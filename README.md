@@ -36,3 +36,29 @@ Every generated asset is stored with useful metadata, including prompts, model d
 - **Metadata-rich storage:** Save prompts, model details, campaign tags, brand inputs, review status, and asset lineage alongside each generated file.
 - **Searchable asset organization:** Find assets by campaign, channel, status, format, audience, or tag for future review and reuse.
 - **Export-ready campaign packs:** Package approved assets for publishing, stakeholder handoff, or reuse in future campaigns.
+
+## Tech Stack
+
+- **Frontend:** React, TypeScript, and Tailwind CSS for a fast, responsive campaign workspace.
+- **Backend:** FastAPI for the application API, campaign workflows, asset metadata, and generation requests.
+- **Generative media orchestration:** Genblaze for connecting campaign context to AI media generation workflows.
+- **Storage:** Backblaze B2 Cloud Storage for generated assets, uploaded brand files, campaign exports, and versioned media.
+- **Metadata:** Structured campaign, asset, prompt, model, review, and version metadata stored alongside each asset.
+- **AI providers:** GMI Cloud and OpenAI for generating campaign copy, images, and video concepts.
+
+## MVP Scope
+
+The first version of SereneSet Spark focuses on a complete campaign asset workflow that can be demoed end to end:
+
+1. Create and manage multiple separated campaign workspaces.
+2. Add campaign details, including brief, audience, tone, channels, goals, and brand requirements.
+3. Create an optional shared brand library with reusable guidelines, product details, audience profiles, and reference assets.
+4. Generate campaign copy and image concepts using GMI Cloud and OpenAI.
+5. Store generated assets and uploaded brand files in Backblaze B2 Cloud Storage.
+6. Save useful metadata for each asset, including prompts, model details, campaign tags, version history, and review status.
+7. Review generated assets and mark them as draft, in review, approved, or rejected.
+8. Refine selected assets while preserving earlier versions.
+9. Search and filter assets by campaign, channel, status, format, audience, or tag.
+10. Export approved assets as a campaign pack for handoff or publishing.
+
+Video concept generation can be included as a stretch goal after the copy, image, storage, review, and export workflow is working reliably.
