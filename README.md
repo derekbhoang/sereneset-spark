@@ -39,7 +39,7 @@ Every generated asset is stored with useful metadata, including prompts, model d
 
 ## Tech Stack
 
-- **Frontend:** React, TypeScript, and Tailwind CSS for a fast, responsive campaign workspace.
+- **Frontend:** Vite React, TypeScript, and Tailwind CSS for a fast, responsive campaign workspace.
 - **Backend:** FastAPI for the application API, campaign workflows, asset metadata, and generation requests.
 - **Generative media orchestration:** Genblaze for connecting campaign context to AI media generation workflows.
 - **Storage:** Backblaze B2 Cloud Storage for generated assets, uploaded brand files, campaign exports, and versioned media.
