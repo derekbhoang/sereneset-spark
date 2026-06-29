@@ -407,12 +407,10 @@ function App() {
         prompt: requestPrompt,
         model,
         provider,
-        storage_key: `campaigns/${selectedCampaign.id}/generated/${now}/${
-          isCopy ? 'copy.json' : 'preview.png'
-        }`,
         generation_metadata: {
           channel: requestChannel,
           format: formatValue,
+          requested_at_ms: now,
           source: 'frontend_mock_generation',
         },
       },

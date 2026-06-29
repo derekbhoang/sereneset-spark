@@ -2,5 +2,6 @@ fastapi
 uvicorn[standard]
 sqlalchemy
 alembic
+boto3
 psycopg[binary]
 pydantic-settings

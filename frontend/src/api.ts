@@ -51,7 +51,6 @@ export type AssetVersionCreateDto = {
   prompt: string
   model: string
   provider: string
-  storage_key: string
   generation_metadata?: Record<string, unknown>
 }
 

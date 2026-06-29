@@ -13,12 +13,11 @@ class AssetVersionBase(BaseModel):
     prompt: str = Field(min_length=1)
     model: str = Field(min_length=1, max_length=120)
     provider: str = Field(min_length=1, max_length=80)
-    storage_key: str = Field(min_length=1, max_length=600)
     generation_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class AssetVersionCreate(AssetVersionBase):
-    pass
+    model_config = ConfigDict(extra="forbid")
 
 
 class AssetVersionRead(AssetVersionBase):
@@ -26,6 +25,15 @@ class AssetVersionRead(AssetVersionBase):
 
     id: uuid.UUID
     asset_id: uuid.UUID
+    storage_key: str
+
+
+class AssetVersionDownloadUrl(BaseModel):
+    asset_id: uuid.UUID
+    version_id: uuid.UUID
+    storage_key: str
+    download_url: str
+    expires_seconds: int
 
 
 class AssetBase(BaseModel):
