@@ -1,0 +1,66 @@
+import uuid
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.models.asset import AssetFormat, ReviewStatus
+
+
+class AssetVersionBase(BaseModel):
+    version_number: int = Field(ge=1)
+    label: str = Field(min_length=1, max_length=180)
+    prompt: str = Field(min_length=1)
+    model: str = Field(min_length=1, max_length=120)
+    provider: str = Field(min_length=1, max_length=80)
+    storage_key: str = Field(min_length=1, max_length=600)
+    generation_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AssetVersionCreate(AssetVersionBase):
+    pass
+
+
+class AssetVersionRead(AssetVersionBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    asset_id: uuid.UUID
+
+
+class AssetBase(BaseModel):
+    title: str = Field(min_length=1, max_length=180)
+    format: AssetFormat
+    channel: str = Field(min_length=1, max_length=80)
+    status: ReviewStatus = ReviewStatus.draft
+    reviewer: str | None = Field(default=None, max_length=120)
+    tags: list[str] = Field(default_factory=list)
+    summary: str = Field(min_length=1)
+
+
+class AssetCreate(AssetBase):
+    initial_version: AssetVersionCreate | None = None
+
+
+class AssetUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=180)
+    format: AssetFormat | None = None
+    channel: str | None = Field(default=None, min_length=1, max_length=80)
+    status: ReviewStatus | None = None
+    reviewer: str | None = Field(default=None, max_length=120)
+    tags: list[str] | None = None
+    summary: str | None = Field(default=None, min_length=1)
+
+
+class AssetStatusUpdate(BaseModel):
+    status: ReviewStatus
+
+
+class AssetRead(AssetBase):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    campaign_id: uuid.UUID
+    created_at: datetime
+    updated_at: datetime
+    versions: list[AssetVersionRead] = Field(default_factory=list)
