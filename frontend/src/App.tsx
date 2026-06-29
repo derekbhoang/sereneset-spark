@@ -1,8 +1,20 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import {
+  createCampaignAsset,
+  fetchCampaignAssets,
+  fetchCampaigns,
+  updateAssetStatus as patchAssetStatus,
+  type AssetCreateDto,
+  type AssetDto,
+  type AssetFormatValue,
+  type AssetVersionDto,
+  type CampaignDto,
+  type ReviewStatus,
+} from './api'
 import './App.css'
 
-type ReviewStatus = 'draft' | 'in_review' | 'approved' | 'rejected'
 type AssetFormat = 'Copy' | 'Image' | 'Video concept'
+type PreviewName = 'evergreen' | 'coral' | 'ink' | 'sun'
 
 type Campaign = {
   id: string
@@ -40,203 +52,12 @@ type Asset = {
   reviewer: string
   tags: string[]
   copy: string
-  preview: 'evergreen' | 'coral' | 'ink' | 'sun'
+  preview: PreviewName
   versions: AssetVersion[]
 }
 
-const campaigns: Campaign[] = [
-  {
-    id: 'camp-summer-reset',
-    name: 'Summer Reset Launch',
-    product: 'SereneSet Essentials Kit',
-    audience: 'Busy wellness shoppers, 28-44',
-    status: 'Generating',
-    due: 'Jul 12',
-    owner: 'Mira Chen',
-    health: 82,
-    goal: 'Increase waitlist signups before the retail launch.',
-    tone: 'Grounded, precise, calm',
-    channels: ['Instagram', 'Email', 'Paid social', 'Landing page'],
-    brief:
-      'Introduce the essentials kit as a simple daily reset for people who want a calmer home routine without a complicated ritual.',
-    brandInputs: ['Tone guide v3', 'Product claims', 'Usage disclaimers'],
-  },
-  {
-    id: 'camp-retail-partner',
-    name: 'Retail Partner Pitch',
-    product: 'Wholesale discovery pack',
-    audience: 'Boutique buyers and store owners',
-    status: 'Review',
-    due: 'Jul 18',
-    owner: 'Noah Patel',
-    health: 64,
-    goal: 'Create polished sell-in assets for three regional buyers.',
-    tone: 'Commercial, clear, assured',
-    channels: ['Pitch deck', 'Email', 'One-sheet'],
-    brief:
-      'Turn the wholesale pack into concise sales assets that show margin potential, shelf appeal, and repeat purchase hooks.',
-    brandInputs: ['Wholesale FAQ', 'Retail photography', 'Margin notes'],
-  },
-  {
-    id: 'camp-membership-refresh',
-    name: 'Membership Refresh',
-    product: 'SereneSet Circle',
-    audience: 'Existing customers and dormant subscribers',
-    status: 'Drafting',
-    due: 'Aug 03',
-    owner: 'Lena Ortiz',
-    health: 48,
-    goal: 'Reposition the monthly membership around flexible routines.',
-    tone: 'Warm, practical, lightly editorial',
-    channels: ['Email', 'SMS', 'Customer portal'],
-    brief:
-      'Refresh membership messages so returning customers understand the value of choice, replenishment, and seasonal edits.',
-    brandInputs: ['Lifecycle segments', 'Offer rules', 'Voice samples'],
-  },
-]
-
-const initialAssets: Asset[] = [
-  {
-    id: 'asset-ig-carousel',
-    campaignId: 'camp-summer-reset',
-    title: 'Five-slide launch carousel',
-    format: 'Image',
-    channel: 'Instagram',
-    status: 'in_review',
-    updated: '10 min ago',
-    reviewer: 'Avery',
-    tags: ['launch', 'routine', 'visual'],
-    copy:
-      'A quiet sequence that opens on a sunlit counter, moves through three product-use moments, and closes with a waitlist callout.',
-    preview: 'evergreen',
-    versions: [
-      {
-        id: 'v3',
-        created: 'Jun 29, 12:41',
-        label: 'Softened product shadows and tightened CTA',
-        prompt:
-          'Create a calm wellness carousel concept for a summer reset kit using natural light and concise waitlist messaging.',
-        model: 'gmi/image-campaign-v2',
-        storageKey:
-          'campaigns/camp-summer-reset/assets/asset-ig-carousel/versions/v3/preview.png',
-      },
-      {
-        id: 'v2',
-        created: 'Jun 29, 12:22',
-        label: 'Added daily ritual framing',
-        prompt:
-          'Refine the carousel to emphasize a simple daily ritual and remove spa language.',
-        model: 'gmi/image-campaign-v2',
-        storageKey:
-          'campaigns/camp-summer-reset/assets/asset-ig-carousel/versions/v2/preview.png',
-      },
-    ],
-  },
-  {
-    id: 'asset-email-hero',
-    campaignId: 'camp-summer-reset',
-    title: 'Waitlist email hero copy',
-    format: 'Copy',
-    channel: 'Email',
-    status: 'approved',
-    updated: '42 min ago',
-    reviewer: 'Mira',
-    tags: ['email', 'waitlist', 'approved'],
-    copy:
-      'A calmer routine starts with fewer decisions. Meet the SereneSet Essentials Kit, a compact edit for resetting the tone of your space.',
-    preview: 'coral',
-    versions: [
-      {
-        id: 'v2',
-        created: 'Jun 29, 12:08',
-        label: 'Approved headline and preheader',
-        prompt:
-          'Write email hero copy for a wellness kit launch with calm, grounded language and no clinical claims.',
-        model: 'openai/gpt-4.1',
-        storageKey:
-          'campaigns/camp-summer-reset/assets/asset-email-hero/versions/v2/copy.json',
-      },
-    ],
-  },
-  {
-    id: 'asset-paid-social',
-    campaignId: 'camp-summer-reset',
-    title: 'Paid social concept trio',
-    format: 'Image',
-    channel: 'Paid social',
-    status: 'draft',
-    updated: '1 hr ago',
-    reviewer: 'Unassigned',
-    tags: ['paid', 'concept', 'testing'],
-    copy:
-      'Three square concepts test product-first, routine-first, and offer-first positioning for paid social acquisition.',
-    preview: 'sun',
-    versions: [
-      {
-        id: 'v1',
-        created: 'Jun 29, 11:37',
-        label: 'Initial testing concepts',
-        prompt:
-          'Generate three paid social image concepts with distinct positioning angles for the essentials kit.',
-        model: 'gmi/image-campaign-v2',
-        storageKey:
-          'campaigns/camp-summer-reset/assets/asset-paid-social/versions/v1/concepts.json',
-      },
-    ],
-  },
-  {
-    id: 'asset-buyer-email',
-    campaignId: 'camp-retail-partner',
-    title: 'Buyer outreach sequence',
-    format: 'Copy',
-    channel: 'Email',
-    status: 'in_review',
-    updated: 'Yesterday',
-    reviewer: 'Noah',
-    tags: ['retail', 'buyer', 'sequence'],
-    copy:
-      'A three-touch outreach flow that leads with category fit, follows with visual merchandising, and closes on low-risk trial terms.',
-    preview: 'ink',
-    versions: [
-      {
-        id: 'v1',
-        created: 'Jun 28, 16:20',
-        label: 'Initial wholesale flow',
-        prompt:
-          'Draft a three-email buyer outreach sequence for boutique retailers evaluating a premium wellness discovery pack.',
-        model: 'openai/gpt-4.1',
-        storageKey:
-          'campaigns/camp-retail-partner/assets/asset-buyer-email/versions/v1/copy.json',
-      },
-    ],
-  },
-  {
-    id: 'asset-member-sms',
-    campaignId: 'camp-membership-refresh',
-    title: 'Dormant member SMS set',
-    format: 'Copy',
-    channel: 'SMS',
-    status: 'draft',
-    updated: 'Yesterday',
-    reviewer: 'Lena',
-    tags: ['sms', 'retention', 'membership'],
-    copy:
-      'Short retention messages that frame membership as flexible replenishment instead of a fixed subscription.',
-    preview: 'evergreen',
-    versions: [
-      {
-        id: 'v1',
-        created: 'Jun 28, 14:11',
-        label: 'Initial retention messages',
-        prompt:
-          'Write five concise SMS options for dormant wellness subscribers with a practical, warm tone.',
-        model: 'openai/gpt-4.1',
-        storageKey:
-          'campaigns/camp-membership-refresh/assets/asset-member-sms/versions/v1/copy.json',
-      },
-    ],
-  },
-]
+const defaultPrompt =
+  'Generate a composed launch asset that keeps the product central and uses calm, benefit-led messaging.'
 
 const reviewStatuses: ReviewStatus[] = [
   'draft',
@@ -254,30 +75,256 @@ const statusLabels: Record<ReviewStatus, string> = {
 
 const formatOptions: AssetFormat[] = ['Copy', 'Image', 'Video concept']
 
+const formatLabels: Record<AssetFormatValue, AssetFormat> = {
+  copy: 'Copy',
+  image: 'Image',
+  video_concept: 'Video concept',
+}
+
+const formatValues: Record<AssetFormat, AssetFormatValue> = {
+  Copy: 'copy',
+  Image: 'image',
+  'Video concept': 'video_concept',
+}
+
+function formatDueDate(value: string | null): string {
+  if (!value) {
+    return 'No due date'
+  }
+
+  const [year, month, day] = value.split('-').map(Number)
+  const date = new Date(year, month - 1, day)
+
+  return date.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+  })
+}
+
+function formatTimestamp(value: string): string {
+  const date = new Date(value)
+
+  if (Number.isNaN(date.getTime())) {
+    return 'Recently'
+  }
+
+  return date.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  })
+}
+
+function titleCase(value: string): string {
+  return value
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function campaignHealth(status: string, index: number): number {
+  const normalizedStatus = status.toLowerCase()
+
+  if (normalizedStatus.includes('approved')) {
+    return 92
+  }
+
+  if (normalizedStatus.includes('review')) {
+    return 70
+  }
+
+  if (normalizedStatus.includes('generat')) {
+    return 82
+  }
+
+  if (normalizedStatus.includes('draft')) {
+    return 48
+  }
+
+  return Math.min(86, 58 + index * 8)
+}
+
+function previewForAsset(format: AssetFormat, channel: string): PreviewName {
+  if (format === 'Copy') {
+    return 'ink'
+  }
+
+  if (channel === 'Email') {
+    return 'coral'
+  }
+
+  if (channel === 'Paid social') {
+    return 'sun'
+  }
+
+  return 'evergreen'
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : 'Something went wrong'
+}
+
+function mapCampaign(campaign: CampaignDto, index: number): Campaign {
+  return {
+    id: campaign.id,
+    name: campaign.name,
+    product: campaign.product,
+    audience: campaign.audience,
+    status: titleCase(campaign.status),
+    due: formatDueDate(campaign.due_date),
+    owner: campaign.owner,
+    health: campaignHealth(campaign.status, index),
+    goal: campaign.goal,
+    tone: campaign.tone,
+    channels: campaign.channels,
+    brief: campaign.brief,
+    brandInputs: campaign.brand_inputs,
+  }
+}
+
+function mapAssetVersion(version: AssetVersionDto): AssetVersion {
+  return {
+    id: `v${version.version_number}`,
+    created: version.provider,
+    label: version.label,
+    prompt: version.prompt,
+    model: version.model,
+    storageKey: version.storage_key,
+  }
+}
+
+function mapAsset(asset: AssetDto): Asset {
+  const format = formatLabels[asset.format]
+
+  return {
+    id: asset.id,
+    campaignId: asset.campaign_id,
+    title: asset.title,
+    format,
+    channel: asset.channel,
+    status: asset.status,
+    updated: formatTimestamp(asset.updated_at),
+    reviewer: asset.reviewer ?? 'Unassigned',
+    tags: asset.tags,
+    copy: asset.summary,
+    preview: previewForAsset(format, asset.channel),
+    versions: asset.versions.map(mapAssetVersion),
+  }
+}
+
 function App() {
-  const [selectedCampaignId, setSelectedCampaignId] = useState(campaigns[0].id)
-  const [assets, setAssets] = useState(initialAssets)
-  const [selectedAssetId, setSelectedAssetId] = useState(initialAssets[0].id)
+  const [campaigns, setCampaigns] = useState<Campaign[]>([])
+  const [assets, setAssets] = useState<Asset[]>([])
+  const [selectedCampaignId, setSelectedCampaignId] = useState('')
+  const [selectedAssetId, setSelectedAssetId] = useState('')
   const [statusFilter, setStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const [channelFilter, setChannelFilter] = useState('All')
   const [requestFormat, setRequestFormat] = useState<AssetFormat>('Image')
-  const [requestChannel, setRequestChannel] = useState('Instagram')
-  const [requestPrompt, setRequestPrompt] = useState(
-    'Generate a composed launch asset that keeps the product central and uses calm, benefit-led messaging.',
+  const [requestChannel, setRequestChannel] = useState('')
+  const [requestPrompt, setRequestPrompt] = useState(defaultPrompt)
+  const [isLoadingCampaigns, setIsLoadingCampaigns] = useState(true)
+  const [isLoadingAssets, setIsLoadingAssets] = useState(false)
+  const [isGenerating, setIsGenerating] = useState(false)
+  const [isSavingStatus, setIsSavingStatus] = useState(false)
+  const [errorMessage, setErrorMessage] = useState<string | null>(null)
+
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadCampaigns() {
+      setIsLoadingCampaigns(true)
+      setErrorMessage(null)
+
+      try {
+        const campaignDtos = await fetchCampaigns()
+        const nextCampaigns = campaignDtos.map(mapCampaign)
+
+        if (isCancelled) {
+          return
+        }
+
+        setCampaigns(nextCampaigns)
+        setSelectedCampaignId(nextCampaigns[0]?.id ?? '')
+        setRequestChannel(nextCampaigns[0]?.channels[0] ?? '')
+      } catch (error) {
+        if (!isCancelled) {
+          setErrorMessage(getErrorMessage(error))
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingCampaigns(false)
+        }
+      }
+    }
+
+    void loadCampaigns()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [])
+
+  const selectedCampaign = useMemo(
+    () =>
+      campaigns.find((campaign) => campaign.id === selectedCampaignId) ?? null,
+    [campaigns, selectedCampaignId],
   )
 
-  const selectedCampaign =
-    campaigns.find((campaign) => campaign.id === selectedCampaignId) ??
-    campaigns[0]
+  useEffect(() => {
+    let isCancelled = false
 
-  const campaignAssets = useMemo(
-    () => assets.filter((asset) => asset.campaignId === selectedCampaign.id),
-    [assets, selectedCampaign.id],
-  )
+    async function loadAssets(campaignId: string) {
+      setIsLoadingAssets(true)
+      setErrorMessage(null)
+
+      try {
+        const assetDtos = await fetchCampaignAssets(campaignId)
+        const nextAssets = assetDtos.map(mapAsset)
+
+        if (isCancelled) {
+          return
+        }
+
+        setAssets(nextAssets)
+        setSelectedAssetId((currentAssetId) => {
+          if (
+            currentAssetId &&
+            nextAssets.some((asset) => asset.id === currentAssetId)
+          ) {
+            return currentAssetId
+          }
+
+          return nextAssets[0]?.id ?? ''
+        })
+      } catch (error) {
+        if (!isCancelled) {
+          setAssets([])
+          setSelectedAssetId('')
+          setErrorMessage(getErrorMessage(error))
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingAssets(false)
+        }
+      }
+    }
+
+    if (!selectedCampaignId) {
+      return
+    }
+
+    void loadAssets(selectedCampaignId)
+
+    return () => {
+      isCancelled = true
+    }
+  }, [selectedCampaignId])
+
+  const campaignAssets = assets
 
   const channels = useMemo(
-    () => ['All', ...new Set(selectedCampaign.channels)],
-    [selectedCampaign.channels],
+    () => ['All', ...(selectedCampaign?.channels ?? [])],
+    [selectedCampaign],
   )
 
   const filteredAssets = campaignAssets.filter((asset) => {
@@ -290,78 +337,106 @@ function App() {
   })
 
   const selectedAsset =
-    campaignAssets.find((asset) => asset.id === selectedAssetId) ??
+    filteredAssets.find((asset) => asset.id === selectedAssetId) ??
     filteredAssets[0] ??
-    campaignAssets[0]
+    null
 
   const approvedCount = campaignAssets.filter(
     (asset) => asset.status === 'approved',
   ).length
 
   function selectCampaign(campaignId: string) {
-    const nextAsset = assets.find((asset) => asset.campaignId === campaignId)
     const nextCampaign = campaigns.find((campaign) => campaign.id === campaignId)
 
     setSelectedCampaignId(campaignId)
-    setSelectedAssetId(nextAsset?.id ?? '')
+    setSelectedAssetId('')
+    setAssets([])
     setStatusFilter('all')
     setChannelFilter('All')
-    setRequestChannel(nextCampaign?.channels[0] ?? 'Instagram')
+    setRequestChannel(nextCampaign?.channels[0] ?? '')
   }
 
-  function updateAssetStatus(status: ReviewStatus) {
+  async function updateAssetStatus(status: ReviewStatus) {
     if (!selectedAsset) {
       return
     }
 
-    setAssets((currentAssets) =>
-      currentAssets.map((asset) =>
-        asset.id === selectedAsset.id ? { ...asset, status } : asset,
-      ),
-    )
+    setIsSavingStatus(true)
+    setErrorMessage(null)
+
+    try {
+      const updatedAsset = mapAsset(await patchAssetStatus(selectedAsset.id, status))
+      setAssets((currentAssets) =>
+        currentAssets.map((asset) =>
+          asset.id === updatedAsset.id ? updatedAsset : asset,
+        ),
+      )
+      setSelectedAssetId(updatedAsset.id)
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setIsSavingStatus(false)
+    }
   }
 
-  function generateAsset() {
-    const now = Date.now()
-    const newAsset: Asset = {
-      id: `asset-${now}`,
-      campaignId: selectedCampaign.id,
-      title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
-      format: requestFormat,
-      channel: requestChannel,
-      status: 'draft',
-      updated: 'Just now',
-      reviewer: 'Unassigned',
-      tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
-      copy:
-        requestFormat === 'Copy'
-          ? 'A generated copy direction will appear here with headline, support copy, and compliance notes ready for review.'
-          : 'A generated creative direction will appear here with composition, focal point, messaging, and production notes.',
-      preview:
-        requestFormat === 'Copy'
-          ? 'ink'
-          : requestChannel === 'Email'
-            ? 'coral'
-            : requestChannel === 'Paid social'
-              ? 'sun'
-              : 'evergreen',
-      versions: [
-        {
-          id: 'v1',
-          created: 'Just now',
-          label: 'Initial generated draft',
-          prompt: requestPrompt,
-          model:
-            requestFormat === 'Copy' ? 'openai/gpt-4.1' : 'gmi/image-campaign-v2',
-          storageKey: `campaigns/${selectedCampaign.id}/assets/asset-${now}/versions/v1/${requestFormat === 'Copy' ? 'copy.json' : 'preview.png'}`,
-        },
-      ],
+  async function generateAsset() {
+    if (!selectedCampaign || !requestChannel) {
+      return
     }
 
-    setAssets((currentAssets) => [newAsset, ...currentAssets])
-    setSelectedAssetId(newAsset.id)
-    setStatusFilter('all')
-    setChannelFilter('All')
+    const now = Date.now()
+    const formatValue = formatValues[requestFormat]
+    const isCopy = requestFormat === 'Copy'
+    const model = isCopy ? 'openai/gpt-4.1' : 'gmi/image-campaign-v2'
+    const provider = isCopy ? 'openai' : 'gmi'
+    const summary = isCopy
+      ? 'A generated copy direction with headline, support copy, and compliance notes ready for review.'
+      : 'A generated creative direction with composition, focal point, messaging, and production notes.'
+
+    const assetPayload: AssetCreateDto = {
+      title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
+      format: formatValue,
+      channel: requestChannel,
+      status: 'draft',
+      reviewer: null,
+      tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
+      summary,
+      initial_version: {
+        version_number: 1,
+        label: 'Initial generated draft',
+        prompt: requestPrompt,
+        model,
+        provider,
+        storage_key: `campaigns/${selectedCampaign.id}/generated/${now}/${
+          isCopy ? 'copy.json' : 'preview.png'
+        }`,
+        generation_metadata: {
+          channel: requestChannel,
+          format: formatValue,
+          source: 'frontend_mock_generation',
+        },
+      },
+    }
+
+    setIsGenerating(true)
+    setErrorMessage(null)
+
+    try {
+      const createdAsset = mapAsset(
+        await createCampaignAsset(selectedCampaign.id, assetPayload),
+      )
+      setAssets((currentAssets) => [
+        createdAsset,
+        ...currentAssets.filter((asset) => asset.id !== createdAsset.id),
+      ])
+      setSelectedAssetId(createdAsset.id)
+      setStatusFilter('all')
+      setChannelFilter('All')
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setIsGenerating(false)
+    }
   }
 
   return (
@@ -395,18 +470,24 @@ function App() {
         </div>
       </header>
 
+      {errorMessage && (
+        <div className="system-banner" role="alert">
+          {errorMessage}
+        </div>
+      )}
+
       <div className="workspace" id="campaigns">
         <aside className="campaign-rail" aria-label="Campaigns">
           <div className="rail-heading">
             <span>Campaigns</span>
-            <strong>{campaigns.length}</strong>
+            <strong>{isLoadingCampaigns ? '...' : campaigns.length}</strong>
           </div>
 
           <div className="campaign-list">
             {campaigns.map((campaign) => (
               <button
                 className={`campaign-card ${
-                  campaign.id === selectedCampaign.id ? 'is-active' : ''
+                  campaign.id === selectedCampaignId ? 'is-active' : ''
                 }`}
                 key={campaign.id}
                 onClick={() => selectCampaign(campaign.id)}
@@ -427,259 +508,299 @@ function App() {
               </button>
             ))}
           </div>
+
+          {!isLoadingCampaigns && campaigns.length === 0 && (
+            <div className="empty-state">No campaigns found.</div>
+          )}
         </aside>
 
-        <main className="campaign-stage">
-          <section className="campaign-header" aria-labelledby="campaign-title">
-            <div>
-              <span className="eyebrow">{selectedCampaign.product}</span>
-              <h1 id="campaign-title">{selectedCampaign.name}</h1>
-              <p>{selectedCampaign.goal}</p>
-            </div>
+        {selectedCampaign ? (
+          <main className="campaign-stage">
+            <section className="campaign-header" aria-labelledby="campaign-title">
+              <div>
+                <span className="eyebrow">{selectedCampaign.product}</span>
+                <h1 id="campaign-title">{selectedCampaign.name}</h1>
+                <p>{selectedCampaign.goal}</p>
+              </div>
 
-            <dl className="campaign-stats" aria-label="Campaign status">
-              <div>
-                <dt>Assets</dt>
-                <dd>{campaignAssets.length}</dd>
-              </div>
-              <div>
-                <dt>Approved</dt>
-                <dd>{approvedCount}</dd>
-              </div>
-              <div>
-                <dt>Due</dt>
-                <dd>{selectedCampaign.due}</dd>
-              </div>
-            </dl>
-          </section>
-
-          <div className="work-grid">
-            <section className="brief-panel" aria-labelledby="brief-heading">
-              <div className="panel-heading">
+              <dl className="campaign-stats" aria-label="Campaign status">
                 <div>
-                  <span className="eyebrow">Brief</span>
-                  <h2 id="brief-heading">Campaign context</h2>
+                  <dt>Assets</dt>
+                  <dd>{campaignAssets.length}</dd>
                 </div>
-              </div>
+                <div>
+                  <dt>Approved</dt>
+                  <dd>{approvedCount}</dd>
+                </div>
+                <div>
+                  <dt>Due</dt>
+                  <dd>{selectedCampaign.due}</dd>
+                </div>
+              </dl>
+            </section>
 
-              <label className="field">
-                <span>Audience</span>
-                <input defaultValue={selectedCampaign.audience} />
-              </label>
-
-              <label className="field">
-                <span>Tone</span>
-                <input defaultValue={selectedCampaign.tone} />
-              </label>
-
-              <label className="field">
-                <span>Brief</span>
-                <textarea defaultValue={selectedCampaign.brief} rows={5} />
-              </label>
-
-              <div className="brand-inputs">
-                {selectedCampaign.brandInputs.map((input) => (
-                  <span key={input}>{input}</span>
-                ))}
-              </div>
-
-              <div className="generator">
+            <div className="work-grid">
+              <section className="brief-panel" aria-labelledby="brief-heading">
                 <div className="panel-heading">
                   <div>
-                    <span className="eyebrow">Generate</span>
-                    <h2>New asset</h2>
+                    <span className="eyebrow">Brief</span>
+                    <h2 id="brief-heading">Campaign context</h2>
                   </div>
                 </div>
 
-                <div className="segmented" aria-label="Asset format">
-                  {formatOptions.map((format) => (
-                    <button
-                      aria-pressed={requestFormat === format}
-                      className={requestFormat === format ? 'is-selected' : ''}
-                      key={format}
-                      onClick={() => setRequestFormat(format)}
-                      type="button"
-                    >
-                      {format}
-                    </button>
-                  ))}
-                </div>
-
                 <label className="field">
-                  <span>Channel</span>
-                  <select
-                    onChange={(event) => setRequestChannel(event.target.value)}
-                    value={requestChannel}
-                  >
-                    {selectedCampaign.channels.map((channel) => (
-                      <option key={channel}>{channel}</option>
-                    ))}
-                  </select>
-                </label>
-
-                <label className="field">
-                  <span>Prompt</span>
-                  <textarea
-                    onChange={(event) => setRequestPrompt(event.target.value)}
-                    rows={4}
-                    value={requestPrompt}
+                  <span>Audience</span>
+                  <input
+                    defaultValue={selectedCampaign.audience}
+                    key={`${selectedCampaign.id}-audience`}
                   />
                 </label>
 
-                <button
-                  className="button button-primary"
-                  onClick={generateAsset}
-                  type="button"
-                >
-                  Generate asset
-                </button>
-              </div>
-            </section>
+                <label className="field">
+                  <span>Tone</span>
+                  <input
+                    defaultValue={selectedCampaign.tone}
+                    key={`${selectedCampaign.id}-tone`}
+                  />
+                </label>
 
-            <section className="asset-board" id="assets" aria-labelledby="assets-heading">
-              <div className="board-toolbar">
-                <div>
-                  <span className="eyebrow">Assets</span>
-                  <h2 id="assets-heading">Review queue</h2>
+                <label className="field">
+                  <span>Brief</span>
+                  <textarea
+                    defaultValue={selectedCampaign.brief}
+                    key={`${selectedCampaign.id}-brief`}
+                    rows={5}
+                  />
+                </label>
+
+                <div className="brand-inputs">
+                  {selectedCampaign.brandInputs.map((input) => (
+                    <span key={input}>{input}</span>
+                  ))}
                 </div>
 
-                <div className="filters">
-                  <select
-                    aria-label="Filter by channel"
-                    onChange={(event) => setChannelFilter(event.target.value)}
-                    value={channelFilter}
-                  >
-                    {channels.map((channel) => (
-                      <option key={channel}>{channel}</option>
-                    ))}
-                  </select>
-
-                  <select
-                    aria-label="Filter by status"
-                    onChange={(event) =>
-                      setStatusFilter(event.target.value as ReviewStatus | 'all')
-                    }
-                    value={statusFilter}
-                  >
-                    <option value="all">All statuses</option>
-                    {reviewStatuses.map((status) => (
-                      <option key={status} value={status}>
-                        {statusLabels[status]}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              <div className="asset-grid">
-                {filteredAssets.map((asset) => (
-                  <button
-                    className={`asset-card ${
-                      selectedAsset?.id === asset.id ? 'is-active' : ''
-                    }`}
-                    key={asset.id}
-                    onClick={() => setSelectedAssetId(asset.id)}
-                    type="button"
-                  >
-                    <span className={`asset-preview ${asset.preview}`}>
-                      <span className="preview-band" />
-                      <span className="preview-copy" />
-                      <span className="preview-chip" />
-                    </span>
-                    <span className="asset-card-body">
-                      <span className="asset-row">
-                        <strong>{asset.title}</strong>
-                        <span className={`status-pill ${asset.status}`}>
-                          {statusLabels[asset.status]}
-                        </span>
-                      </span>
-                      <span className="asset-copy">{asset.copy}</span>
-                      <span className="asset-foot">
-                        <span>{asset.format}</span>
-                        <span>{asset.channel}</span>
-                        <span>{asset.updated}</span>
-                      </span>
-                    </span>
-                  </button>
-                ))}
-              </div>
-
-              {filteredAssets.length === 0 && (
-                <div className="empty-state">No assets match these filters.</div>
-              )}
-            </section>
-
-            <aside className="detail-panel" aria-label="Selected asset">
-              {selectedAsset ? (
-                <>
+                <div className="generator">
                   <div className="panel-heading">
                     <div>
-                      <span className="eyebrow">Selected</span>
-                      <h2>{selectedAsset.title}</h2>
+                      <span className="eyebrow">Generate</span>
+                      <h2>New asset</h2>
                     </div>
-                    <span className={`status-pill ${selectedAsset.status}`}>
-                      {statusLabels[selectedAsset.status]}
-                    </span>
                   </div>
 
-                  <div className={`detail-preview ${selectedAsset.preview}`}>
-                    <span />
-                    <strong>{selectedAsset.format}</strong>
-                  </div>
-
-                  <p className="detail-copy">{selectedAsset.copy}</p>
-
-                  <div className="status-controls" aria-label="Review status">
-                    {reviewStatuses.map((status) => (
+                  <div className="segmented" aria-label="Asset format">
+                    {formatOptions.map((format) => (
                       <button
-                        aria-pressed={selectedAsset.status === status}
-                        className={
-                          selectedAsset.status === status ? 'is-selected' : ''
-                        }
-                        key={status}
-                        onClick={() => updateAssetStatus(status)}
+                        aria-pressed={requestFormat === format}
+                        className={requestFormat === format ? 'is-selected' : ''}
+                        key={format}
+                        onClick={() => setRequestFormat(format)}
                         type="button"
                       >
-                        {statusLabels[status]}
+                        {format}
                       </button>
                     ))}
                   </div>
 
-                  <dl className="metadata-list">
-                    <div>
-                      <dt>Reviewer</dt>
-                      <dd>{selectedAsset.reviewer}</dd>
-                    </div>
-                    <div>
-                      <dt>Channel</dt>
-                      <dd>{selectedAsset.channel}</dd>
-                    </div>
-                    <div>
-                      <dt>Tags</dt>
-                      <dd>{selectedAsset.tags.join(', ')}</dd>
-                    </div>
-                  </dl>
+                  <label className="field">
+                    <span>Channel</span>
+                    <select
+                      onChange={(event) => setRequestChannel(event.target.value)}
+                      value={requestChannel}
+                    >
+                      {selectedCampaign.channels.map((channel) => (
+                        <option key={channel}>{channel}</option>
+                      ))}
+                    </select>
+                  </label>
 
-                  <div className="version-list">
-                    <h3>Versions</h3>
-                    {selectedAsset.versions.map((version) => (
-                      <div className="version-row" key={version.id}>
-                        <span>
-                          <strong>{version.id.toUpperCase()}</strong>
-                          {version.label}
-                        </span>
-                        <span>{version.created}</span>
-                        <code>{version.storageKey}</code>
-                      </div>
-                    ))}
+                  <label className="field">
+                    <span>Prompt</span>
+                    <textarea
+                      onChange={(event) => setRequestPrompt(event.target.value)}
+                      rows={4}
+                      value={requestPrompt}
+                    />
+                  </label>
+
+                  <button
+                    className="button button-primary"
+                    disabled={isGenerating || !requestChannel}
+                    onClick={generateAsset}
+                    type="button"
+                  >
+                    {isGenerating ? 'Generating...' : 'Generate asset'}
+                  </button>
+                </div>
+              </section>
+
+              <section
+                className="asset-board"
+                id="assets"
+                aria-labelledby="assets-heading"
+              >
+                <div className="board-toolbar">
+                  <div>
+                    <span className="eyebrow">Assets</span>
+                    <h2 id="assets-heading">Review queue</h2>
                   </div>
-                </>
-              ) : (
-                <div className="empty-state">No asset selected.</div>
-              )}
-            </aside>
-          </div>
-        </main>
+
+                  <div className="filters">
+                    <select
+                      aria-label="Filter by channel"
+                      onChange={(event) => setChannelFilter(event.target.value)}
+                      value={channelFilter}
+                    >
+                      {channels.map((channel) => (
+                        <option key={channel}>{channel}</option>
+                      ))}
+                    </select>
+
+                    <select
+                      aria-label="Filter by status"
+                      onChange={(event) =>
+                        setStatusFilter(
+                          event.target.value as ReviewStatus | 'all',
+                        )
+                      }
+                      value={statusFilter}
+                    >
+                      <option value="all">All statuses</option>
+                      {reviewStatuses.map((status) => (
+                        <option key={status} value={status}>
+                          {statusLabels[status]}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {isLoadingAssets ? (
+                  <div className="empty-state">Loading assets...</div>
+                ) : (
+                  <>
+                    <div className="asset-grid">
+                      {filteredAssets.map((asset) => (
+                        <button
+                          className={`asset-card ${
+                            selectedAsset?.id === asset.id ? 'is-active' : ''
+                          }`}
+                          key={asset.id}
+                          onClick={() => setSelectedAssetId(asset.id)}
+                          type="button"
+                        >
+                          <span className={`asset-preview ${asset.preview}`}>
+                            <span className="preview-band" />
+                            <span className="preview-copy" />
+                            <span className="preview-chip" />
+                          </span>
+                          <span className="asset-card-body">
+                            <span className="asset-row">
+                              <strong>{asset.title}</strong>
+                              <span className={`status-pill ${asset.status}`}>
+                                {statusLabels[asset.status]}
+                              </span>
+                            </span>
+                            <span className="asset-copy">{asset.copy}</span>
+                            <span className="asset-foot">
+                              <span>{asset.format}</span>
+                              <span>{asset.channel}</span>
+                              <span>{asset.updated}</span>
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+
+                    {filteredAssets.length === 0 && (
+                      <div className="empty-state">
+                        No assets match these filters.
+                      </div>
+                    )}
+                  </>
+                )}
+              </section>
+
+              <aside className="detail-panel" aria-label="Selected asset">
+                {selectedAsset ? (
+                  <>
+                    <div className="panel-heading">
+                      <div>
+                        <span className="eyebrow">Selected</span>
+                        <h2>{selectedAsset.title}</h2>
+                      </div>
+                      <span className={`status-pill ${selectedAsset.status}`}>
+                        {statusLabels[selectedAsset.status]}
+                      </span>
+                    </div>
+
+                    <div className={`detail-preview ${selectedAsset.preview}`}>
+                      <span />
+                      <strong>{selectedAsset.format}</strong>
+                    </div>
+
+                    <p className="detail-copy">{selectedAsset.copy}</p>
+
+                    <div className="status-controls" aria-label="Review status">
+                      {reviewStatuses.map((status) => (
+                        <button
+                          aria-pressed={selectedAsset.status === status}
+                          className={
+                            selectedAsset.status === status ? 'is-selected' : ''
+                          }
+                          disabled={isSavingStatus}
+                          key={status}
+                          onClick={() => updateAssetStatus(status)}
+                          type="button"
+                        >
+                          {statusLabels[status]}
+                        </button>
+                      ))}
+                    </div>
+
+                    <dl className="metadata-list">
+                      <div>
+                        <dt>Reviewer</dt>
+                        <dd>{selectedAsset.reviewer}</dd>
+                      </div>
+                      <div>
+                        <dt>Channel</dt>
+                        <dd>{selectedAsset.channel}</dd>
+                      </div>
+                      <div>
+                        <dt>Tags</dt>
+                        <dd>{selectedAsset.tags.join(', ')}</dd>
+                      </div>
+                    </dl>
+
+                    <div className="version-list">
+                      <h3>Versions</h3>
+                      {selectedAsset.versions.map((version) => (
+                        <div className="version-row" key={version.id}>
+                          <span>
+                            <strong>{version.id.toUpperCase()}</strong>
+                            {version.label}
+                          </span>
+                          <span>{version.created}</span>
+                          <code>{version.storageKey}</code>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <div className="empty-state">No asset selected.</div>
+                )}
+              </aside>
+            </div>
+          </main>
+        ) : (
+          <main className="campaign-stage">
+            <div className="empty-state workspace-empty">
+              {isLoadingCampaigns
+                ? 'Loading workspace...'
+                : 'No campaigns yet. Create one through the API to begin.'}
+            </div>
+          </main>
+        )}
       </div>
     </div>
   )

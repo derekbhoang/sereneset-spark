@@ -111,6 +111,15 @@
   min-height: calc(100svh - 76px);
 }
 
+.system-banner {
+  padding: 10px 24px;
+  border-bottom: 1px solid #efc8c1;
+  color: #7c2c22;
+  background: #fff0ed;
+  font-size: 13px;
+  font-weight: 800;
+}
+
 .campaign-rail {
   border-right: 1px solid var(--border);
   background: #f6f6f0;
@@ -430,6 +439,13 @@ a:focus-visible {
   cursor: pointer;
 }
 
+.button:disabled,
+.segmented button:disabled,
+.status-controls button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 .button-primary {
   width: 100%;
   color: #fff;
@@ -626,6 +642,10 @@ a:focus-visible {
   color: var(--muted);
   background: #fbfbf6;
   font-weight: 700;
+}
+
+.workspace-empty {
+  margin: 24px;
 }
 
 .detail-preview {
