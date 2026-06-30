@@ -27,6 +27,10 @@ export type AssetVersionDto = {
   model: string
   provider: string
   storage_key: string
+  artifact_storage_key: string | null
+  artifact_filename: string | null
+  artifact_content_type: string | null
+  artifact_size_bytes: number | null
   generation_metadata: Record<string, unknown>
 }
 
@@ -73,8 +77,34 @@ export type AssetVersionDownloadUrlDto = {
   expires_seconds: number
 }
 
+export type AssetVersionArtifactDownloadUrlDto = {
+  asset_id: string
+  version_id: string
+  artifact_storage_key: string
+  artifact_filename: string | null
+  artifact_content_type: string | null
+  artifact_size_bytes: number | null
+  download_url: string
+  expires_seconds: number
+}
+
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000/api/v1'
+
+async function readErrorMessage(response: Response): Promise<string> {
+  let message = `Request failed with status ${response.status}`
+
+  try {
+    const body = (await response.json()) as { detail?: string }
+    if (body.detail) {
+      message = body.detail
+    }
+  } catch {
+    // Keep the status-based fallback when the response is not JSON.
+  }
+
+  return message
+}
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
@@ -86,18 +116,20 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   })
 
   if (!response.ok) {
-    let message = `Request failed with status ${response.status}`
+    throw new Error(await readErrorMessage(response))
+  }
 
-    try {
-      const body = (await response.json()) as { detail?: string }
-      if (body.detail) {
-        message = body.detail
-      }
-    } catch {
-      // Keep the status-based fallback when the response is not JSON.
-    }
+  return response.json() as Promise<T>
+}
 
-    throw new Error(message)
+async function uploadRequest<T>(path: string, formData: FormData): Promise<T> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'POST',
+    body: formData,
+  })
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response))
   }
 
   return response.json() as Promise<T>
@@ -176,5 +208,33 @@ export function fetchAssetVersionDownloadUrl(
 
   return request<AssetVersionDownloadUrlDto>(
     `/assets/${assetId}/versions/${versionId}/download-url?${params}`,
+  )
+}
+
+export function uploadAssetVersionArtifact(
+  assetId: string,
+  versionId: string,
+  file: File,
+): Promise<AssetVersionDto> {
+  const formData = new FormData()
+  formData.append('file', file)
+
+  return uploadRequest<AssetVersionDto>(
+    `/assets/${assetId}/versions/${versionId}/artifact`,
+    formData,
+  )
+}
+
+export function fetchAssetVersionArtifactDownloadUrl(
+  assetId: string,
+  versionId: string,
+  expiresSeconds = 3600,
+): Promise<AssetVersionArtifactDownloadUrlDto> {
+  const params = new URLSearchParams({
+    expires_seconds: String(expiresSeconds),
+  })
+
+  return request<AssetVersionArtifactDownloadUrlDto>(
+    `/assets/${assetId}/versions/${versionId}/artifact/download-url?${params}`,
   )
 }

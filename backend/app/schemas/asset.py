@@ -26,12 +26,27 @@ class AssetVersionRead(AssetVersionBase):
     id: uuid.UUID
     asset_id: uuid.UUID
     storage_key: str
+    artifact_storage_key: str | None = None
+    artifact_filename: str | None = None
+    artifact_content_type: str | None = None
+    artifact_size_bytes: int | None = None
 
 
 class AssetVersionDownloadUrl(BaseModel):
     asset_id: uuid.UUID
     version_id: uuid.UUID
     storage_key: str
+    download_url: str
+    expires_seconds: int
+
+
+class AssetVersionArtifactDownloadUrl(BaseModel):
+    asset_id: uuid.UUID
+    version_id: uuid.UUID
+    artifact_storage_key: str
+    artifact_filename: str | None = None
+    artifact_content_type: str | None = None
+    artifact_size_bytes: int | None = None
     download_url: str
     expires_seconds: int
 

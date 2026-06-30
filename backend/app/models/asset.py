@@ -94,6 +94,22 @@ class AssetVersion(IdMixin, Base):
     model: Mapped[str] = mapped_column(String(120), nullable=False)
     provider: Mapped[str] = mapped_column(String(80), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(600), nullable=False)
+    artifact_storage_key: Mapped[str | None] = mapped_column(
+        String(600),
+        nullable=True,
+    )
+    artifact_filename: Mapped[str | None] = mapped_column(
+        String(240),
+        nullable=True,
+    )
+    artifact_content_type: Mapped[str | None] = mapped_column(
+        String(120),
+        nullable=True,
+    )
+    artifact_size_bytes: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
     generation_metadata: Mapped[dict[str, Any]] = mapped_column(
         "metadata",
         JSONB,

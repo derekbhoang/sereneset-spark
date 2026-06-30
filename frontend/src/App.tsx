@@ -3,10 +3,12 @@ import {
   createCampaignAsset,
   createAssetVersion,
   fetchAsset,
+  fetchAssetVersionArtifactDownloadUrl,
   fetchAssetVersionDownloadUrl,
   fetchCampaignAssets,
   fetchCampaigns,
   updateAssetStatus as patchAssetStatus,
+  uploadAssetVersionArtifact,
   type AssetCreateDto,
   type AssetDto,
   type AssetFormatValue,
@@ -45,6 +47,10 @@ type AssetVersion = {
   model: string
   provider: string
   storageKey: string
+  artifactStorageKey: string | null
+  artifactFilename: string | null
+  artifactContentType: string | null
+  artifactSizeBytes: number | null
 }
 
 type Asset = {
@@ -60,6 +66,11 @@ type Asset = {
   copy: string
   preview: PreviewName
   versions: AssetVersion[]
+}
+
+type ArtifactPreviewUrl = {
+  storageKey: string
+  url: string
 }
 
 const defaultPrompt =
@@ -120,6 +131,55 @@ function formatTimestamp(value: string): string {
     hour: 'numeric',
     minute: '2-digit',
   })
+}
+
+function formatFileSize(value: number | null): string {
+  if (value === null) {
+    return 'Size pending'
+  }
+
+  if (value < 1024) {
+    return `${value} B`
+  }
+
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(value < 10 * 1024 ? 1 : 0)} KB`
+  }
+
+  return `${(value / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function formatArtifactDetails(version: AssetVersion): string {
+  const details = [
+    version.artifactContentType,
+    version.artifactSizeBytes === null
+      ? null
+      : formatFileSize(version.artifactSizeBytes),
+  ].filter(Boolean)
+
+  return details.join(' / ') || 'Stored artifact'
+}
+
+function getFileExtension(filename: string | null): string {
+  const extension = filename?.split('.').pop()
+
+  if (!extension || extension === filename) {
+    return 'file'
+  }
+
+  return extension.slice(0, 5).toLowerCase()
+}
+
+function hasImageArtifact(version: AssetVersion): boolean {
+  if (!version.artifactStorageKey) {
+    return false
+  }
+
+  if (version.artifactContentType?.startsWith('image/')) {
+    return true
+  }
+
+  return /\.(avif|gif|jpe?g|png|webp)$/i.test(version.artifactFilename ?? '')
 }
 
 function titleCase(value: string): string {
@@ -224,6 +284,10 @@ function mapAssetVersion(version: AssetVersionDto): AssetVersion {
     model: version.model,
     provider: version.provider,
     storageKey: version.storage_key,
+    artifactStorageKey: version.artifact_storage_key,
+    artifactFilename: version.artifact_filename,
+    artifactContentType: version.artifact_content_type,
+    artifactSizeBytes: version.artifact_size_bytes,
   }
 }
 
@@ -262,6 +326,21 @@ function App() {
   const [isSavingStatus, setIsSavingStatus] = useState(false)
   const [isRefining, setIsRefining] = useState(false)
   const [openingVersionId, setOpeningVersionId] = useState<string | null>(null)
+  const [openingArtifactVersionId, setOpeningArtifactVersionId] = useState<
+    string | null
+  >(null)
+  const [uploadingArtifactVersionId, setUploadingArtifactVersionId] = useState<
+    string | null
+  >(null)
+  const [artifactPreviewUrls, setArtifactPreviewUrls] = useState<
+    Record<string, ArtifactPreviewUrl>
+  >({})
+  const [artifactPreviewLoadingIds, setArtifactPreviewLoadingIds] = useState<
+    Record<string, boolean>
+  >({})
+  const [artifactPreviewErrors, setArtifactPreviewErrors] = useState<
+    Record<string, string>
+  >({})
   const [refinePrompts, setRefinePrompts] = useState<Record<string, string>>({})
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
@@ -386,6 +465,74 @@ function App() {
     (asset) => asset.status === 'approved',
   ).length
 
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadArtifactPreviews(asset: Asset) {
+      const imageVersions = asset.versions.filter(hasImageArtifact)
+
+      await Promise.all(
+        imageVersions.map(async (version) => {
+          if (!version.artifactStorageKey) {
+            return
+          }
+
+          setArtifactPreviewLoadingIds((currentLoadingIds) => ({
+            ...currentLoadingIds,
+            [version.versionId]: true,
+          }))
+
+          try {
+            const download = await fetchAssetVersionArtifactDownloadUrl(
+              asset.id,
+              version.versionId,
+            )
+
+            if (isCancelled) {
+              return
+            }
+
+            setArtifactPreviewUrls((currentPreviewUrls) => ({
+              ...currentPreviewUrls,
+              [version.versionId]: {
+                storageKey: version.artifactStorageKey ?? '',
+                url: download.download_url,
+              },
+            }))
+            setArtifactPreviewErrors((currentPreviewErrors) => {
+              const nextPreviewErrors = { ...currentPreviewErrors }
+              delete nextPreviewErrors[version.versionId]
+              return nextPreviewErrors
+            })
+          } catch (error) {
+            if (!isCancelled) {
+              setArtifactPreviewErrors((currentPreviewErrors) => ({
+                ...currentPreviewErrors,
+                [version.versionId]: getErrorMessage(error),
+              }))
+            }
+          } finally {
+            if (!isCancelled) {
+              setArtifactPreviewLoadingIds((currentLoadingIds) => {
+                const nextLoadingIds = { ...currentLoadingIds }
+                delete nextLoadingIds[version.versionId]
+                return nextLoadingIds
+              })
+            }
+          }
+        }),
+      )
+    }
+
+    if (selectedAsset) {
+      void loadArtifactPreviews(selectedAsset)
+    }
+
+    return () => {
+      isCancelled = true
+    }
+  }, [selectedAsset])
+
   function selectCampaign(campaignId: string) {
     if (campaignId === selectedCampaignId) {
       return
@@ -399,6 +546,19 @@ function App() {
     setStatusFilter('all')
     setChannelFilter('All')
     setRequestChannel(nextCampaign?.channels[0] ?? '')
+  }
+
+  async function refreshAsset(assetId: string): Promise<Asset> {
+    const refreshedAsset = mapAsset(await fetchAsset(assetId))
+
+    setAssets((currentAssets) =>
+      currentAssets.map((asset) =>
+        asset.id === refreshedAsset.id ? refreshedAsset : asset,
+      ),
+    )
+    setSelectedAssetId(refreshedAsset.id)
+
+    return refreshedAsset
   }
 
   async function updateAssetStatus(status: ReviewStatus) {
@@ -518,13 +678,7 @@ function App() {
         },
       })
 
-      const refreshedAsset = mapAsset(await fetchAsset(selectedAsset.id))
-      setAssets((currentAssets) =>
-        currentAssets.map((asset) =>
-          asset.id === refreshedAsset.id ? refreshedAsset : asset,
-        ),
-      )
-      setSelectedAssetId(refreshedAsset.id)
+      await refreshAsset(selectedAsset.id)
       setRefinePrompts((currentPrompts) => {
         const nextPrompts = { ...currentPrompts }
         delete nextPrompts[selectedAsset.id]
@@ -535,6 +689,122 @@ function App() {
     } finally {
       setIsRefining(false)
     }
+  }
+
+  async function uploadArtifact(version: AssetVersion, file: File | null) {
+    if (!selectedAsset || !file) {
+      return
+    }
+
+    setUploadingArtifactVersionId(version.versionId)
+    setErrorMessage(null)
+    setArtifactPreviewUrls((currentPreviewUrls) => {
+      const nextPreviewUrls = { ...currentPreviewUrls }
+      delete nextPreviewUrls[version.versionId]
+      return nextPreviewUrls
+    })
+    setArtifactPreviewErrors((currentPreviewErrors) => {
+      const nextPreviewErrors = { ...currentPreviewErrors }
+      delete nextPreviewErrors[version.versionId]
+      return nextPreviewErrors
+    })
+
+    try {
+      await uploadAssetVersionArtifact(selectedAsset.id, version.versionId, file)
+      await refreshAsset(selectedAsset.id)
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setUploadingArtifactVersionId(null)
+    }
+  }
+
+  async function openArtifact(version: AssetVersion) {
+    if (!selectedAsset || !version.artifactStorageKey) {
+      return
+    }
+
+    setOpeningArtifactVersionId(version.versionId)
+    setErrorMessage(null)
+
+    try {
+      const download = await fetchAssetVersionArtifactDownloadUrl(
+        selectedAsset.id,
+        version.versionId,
+      )
+      const openedWindow = window.open(
+        download.download_url,
+        '_blank',
+        'noopener,noreferrer',
+      )
+
+      if (!openedWindow) {
+        setErrorMessage('The browser blocked the artifact tab')
+      }
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setOpeningArtifactVersionId(null)
+    }
+  }
+
+  function renderArtifactPreview(version: AssetVersion) {
+    if (!version.artifactStorageKey) {
+      return (
+        <span className="artifact-summary artifact-empty">
+          No artifact attached
+        </span>
+      )
+    }
+
+    if (!hasImageArtifact(version)) {
+      return (
+        <button
+          className="artifact-file-preview"
+          onClick={() => openArtifact(version)}
+          type="button"
+        >
+          <span>{getFileExtension(version.artifactFilename)}</span>
+          <strong>{version.artifactFilename ?? 'Artifact'}</strong>
+          <small>{formatArtifactDetails(version)}</small>
+        </button>
+      )
+    }
+
+    const previewUrl = artifactPreviewUrls[version.versionId]
+    const imagePreviewUrl =
+      previewUrl?.storageKey === version.artifactStorageKey
+        ? previewUrl.url
+        : null
+
+    if (imagePreviewUrl) {
+      return (
+        <button
+          className="artifact-image-preview"
+          onClick={() => openArtifact(version)}
+          type="button"
+        >
+          <img
+            alt={version.artifactFilename ?? `${version.id} artifact`}
+            src={imagePreviewUrl}
+          />
+        </button>
+      )
+    }
+
+    if (artifactPreviewErrors[version.versionId]) {
+      return (
+        <span className="artifact-preview-state">Preview unavailable</span>
+      )
+    }
+
+    return (
+      <span className="artifact-preview-state">
+        {artifactPreviewLoadingIds[version.versionId]
+          ? 'Loading preview...'
+          : 'Preview pending'}
+      </span>
+    )
   }
 
   async function openStoredMetadata(version: AssetVersion) {
@@ -936,22 +1206,72 @@ function App() {
                       <h3>Versions</h3>
                       {selectedAsset.versions.map((version) => (
                         <div className="version-row" key={version.versionId}>
-                          <span>
+                          <span className="version-title">
                             <strong>{version.id.toUpperCase()}</strong>
                             {version.label}
                           </span>
-                          <span>{version.created}</span>
+                          <span className="version-provider">
+                            {version.created}
+                          </span>
                           <code>{version.storageKey}</code>
-                          <button
-                            className="metadata-button"
-                            disabled={openingVersionId === version.versionId}
-                            onClick={() => openStoredMetadata(version)}
-                            type="button"
+                          {renderArtifactPreview(version)}
+                          <div
+                            className="version-actions"
+                            aria-label={`${version.id} actions`}
                           >
-                            {openingVersionId === version.versionId
-                              ? 'Opening...'
-                              : 'Open stored metadata'}
-                          </button>
+                            <label
+                              aria-disabled={
+                                uploadingArtifactVersionId === version.versionId
+                              }
+                              className={`metadata-button artifact-upload ${
+                                uploadingArtifactVersionId === version.versionId
+                                  ? 'is-disabled'
+                                  : ''
+                              }`}
+                            >
+                              {uploadingArtifactVersionId === version.versionId
+                                ? 'Uploading...'
+                                : version.artifactStorageKey
+                                  ? 'Replace artifact'
+                                  : 'Attach output'}
+                              <input
+                                disabled={
+                                  uploadingArtifactVersionId ===
+                                  version.versionId
+                                }
+                                onChange={(event) => {
+                                  const file =
+                                    event.currentTarget.files?.[0] ?? null
+                                  event.currentTarget.value = ''
+                                  void uploadArtifact(version, file)
+                                }}
+                                type="file"
+                              />
+                            </label>
+                            <button
+                              className="metadata-button"
+                              disabled={
+                                !version.artifactStorageKey ||
+                                openingArtifactVersionId === version.versionId
+                              }
+                              onClick={() => openArtifact(version)}
+                              type="button"
+                            >
+                              {openingArtifactVersionId === version.versionId
+                                ? 'Opening...'
+                                : 'Open artifact'}
+                            </button>
+                            <button
+                              className="metadata-button"
+                              disabled={openingVersionId === version.versionId}
+                              onClick={() => openStoredMetadata(version)}
+                              type="button"
+                            >
+                              {openingVersionId === version.versionId
+                                ? 'Opening...'
+                                : 'Open stored metadata'}
+                            </button>
+                          </div>
                         </div>
                       ))}
                     </div>

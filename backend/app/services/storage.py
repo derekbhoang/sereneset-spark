@@ -1,7 +1,9 @@
 import json
+import re
 import uuid
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import PurePosixPath
 from typing import Any
 
 import boto3
@@ -55,6 +57,46 @@ def build_asset_version_storage_key(
                 "versions",
                 f"v{version_number}",
                 filename,
+            ]
+        )
+    )
+
+
+def normalize_artifact_filename(filename: str) -> str:
+    leaf_filename = PurePosixPath(filename.strip().replace("\\", "/")).name.strip()
+
+    if not leaf_filename:
+        raise ValueError("Artifact filename must not be empty")
+
+    safe_filename = re.sub(r"[^A-Za-z0-9._-]+", "-", leaf_filename).strip(".-")
+
+    if not safe_filename:
+        raise ValueError("Artifact filename must contain a safe name")
+
+    return safe_filename[:240]
+
+
+def build_asset_version_artifact_storage_key(
+    *,
+    campaign_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    version_number: int,
+    filename: str,
+) -> str:
+    if version_number < 1:
+        raise ValueError("Version number must be greater than zero")
+
+    return normalize_storage_key(
+        "/".join(
+            [
+                "campaigns",
+                str(campaign_id),
+                "assets",
+                str(asset_id),
+                "versions",
+                f"v{version_number}",
+                "artifact",
+                normalize_artifact_filename(filename),
             ]
         )
     )
@@ -173,6 +215,10 @@ class B2StorageService:
             Params={"Bucket": self.bucket_name, "Key": storage_key},
             ExpiresIn=expires_seconds,
         )
+
+    def delete_object(self, *, key: str) -> None:
+        storage_key = normalize_storage_key(key)
+        self.client.delete_object(Bucket=self.bucket_name, Key=storage_key)
 
 
 @lru_cache
