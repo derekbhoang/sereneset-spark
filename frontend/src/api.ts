@@ -65,6 +65,14 @@ export type AssetCreateDto = {
   initial_version?: AssetVersionCreateDto | null
 }
 
+export type AssetVersionDownloadUrlDto = {
+  asset_id: string
+  version_id: string
+  storage_key: string
+  download_url: string
+  expires_seconds: number
+}
+
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000/api/v1'
 
@@ -151,4 +159,18 @@ export function createAssetVersion(
     method: 'POST',
     body: JSON.stringify(version),
   })
+}
+
+export function fetchAssetVersionDownloadUrl(
+  assetId: string,
+  versionId: string,
+  expiresSeconds = 3600,
+): Promise<AssetVersionDownloadUrlDto> {
+  const params = new URLSearchParams({
+    expires_seconds: String(expiresSeconds),
+  })
+
+  return request<AssetVersionDownloadUrlDto>(
+    `/assets/${assetId}/versions/${versionId}/download-url?${params}`,
+  )
 }

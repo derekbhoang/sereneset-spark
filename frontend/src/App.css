@@ -710,6 +710,29 @@ a:focus-visible {
   font-size: 12px;
 }
 
+.metadata-button {
+  justify-self: start;
+  min-height: 32px;
+  border: 1px solid #b9c9c4;
+  border-radius: 6px;
+  color: #176b5d;
+  background: #f2f8f5;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 900;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.metadata-button:hover {
+  background: #e5f1ec;
+}
+
+.metadata-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
 code {
   overflow-wrap: anywhere;
   border-radius: 6px;

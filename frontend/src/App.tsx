@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   createCampaignAsset,
+  fetchAssetVersionDownloadUrl,
   fetchCampaignAssets,
   fetchCampaigns,
   updateAssetStatus as patchAssetStatus,
@@ -34,6 +35,7 @@ type Campaign = {
 
 type AssetVersion = {
   id: string
+  versionId: string
   created: string
   label: string
   prompt: string
@@ -185,6 +187,7 @@ function mapCampaign(campaign: CampaignDto, index: number): Campaign {
 function mapAssetVersion(version: AssetVersionDto): AssetVersion {
   return {
     id: `v${version.version_number}`,
+    versionId: version.id,
     created: version.provider,
     label: version.label,
     prompt: version.prompt,
@@ -226,6 +229,7 @@ function App() {
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isSavingStatus, setIsSavingStatus] = useState(false)
+  const [openingVersionId, setOpeningVersionId] = useState<string | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
   useEffect(() => {
@@ -346,6 +350,10 @@ function App() {
   ).length
 
   function selectCampaign(campaignId: string) {
+    if (campaignId === selectedCampaignId) {
+      return
+    }
+
     const nextCampaign = campaigns.find((campaign) => campaign.id === campaignId)
 
     setSelectedCampaignId(campaignId)
@@ -434,6 +442,35 @@ function App() {
       setErrorMessage(getErrorMessage(error))
     } finally {
       setIsGenerating(false)
+    }
+  }
+
+  async function openStoredMetadata(version: AssetVersion) {
+    if (!selectedAsset) {
+      return
+    }
+
+    setOpeningVersionId(version.versionId)
+    setErrorMessage(null)
+
+    try {
+      const download = await fetchAssetVersionDownloadUrl(
+        selectedAsset.id,
+        version.versionId,
+      )
+      const openedWindow = window.open(
+        download.download_url,
+        '_blank',
+        'noopener,noreferrer',
+      )
+
+      if (!openedWindow) {
+        setErrorMessage('The browser blocked the metadata tab')
+      }
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setOpeningVersionId(null)
     }
   }
 
@@ -773,13 +810,23 @@ function App() {
                     <div className="version-list">
                       <h3>Versions</h3>
                       {selectedAsset.versions.map((version) => (
-                        <div className="version-row" key={version.id}>
+                        <div className="version-row" key={version.versionId}>
                           <span>
                             <strong>{version.id.toUpperCase()}</strong>
                             {version.label}
                           </span>
                           <span>{version.created}</span>
                           <code>{version.storageKey}</code>
+                          <button
+                            className="metadata-button"
+                            disabled={openingVersionId === version.versionId}
+                            onClick={() => openStoredMetadata(version)}
+                            type="button"
+                          >
+                            {openingVersionId === version.versionId
+                              ? 'Opening...'
+                              : 'Open stored metadata'}
+                          </button>
                         </div>
                       ))}
                     </div>
