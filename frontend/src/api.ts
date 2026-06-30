@@ -127,6 +127,10 @@ export function fetchCampaignAssets(
   )
 }
 
+export function fetchAsset(assetId: string): Promise<AssetDto> {
+  return request<AssetDto>(`/assets/${assetId}`)
+}
+
 export function createCampaignAsset(
   campaignId: string,
   asset: AssetCreateDto,

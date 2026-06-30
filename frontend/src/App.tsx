@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   createCampaignAsset,
+  createAssetVersion,
+  fetchAsset,
   fetchAssetVersionDownloadUrl,
   fetchCampaignAssets,
   fetchCampaigns,
@@ -36,10 +38,12 @@ type Campaign = {
 type AssetVersion = {
   id: string
   versionId: string
+  versionNumber: number
   created: string
   label: string
   prompt: string
   model: string
+  provider: string
   storageKey: string
 }
 
@@ -166,6 +170,31 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong'
 }
 
+function buildRefinePrompt(asset: Asset): string {
+  return `Refine "${asset.title}" for ${asset.channel}. Keep the strongest idea, improve clarity, and make the next version more production-ready.`
+}
+
+function getNextVersionNumber(asset: Asset): number {
+  const latestVersionNumber = asset.versions.reduce(
+    (latest, version) => Math.max(latest, version.versionNumber),
+    0,
+  )
+
+  return latestVersionNumber + 1
+}
+
+function getLatestVersion(asset: Asset): AssetVersion | null {
+  return (
+    asset.versions.reduce<AssetVersion | null>((latest, version) => {
+      if (!latest || version.versionNumber > latest.versionNumber) {
+        return version
+      }
+
+      return latest
+    }, null)
+  )
+}
+
 function mapCampaign(campaign: CampaignDto, index: number): Campaign {
   return {
     id: campaign.id,
@@ -188,10 +217,12 @@ function mapAssetVersion(version: AssetVersionDto): AssetVersion {
   return {
     id: `v${version.version_number}`,
     versionId: version.id,
+    versionNumber: version.version_number,
     created: version.provider,
     label: version.label,
     prompt: version.prompt,
     model: version.model,
+    provider: version.provider,
     storageKey: version.storage_key,
   }
 }
@@ -229,7 +260,9 @@ function App() {
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isSavingStatus, setIsSavingStatus] = useState(false)
+  const [isRefining, setIsRefining] = useState(false)
   const [openingVersionId, setOpeningVersionId] = useState<string | null>(null)
+  const [refinePrompts, setRefinePrompts] = useState<Record<string, string>>({})
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
   useEffect(() => {
@@ -345,6 +378,10 @@ function App() {
     filteredAssets[0] ??
     null
 
+  const refinePrompt = selectedAsset
+    ? (refinePrompts[selectedAsset.id] ?? buildRefinePrompt(selectedAsset))
+    : ''
+
   const approvedCount = campaignAssets.filter(
     (asset) => asset.status === 'approved',
   ).length
@@ -442,6 +479,61 @@ function App() {
       setErrorMessage(getErrorMessage(error))
     } finally {
       setIsGenerating(false)
+    }
+  }
+
+  async function refineAsset() {
+    if (!selectedAsset) {
+      return
+    }
+
+    const trimmedPrompt = refinePrompt.trim()
+
+    if (!trimmedPrompt) {
+      return
+    }
+
+    const latestVersion = getLatestVersion(selectedAsset)
+    const versionNumber = getNextVersionNumber(selectedAsset)
+    const formatValue = formatValues[selectedAsset.format]
+    const isCopy = selectedAsset.format === 'Copy'
+
+    setIsRefining(true)
+    setErrorMessage(null)
+
+    try {
+      await createAssetVersion(selectedAsset.id, {
+        version_number: versionNumber,
+        label: `Refinement ${versionNumber}`,
+        prompt: trimmedPrompt,
+        model:
+          latestVersion?.model ??
+          (isCopy ? 'openai/gpt-4.1' : 'gmi/image-campaign-v2'),
+        provider: latestVersion?.provider ?? (isCopy ? 'openai' : 'gmi'),
+        generation_metadata: {
+          based_on_version_id: latestVersion?.versionId ?? null,
+          channel: selectedAsset.channel,
+          format: formatValue,
+          source: 'frontend_refine_action',
+        },
+      })
+
+      const refreshedAsset = mapAsset(await fetchAsset(selectedAsset.id))
+      setAssets((currentAssets) =>
+        currentAssets.map((asset) =>
+          asset.id === refreshedAsset.id ? refreshedAsset : asset,
+        ),
+      )
+      setSelectedAssetId(refreshedAsset.id)
+      setRefinePrompts((currentPrompts) => {
+        const nextPrompts = { ...currentPrompts }
+        delete nextPrompts[selectedAsset.id]
+        return nextPrompts
+      })
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setIsRefining(false)
     }
   }
 
@@ -806,6 +898,39 @@ function App() {
                         <dd>{selectedAsset.tags.join(', ')}</dd>
                       </div>
                     </dl>
+
+                    <div className="refine-panel">
+                      <div className="panel-heading">
+                        <div>
+                          <span className="eyebrow">Refine</span>
+                          <h3>Next version</h3>
+                        </div>
+                        <span>{`v${getNextVersionNumber(selectedAsset)}`}</span>
+                      </div>
+
+                      <label className="field">
+                        <span>Prompt</span>
+                        <textarea
+                          onChange={(event) =>
+                            setRefinePrompts((currentPrompts) => ({
+                              ...currentPrompts,
+                              [selectedAsset.id]: event.target.value,
+                            }))
+                          }
+                          rows={4}
+                          value={refinePrompt}
+                        />
+                      </label>
+
+                      <button
+                        className="button button-primary"
+                        disabled={isRefining || !refinePrompt.trim()}
+                        onClick={refineAsset}
+                        type="button"
+                      >
+                        {isRefining ? 'Refining...' : 'Create refinement'}
+                      </button>
+                    </div>
 
                     <div className="version-list">
                       <h3>Versions</h3>

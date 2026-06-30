@@ -319,19 +319,34 @@ def create_asset_version(
     asset_id: uuid.UUID,
     version_in: AssetVersionCreate,
     db: Session = Depends(get_db),
+    storage: B2StorageService = Depends(get_storage_service),
 ) -> AssetVersion:
     asset = get_asset_or_404(asset_id, db)
+    campaign = ensure_campaign_exists(asset.campaign_id, db)
 
     version = make_asset_version(asset=asset, version_in=version_in)
-    db.add(version)
 
     try:
+        db.add(version)
+        db.flush()
+        upload_asset_version_sidecar(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+        )
         db.commit()
     except IntegrityError as exc:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Asset version number already exists",
+        ) from exc
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Asset version was not created because B2 storage failed",
         ) from exc
 
     db.refresh(version)
