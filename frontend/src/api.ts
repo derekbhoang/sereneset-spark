@@ -88,6 +88,11 @@ export type AssetVersionArtifactDownloadUrlDto = {
   expires_seconds: number
 }
 
+export type DownloadedFile = {
+  blob: Blob
+  filename: string
+}
+
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? 'http://127.0.0.1:8000/api/v1'
 
@@ -135,8 +140,42 @@ async function uploadRequest<T>(path: string, formData: FormData): Promise<T> {
   return response.json() as Promise<T>
 }
 
+function getFilenameFromContentDisposition(value: string | null): string | null {
+  if (!value) {
+    return null
+  }
+
+  const match = value.match(/filename="?([^"]+)"?/i)
+  return match?.[1] ?? null
+}
+
+async function downloadRequest(
+  path: string,
+  fallbackFilename: string,
+): Promise<DownloadedFile> {
+  const response = await fetch(`${API_BASE_URL}${path}`)
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response))
+  }
+
+  const filename =
+    getFilenameFromContentDisposition(
+      response.headers.get('Content-Disposition'),
+    ) ?? fallbackFilename
+
+  return {
+    blob: await response.blob(),
+    filename,
+  }
+}
+
 export function fetchCampaigns(): Promise<CampaignDto[]> {
   return request<CampaignDto[]>('/campaigns')
+}
+
+export function exportCampaignPack(campaignId: string): Promise<DownloadedFile> {
+  return downloadRequest(`/campaigns/${campaignId}/export`, 'campaign-export.zip')
 }
 
 export function fetchCampaignAssets(

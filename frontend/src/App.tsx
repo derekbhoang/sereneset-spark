@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   createCampaignAsset,
   createAssetVersion,
+  exportCampaignPack,
   fetchAsset,
   fetchAssetVersionArtifactDownloadUrl,
   fetchAssetVersionDownloadUrl,
@@ -323,6 +324,7 @@ function App() {
   const [isLoadingCampaigns, setIsLoadingCampaigns] = useState(true)
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
+  const [isExporting, setIsExporting] = useState(false)
   const [isSavingStatus, setIsSavingStatus] = useState(false)
   const [isRefining, setIsRefining] = useState(false)
   const [openingVersionId, setOpeningVersionId] = useState<string | null>(null)
@@ -546,6 +548,33 @@ function App() {
     setStatusFilter('all')
     setChannelFilter('All')
     setRequestChannel(nextCampaign?.channels[0] ?? '')
+  }
+
+  async function downloadCampaignExport() {
+    if (!selectedCampaign) {
+      return
+    }
+
+    setIsExporting(true)
+    setErrorMessage(null)
+
+    try {
+      const download = await exportCampaignPack(selectedCampaign.id)
+      const url = URL.createObjectURL(download.blob)
+      const link = document.createElement('a')
+
+      link.href = url
+      link.download = download.filename
+      link.style.display = 'none'
+      document.body.append(link)
+      link.click()
+      link.remove()
+      window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setIsExporting(false)
+    }
   }
 
   async function refreshAsset(assetId: string): Promise<Asset> {
@@ -861,8 +890,13 @@ function App() {
             <span>Search</span>
             <input type="search" placeholder="Asset, channel, tag" />
           </label>
-          <button className="button button-secondary" type="button">
-            Export pack
+          <button
+            className="button button-secondary"
+            disabled={!selectedCampaign || isExporting}
+            onClick={downloadCampaignExport}
+            type="button"
+          >
+            {isExporting ? 'Exporting...' : 'Export pack'}
           </button>
         </div>
       </header>

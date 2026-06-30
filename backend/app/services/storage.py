@@ -220,6 +220,16 @@ class B2StorageService:
         storage_key = normalize_storage_key(key)
         self.client.delete_object(Bucket=self.bucket_name, Key=storage_key)
 
+    def download_bytes(self, *, key: str) -> bytes:
+        storage_key = normalize_storage_key(key)
+        response = self.client.get_object(Bucket=self.bucket_name, Key=storage_key)
+        body = response["Body"]
+
+        try:
+            return body.read()
+        finally:
+            body.close()
+
 
 @lru_cache
 def get_storage_service() -> B2StorageService:
