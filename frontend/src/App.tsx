@@ -1,16 +1,15 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  createCampaignAsset,
-  createAssetVersion,
   exportCampaignPack,
   fetchAsset,
   fetchAssetVersionArtifactDownloadUrl,
   fetchAssetVersionDownloadUrl,
   fetchCampaignAssets,
   fetchCampaigns,
+  generateAssetVersion,
+  generateCampaignAsset,
   updateAssetStatus as patchAssetStatus,
   uploadAssetVersionArtifact,
-  type AssetCreateDto,
   type AssetDto,
   type AssetFormatValue,
   type AssetVersionDto,
@@ -52,6 +51,8 @@ type AssetVersion = {
   artifactFilename: string | null
   artifactContentType: string | null
   artifactSizeBytes: number | null
+  generationMetadata: Record<string, unknown>
+  generatedPreview: GeneratedPreview | null
 }
 
 type Asset = {
@@ -72,6 +73,13 @@ type Asset = {
 type ArtifactPreviewUrl = {
   storageKey: string
   url: string
+}
+
+type GeneratedPreview = {
+  url: string | null
+  storageKey: string | null
+  contentType: string | null
+  filename: string | null
 }
 
 const defaultPrompt =
@@ -152,13 +160,17 @@ function formatFileSize(value: number | null): string {
 
 function formatArtifactDetails(version: AssetVersion): string {
   const details = [
-    version.artifactContentType,
+    version.artifactContentType ?? version.generatedPreview?.contentType,
     version.artifactSizeBytes === null
       ? null
       : formatFileSize(version.artifactSizeBytes),
   ].filter(Boolean)
 
   return details.join(' / ') || 'Stored artifact'
+}
+
+function getVersionFilename(version: AssetVersion): string | null {
+  return version.artifactFilename ?? version.generatedPreview?.filename ?? null
 }
 
 function getFileExtension(filename: string | null): string {
@@ -171,16 +183,80 @@ function getFileExtension(filename: string | null): string {
   return extension.slice(0, 5).toLowerCase()
 }
 
-function hasImageArtifact(version: AssetVersion): boolean {
-  if (!version.artifactStorageKey) {
-    return false
-  }
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
 
-  if (version.artifactContentType?.startsWith('image/')) {
+function readString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
+function readAssetMetadataList(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.filter(isRecord) : []
+}
+
+function isImageDescriptor(
+  contentType: string | null,
+  filename: string | null,
+  url: string | null = null,
+): boolean {
+  if (contentType?.startsWith('image/')) {
     return true
   }
 
-  return /\.(avif|gif|jpe?g|png|webp)$/i.test(version.artifactFilename ?? '')
+  return /\.(avif|gif|jpe?g|png|webp)$/i.test(filename ?? url ?? '')
+}
+
+function getGeneratedPreview(
+  metadata: Record<string, unknown>,
+): GeneratedPreview | null {
+  const provenance = isRecord(metadata.provenance) ? metadata.provenance : null
+  const assetCandidates = [
+    ...readAssetMetadataList(metadata.assets),
+    ...readAssetMetadataList(provenance?.assets),
+  ]
+    .map((asset) => ({
+      url: readString(asset.url),
+      storageKey: readString(asset.storage_key),
+      contentType: readString(asset.content_type),
+      filename: readString(asset.filename),
+    }))
+    .filter((asset) => asset.url || asset.storageKey)
+
+  return (
+    assetCandidates.find((asset) =>
+      isImageDescriptor(asset.contentType, asset.filename, asset.url),
+    ) ??
+    assetCandidates[0] ??
+    null
+  )
+}
+
+function hasImageArtifact(version: AssetVersion): boolean {
+  const generatedPreview = version.generatedPreview
+
+  if (
+    isImageDescriptor(
+      version.artifactContentType,
+      version.artifactFilename,
+      null,
+    )
+  ) {
+    return true
+  }
+
+  if (
+    generatedPreview &&
+    isImageDescriptor(
+      generatedPreview.contentType,
+      generatedPreview.filename,
+      generatedPreview.url,
+    )
+  ) {
+    return true
+  }
+
+  return Boolean(version.artifactStorageKey && generatedPreview)
 }
 
 function titleCase(value: string): string {
@@ -244,18 +320,6 @@ function getNextVersionNumber(asset: Asset): number {
   return latestVersionNumber + 1
 }
 
-function getLatestVersion(asset: Asset): AssetVersion | null {
-  return (
-    asset.versions.reduce<AssetVersion | null>((latest, version) => {
-      if (!latest || version.versionNumber > latest.versionNumber) {
-        return version
-      }
-
-      return latest
-    }, null)
-  )
-}
-
 function mapCampaign(campaign: CampaignDto, index: number): Campaign {
   return {
     id: campaign.id,
@@ -275,6 +339,8 @@ function mapCampaign(campaign: CampaignDto, index: number): Campaign {
 }
 
 function mapAssetVersion(version: AssetVersionDto): AssetVersion {
+  const generatedPreview = getGeneratedPreview(version.generation_metadata)
+
   return {
     id: `v${version.version_number}`,
     versionId: version.id,
@@ -289,6 +355,8 @@ function mapAssetVersion(version: AssetVersionDto): AssetVersion {
     artifactFilename: version.artifact_filename,
     artifactContentType: version.artifact_content_type,
     artifactSizeBytes: version.artifact_size_bytes,
+    generationMetadata: version.generation_metadata,
+    generatedPreview,
   }
 }
 
@@ -618,44 +686,31 @@ function App() {
       return
     }
 
-    const now = Date.now()
     const formatValue = formatValues[requestFormat]
-    const isCopy = requestFormat === 'Copy'
-    const model = isCopy ? 'openai/gpt-4.1' : 'gmi/image-campaign-v2'
-    const provider = isCopy ? 'openai' : 'gmi'
-    const summary = isCopy
-      ? 'A generated copy direction with headline, support copy, and compliance notes ready for review.'
-      : 'A generated creative direction with composition, focal point, messaging, and production notes.'
-
-    const assetPayload: AssetCreateDto = {
-      title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
-      format: formatValue,
-      channel: requestChannel,
-      status: 'draft',
-      reviewer: null,
-      tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
-      summary,
-      initial_version: {
-        version_number: 1,
-        label: 'Initial generated draft',
-        prompt: requestPrompt,
-        model,
-        provider,
-        generation_metadata: {
-          channel: requestChannel,
-          format: formatValue,
-          requested_at_ms: now,
-          source: 'frontend_mock_generation',
-        },
-      },
-    }
 
     setIsGenerating(true)
     setErrorMessage(null)
 
     try {
       const createdAsset = mapAsset(
-        await createCampaignAsset(selectedCampaign.id, assetPayload),
+        await generateCampaignAsset(selectedCampaign.id, {
+          title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
+          format: formatValue,
+          channel: requestChannel,
+          prompt: requestPrompt,
+          status: 'draft',
+          reviewer: null,
+          tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
+          summary:
+            'A Genblaze-generated creative direction with durable B2 storage and provenance metadata.',
+          generation_parameters: {
+            campaign_name: selectedCampaign.name,
+            product: selectedCampaign.product,
+            audience: selectedCampaign.audience,
+            format: formatValue,
+            channel: requestChannel,
+          },
+        }),
       )
       setAssets((currentAssets) => [
         createdAsset,
@@ -682,32 +737,29 @@ function App() {
       return
     }
 
-    const latestVersion = getLatestVersion(selectedAsset)
     const versionNumber = getNextVersionNumber(selectedAsset)
-    const formatValue = formatValues[selectedAsset.format]
-    const isCopy = selectedAsset.format === 'Copy'
 
     setIsRefining(true)
     setErrorMessage(null)
 
     try {
-      await createAssetVersion(selectedAsset.id, {
-        version_number: versionNumber,
-        label: `Refinement ${versionNumber}`,
-        prompt: trimmedPrompt,
-        model:
-          latestVersion?.model ??
-          (isCopy ? 'openai/gpt-4.1' : 'gmi/image-campaign-v2'),
-        provider: latestVersion?.provider ?? (isCopy ? 'openai' : 'gmi'),
-        generation_metadata: {
-          based_on_version_id: latestVersion?.versionId ?? null,
-          channel: selectedAsset.channel,
-          format: formatValue,
-          source: 'frontend_refine_action',
-        },
-      })
-
-      await refreshAsset(selectedAsset.id)
+      const refreshedAsset = mapAsset(
+        await generateAssetVersion(selectedAsset.id, {
+          prompt: trimmedPrompt,
+          label: `Genblaze refinement ${versionNumber}`,
+          generation_parameters: {
+            asset_title: selectedAsset.title,
+            format: formatValues[selectedAsset.format],
+            channel: selectedAsset.channel,
+          },
+        }),
+      )
+      setAssets((currentAssets) =>
+        currentAssets.map((asset) =>
+          asset.id === refreshedAsset.id ? refreshedAsset : asset,
+        ),
+      )
+      setSelectedAssetId(refreshedAsset.id)
       setRefinePrompts((currentPrompts) => {
         const nextPrompts = { ...currentPrompts }
         delete nextPrompts[selectedAsset.id]
@@ -719,7 +771,6 @@ function App() {
       setIsRefining(false)
     }
   }
-
   async function uploadArtifact(version: AssetVersion, file: File | null) {
     if (!selectedAsset || !file) {
       return
@@ -748,8 +799,28 @@ function App() {
     }
   }
 
+  function openPendingTab(blockedMessage: string): Window | null {
+    const openedWindow = window.open('about:blank', '_blank')
+
+    if (!openedWindow) {
+      setErrorMessage(blockedMessage)
+      return null
+    }
+
+    openedWindow.opener = null
+    openedWindow.document.title = 'Opening asset...'
+    openedWindow.document.body.textContent = 'Preparing signed download URL...'
+
+    return openedWindow
+  }
+
   async function openArtifact(version: AssetVersion) {
     if (!selectedAsset || !version.artifactStorageKey) {
+      return
+    }
+
+    const openedWindow = openPendingTab('The browser blocked the artifact tab')
+    if (!openedWindow) {
       return
     }
 
@@ -761,24 +832,42 @@ function App() {
         selectedAsset.id,
         version.versionId,
       )
-      const openedWindow = window.open(
-        download.download_url,
-        '_blank',
-        'noopener,noreferrer',
-      )
-
-      if (!openedWindow) {
-        setErrorMessage('The browser blocked the artifact tab')
-      }
+      openedWindow.location.assign(download.download_url)
     } catch (error) {
+      openedWindow.close()
       setErrorMessage(getErrorMessage(error))
     } finally {
       setOpeningArtifactVersionId(null)
     }
   }
 
+  function openGeneratedPreview(version: AssetVersion) {
+    const previewUrl = version.generatedPreview?.url
+
+    if (!previewUrl) {
+      return
+    }
+
+    const openedWindow = window.open(previewUrl, '_blank', 'noopener,noreferrer')
+
+    if (!openedWindow) {
+      setErrorMessage('The browser blocked the generated preview tab')
+    }
+  }
+
+  function openPreview(version: AssetVersion) {
+    if (version.artifactStorageKey) {
+      void openArtifact(version)
+      return
+    }
+
+    openGeneratedPreview(version)
+  }
+
   function renderArtifactPreview(version: AssetVersion) {
-    if (!version.artifactStorageKey) {
+    const generatedPreviewUrl = version.generatedPreview?.url ?? null
+
+    if (!version.artifactStorageKey && !generatedPreviewUrl) {
       return (
         <span className="artifact-summary artifact-empty">
           No artifact attached
@@ -790,11 +879,11 @@ function App() {
       return (
         <button
           className="artifact-file-preview"
-          onClick={() => openArtifact(version)}
+          onClick={() => openPreview(version)}
           type="button"
         >
-          <span>{getFileExtension(version.artifactFilename)}</span>
-          <strong>{version.artifactFilename ?? 'Artifact'}</strong>
+          <span>{getFileExtension(getVersionFilename(version))}</span>
+          <strong>{getVersionFilename(version) ?? 'Artifact'}</strong>
           <small>{formatArtifactDetails(version)}</small>
         </button>
       )
@@ -804,19 +893,23 @@ function App() {
     const imagePreviewUrl =
       previewUrl?.storageKey === version.artifactStorageKey
         ? previewUrl.url
-        : null
+        : generatedPreviewUrl
 
     if (imagePreviewUrl) {
       return (
         <button
           className="artifact-image-preview"
-          onClick={() => openArtifact(version)}
+          onClick={() => openPreview(version)}
           type="button"
         >
           <img
-            alt={version.artifactFilename ?? `${version.id} artifact`}
+            alt={getVersionFilename(version) ?? `${version.id} generated preview`}
             src={imagePreviewUrl}
           />
+          <span className="artifact-image-caption">
+            <strong>{getVersionFilename(version) ?? 'Generated preview'}</strong>
+            <small>{formatArtifactDetails(version)}</small>
+          </span>
         </button>
       )
     }
@@ -841,6 +934,11 @@ function App() {
       return
     }
 
+    const openedWindow = openPendingTab('The browser blocked the metadata tab')
+    if (!openedWindow) {
+      return
+    }
+
     setOpeningVersionId(version.versionId)
     setErrorMessage(null)
 
@@ -849,16 +947,9 @@ function App() {
         selectedAsset.id,
         version.versionId,
       )
-      const openedWindow = window.open(
-        download.download_url,
-        '_blank',
-        'noopener,noreferrer',
-      )
-
-      if (!openedWindow) {
-        setErrorMessage('The browser blocked the metadata tab')
-      }
+      openedWindow.location.assign(download.download_url)
     } catch (error) {
+      openedWindow.close()
       setErrorMessage(getErrorMessage(error))
     } finally {
       setOpeningVersionId(null)

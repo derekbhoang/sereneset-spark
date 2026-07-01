@@ -3,5 +3,7 @@ uvicorn[standard]
 sqlalchemy
 alembic
 boto3
+genblaze[gmicloud]
+python-multipart
 psycopg[binary]
 pydantic-settings

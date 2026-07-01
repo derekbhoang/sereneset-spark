@@ -69,6 +69,28 @@ export type AssetCreateDto = {
   initial_version?: AssetVersionCreateDto | null
 }
 
+export type AssetGenerationCreateDto = {
+  title?: string | null
+  format: AssetFormatValue
+  channel: string
+  prompt: string
+  status?: ReviewStatus
+  reviewer?: string | null
+  tags?: string[]
+  summary?: string | null
+  model?: string | null
+  generation_parameters?: Record<string, unknown>
+  timeout_seconds?: number | null
+}
+
+export type AssetVersionGenerationCreateDto = {
+  prompt: string
+  label?: string | null
+  model?: string | null
+  generation_parameters?: Record<string, unknown>
+  timeout_seconds?: number | null
+}
+
 export type AssetVersionDownloadUrlDto = {
   asset_id: string
   version_id: string
@@ -212,6 +234,16 @@ export function createCampaignAsset(
   })
 }
 
+export function generateCampaignAsset(
+  campaignId: string,
+  asset: AssetGenerationCreateDto,
+): Promise<AssetDto> {
+  return request<AssetDto>(`/campaigns/${campaignId}/assets/generate`, {
+    method: 'POST',
+    body: JSON.stringify(asset),
+  })
+}
+
 export function updateAssetStatus(
   assetId: string,
   status: ReviewStatus,
@@ -231,6 +263,16 @@ export function createAssetVersion(
   version: AssetVersionCreateDto,
 ): Promise<AssetVersionDto> {
   return request<AssetVersionDto>(`/assets/${assetId}/versions`, {
+    method: 'POST',
+    body: JSON.stringify(version),
+  })
+}
+
+export function generateAssetVersion(
+  assetId: string,
+  version: AssetVersionGenerationCreateDto,
+): Promise<AssetDto> {
+  return request<AssetDto>(`/assets/${assetId}/versions/generate`, {
     method: 'POST',
     body: JSON.stringify(version),
   })

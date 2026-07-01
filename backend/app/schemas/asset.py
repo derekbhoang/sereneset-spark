@@ -51,6 +51,28 @@ class AssetVersionArtifactDownloadUrl(BaseModel):
     expires_seconds: int
 
 
+class AssetGenerationCreate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=180)
+    format: AssetFormat = AssetFormat.image
+    channel: str = Field(min_length=1, max_length=80)
+    prompt: str = Field(min_length=1)
+    status: ReviewStatus = ReviewStatus.draft
+    reviewer: str | None = Field(default=None, max_length=120)
+    tags: list[str] = Field(default_factory=list)
+    summary: str | None = Field(default=None, min_length=1)
+    model: str | None = Field(default=None, min_length=1, max_length=120)
+    generation_parameters: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: int | None = Field(default=None, ge=30)
+
+
+class AssetVersionGenerationCreate(BaseModel):
+    prompt: str = Field(min_length=1)
+    label: str | None = Field(default=None, min_length=1, max_length=180)
+    model: str | None = Field(default=None, min_length=1, max_length=120)
+    generation_parameters: dict[str, Any] = Field(default_factory=dict)
+    timeout_seconds: int | None = Field(default=None, ge=30)
+
+
 class AssetBase(BaseModel):
     title: str = Field(min_length=1, max_length=180)
     format: AssetFormat

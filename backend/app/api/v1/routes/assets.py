@@ -1,5 +1,9 @@
+import mimetypes
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
@@ -12,12 +16,23 @@ from app.models.asset import Asset, AssetVersion, ReviewStatus
 from app.models.campaign import Campaign
 from app.schemas.asset import (
     AssetCreate,
+    AssetGenerationCreate,
     AssetRead,
     AssetStatusUpdate,
     AssetVersionArtifactDownloadUrl,
     AssetVersionCreate,
     AssetVersionDownloadUrl,
+    AssetVersionGenerationCreate,
     AssetVersionRead,
+)
+from app.services.generation import (
+    GeneratedAsset,
+    GenerationConfigurationError,
+    GenerationProviderError,
+    GenerationResult,
+    GenblazeGenerationService,
+    ImageGenerationRequest,
+    get_generation_service,
 )
 from app.services.storage import (
     B2StorageService,
@@ -31,6 +46,12 @@ from app.services.storage import (
 
 router = APIRouter(tags=["assets"])
 MAX_ARTIFACT_SIZE_BYTES = 25 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class GeneratedArtifactPayload:
+    body: bytes
+    content_type: str | None
 
 
 def get_asset_or_404(asset_id: uuid.UUID, db: Session) -> Asset:
@@ -86,6 +107,13 @@ def make_asset_version(
     version_in: AssetVersionCreate,
 ) -> AssetVersion:
     version_data = version_in.model_dump()
+    version_data["generation_metadata"] = build_version_generation_metadata(
+        provider=version_in.provider,
+        model=version_in.model,
+        prompt=version_in.prompt,
+        base_metadata=version_in.generation_metadata,
+        source="manual_asset_version_create",
+    )
     storage_key = build_asset_version_storage_key(
         campaign_id=asset.campaign_id,
         asset_id=asset.id,
@@ -96,6 +124,529 @@ def make_asset_version(
         asset_id=asset.id,
         storage_key=storage_key,
         **version_data,
+    )
+
+
+def make_generated_asset_version(
+    *,
+    asset: Asset,
+    version_number: int,
+    label: str,
+    prompt: str,
+    result: GenerationResult,
+    generation_parameters: dict[str, object],
+    source: str,
+    based_on_version_id: uuid.UUID | None = None,
+) -> AssetVersion:
+    version = AssetVersion(
+        asset_id=asset.id,
+        version_number=version_number,
+        label=label,
+        prompt=prompt,
+        model=result.model,
+        provider=result.provider,
+        storage_key=build_asset_version_storage_key(
+            campaign_id=asset.campaign_id,
+            asset_id=asset.id,
+            version_number=version_number,
+        ),
+        generation_metadata=build_generation_metadata(
+            result=result,
+            generation_parameters=generation_parameters,
+            source=source,
+            based_on_version_id=based_on_version_id,
+        ),
+    )
+
+    return version
+
+
+def generated_asset_to_metadata(asset: GeneratedAsset) -> dict[str, object | None]:
+    return {
+        "url": asset.url,
+        "storage_key": asset.storage_key,
+        "sha256": asset.sha256,
+        "content_type": asset.content_type,
+        "size_bytes": asset.size_bytes,
+        "filename": asset.filename,
+    }
+
+
+def build_version_generation_metadata(
+    *,
+    provider: str,
+    model: str,
+    prompt: str,
+    base_metadata: dict[str, object],
+    source: str,
+    generation_parameters: dict[str, object] | None = None,
+    based_on_version_id: uuid.UUID | str | None = None,
+    manifest_uri: str | None = None,
+    manifest_hash: str | None = None,
+    manifest_verified: bool | None = None,
+    assets: list[dict[str, object | None]] | None = None,
+) -> dict[str, object]:
+    existing_provenance = base_metadata.get("provenance")
+    based_on_version = (
+        str(based_on_version_id) if based_on_version_id is not None else None
+    )
+    provenance: dict[str, object] = {
+        "provider": provider,
+        "model": model,
+        "prompt": prompt,
+        "source": source,
+        "based_on_version_id": based_on_version,
+        "generation_parameters": generation_parameters or {},
+        "manifest_uri": manifest_uri,
+        "manifest_hash": manifest_hash,
+        "manifest_verified": manifest_verified,
+        "assets": assets or [],
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+
+    if existing_provenance is not None:
+        provenance["upstream_provenance"] = existing_provenance
+
+    return {
+        **base_metadata,
+        "provider": provider,
+        "model": model,
+        "prompt": prompt,
+        "source": source,
+        "based_on_version_id": based_on_version,
+        "generation_parameters": generation_parameters or {},
+        "manifest_uri": manifest_uri,
+        "manifest_hash": manifest_hash,
+        "manifest_verified": manifest_verified,
+        "assets": assets or [],
+        "provenance": provenance,
+    }
+
+
+def build_generation_metadata(
+    *,
+    result: GenerationResult,
+    generation_parameters: dict[str, object],
+    source: str,
+    based_on_version_id: uuid.UUID | None = None,
+) -> dict[str, object]:
+    return build_version_generation_metadata(
+        provider=result.provider,
+        model=result.model,
+        prompt=result.prompt,
+        base_metadata=result.generation_metadata,
+        source=source,
+        generation_parameters=generation_parameters,
+        based_on_version_id=based_on_version_id,
+        manifest_uri=result.manifest_uri,
+        manifest_hash=result.manifest_hash,
+        manifest_verified=result.manifest_verified,
+        assets=[generated_asset_to_metadata(asset) for asset in result.assets],
+    )
+
+
+def get_generated_artifact(result: GenerationResult) -> GeneratedAsset:
+    for asset in result.assets:
+        if asset.storage_key or asset.url:
+            return asset
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="Genblaze did not return an artifact URL or storage key",
+    )
+
+
+def guess_artifact_extension(content_type: str | None) -> str:
+    if not content_type:
+        return ".png"
+
+    guessed_extension = mimetypes.guess_extension(content_type.split(";")[0].strip())
+    if guessed_extension == ".jpe":
+        return ".jpg"
+
+    return guessed_extension or ".png"
+
+
+def generated_artifact_filename(
+    *,
+    artifact: GeneratedAsset,
+    version: AssetVersion,
+    content_type: str | None,
+) -> str:
+    artifact_filename = artifact.filename or (
+        f"artifact-v{version.version_number}"
+        f"{guess_artifact_extension(content_type)}"
+    )
+
+    try:
+        return normalize_artifact_filename(artifact_filename)
+    except ValueError:
+        return f"artifact-v{version.version_number}.png"
+
+
+def ensure_artifact_payload_size(payload: GeneratedArtifactPayload) -> None:
+    if not payload.body:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Generated artifact was empty",
+        )
+
+    if len(payload.body) > MAX_ARTIFACT_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="Generated artifact must be 25 MB or smaller",
+        )
+
+
+def download_generated_artifact_url(url: str) -> GeneratedArtifactPayload:
+    request = Request(
+        url,
+        headers={"User-Agent": "SereneSet-Spark/1.0"},
+    )
+
+    try:
+        with urlopen(request, timeout=60) as response:
+            payload = GeneratedArtifactPayload(
+                body=response.read(MAX_ARTIFACT_SIZE_BYTES + 1),
+                content_type=response.headers.get_content_type(),
+            )
+    except (OSError, URLError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Generated artifact could not be downloaded",
+        ) from exc
+
+    ensure_artifact_payload_size(payload)
+    return payload
+
+
+def read_generated_artifact_payload(
+    *,
+    storage: B2StorageService,
+    artifact: GeneratedAsset,
+) -> GeneratedArtifactPayload:
+    if artifact.storage_key:
+        payload = GeneratedArtifactPayload(
+            body=storage.download_bytes(key=artifact.storage_key),
+            content_type=artifact.content_type,
+        )
+        ensure_artifact_payload_size(payload)
+        return payload
+
+    if artifact.url:
+        return download_generated_artifact_url(artifact.url)
+
+    raise HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail="Genblaze did not return a readable artifact",
+    )
+
+
+def upload_generated_artifact_reference(
+    *,
+    storage: B2StorageService,
+    campaign: Campaign,
+    asset: Asset,
+    version: AssetVersion,
+    artifact: GeneratedAsset,
+    source: str,
+) -> str:
+    payload = read_generated_artifact_payload(storage=storage, artifact=artifact)
+    artifact_content_type = (
+        artifact.content_type
+        or payload.content_type
+        or "application/octet-stream"
+    )
+    artifact_filename = generated_artifact_filename(
+        artifact=artifact,
+        version=version,
+        content_type=artifact_content_type,
+    )
+    artifact_storage_key = build_asset_version_artifact_storage_key(
+        campaign_id=asset.campaign_id,
+        asset_id=asset.id,
+        version_number=version.version_number,
+        filename=artifact_filename,
+    )
+    stored_artifact = storage.upload_bytes(
+        key=artifact_storage_key,
+        body=payload.body,
+        content_type=artifact_content_type,
+        metadata={
+            "campaign_id": str(campaign.id),
+            "asset_id": str(asset.id),
+            "version_id": str(version.id),
+            "version_number": version.version_number,
+            "content_kind": "asset-version-artifact",
+            "filename": artifact_filename,
+            "source": source,
+            "source_storage_key": artifact.storage_key,
+            "source_sha256": artifact.sha256,
+        },
+    )
+
+    version.artifact_storage_key = stored_artifact.key
+    version.artifact_filename = artifact_filename
+    version.artifact_content_type = stored_artifact.content_type
+    version.artifact_size_bytes = stored_artifact.size
+    ensure_version_generation_metadata(version=version, source=source)
+    artifact_flow = {
+        "storage_key": stored_artifact.key,
+        "filename": artifact_filename,
+        "content_type": stored_artifact.content_type,
+        "size_bytes": stored_artifact.size,
+        "source": source,
+        "source_storage_key": artifact.storage_key,
+        "source_sha256": artifact.sha256,
+    }
+    provenance = version.generation_metadata.get("provenance")
+    if isinstance(provenance, dict):
+        provenance = {
+            **provenance,
+            "artifact_flow": artifact_flow,
+        }
+
+    version.generation_metadata = {
+        **version.generation_metadata,
+        "artifact_flow": artifact_flow,
+        "provenance": provenance,
+    }
+
+    return stored_artifact.key
+
+
+def upload_generated_artifact(
+    *,
+    storage: B2StorageService,
+    campaign: Campaign,
+    asset: Asset,
+    version: AssetVersion,
+    result: GenerationResult,
+) -> str:
+    return upload_generated_artifact_reference(
+        storage=storage,
+        campaign=campaign,
+        asset=asset,
+        version=version,
+        artifact=get_generated_artifact(result),
+        source="genblaze",
+    )
+
+
+def optional_string(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+
+    return None
+
+
+def optional_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+
+    return None
+
+
+def optional_bool(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+
+    return None
+
+
+def optional_metadata_dict(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+
+    return {}
+
+
+def optional_asset_metadata_list(value: object) -> list[dict[str, object | None]]:
+    if not isinstance(value, list):
+        return []
+
+    return [item for item in value if isinstance(item, dict)]
+
+
+def ensure_version_generation_metadata(
+    *,
+    version: AssetVersion,
+    source: str,
+) -> None:
+    metadata = version.generation_metadata or {}
+
+    if (
+        metadata.get("provider") == version.provider
+        and metadata.get("model") == version.model
+        and metadata.get("prompt") == version.prompt
+        and isinstance(metadata.get("provenance"), dict)
+    ):
+        return
+
+    generation_parameters = optional_metadata_dict(
+        metadata.get("generation_parameters")
+    )
+    version.generation_metadata = build_version_generation_metadata(
+        provider=version.provider,
+        model=version.model,
+        prompt=version.prompt,
+        base_metadata=metadata,
+        source=optional_string(metadata.get("source")) or source,
+        generation_parameters=generation_parameters,
+        based_on_version_id=optional_string(metadata.get("based_on_version_id")),
+        manifest_uri=optional_string(metadata.get("manifest_uri")),
+        manifest_hash=optional_string(metadata.get("manifest_hash")),
+        manifest_verified=optional_bool(metadata.get("manifest_verified")),
+        assets=optional_asset_metadata_list(metadata.get("assets")),
+    )
+
+
+def generated_asset_from_metadata(data: object) -> GeneratedAsset | None:
+    if not isinstance(data, dict):
+        return None
+
+    storage_key = optional_string(data.get("storage_key"))
+    url = optional_string(data.get("url"))
+
+    if not storage_key and not url:
+        return None
+
+    return GeneratedAsset(
+        url=url,
+        storage_key=storage_key,
+        sha256=optional_string(data.get("sha256")),
+        content_type=optional_string(data.get("content_type")),
+        size_bytes=optional_int(data.get("size_bytes")),
+        filename=optional_string(data.get("filename")),
+    )
+
+
+def asset_version_artifact_prefix(*, asset: Asset, version: AssetVersion) -> str:
+    return "/".join(
+        [
+            "campaigns",
+            str(asset.campaign_id),
+            "assets",
+            str(asset.id),
+            "versions",
+            f"v{version.version_number}",
+            "artifact",
+            "",
+        ]
+    )
+
+
+def is_app_asset_version_artifact_key(
+    *,
+    asset: Asset,
+    version: AssetVersion,
+    storage_key: str | None,
+) -> bool:
+    return bool(
+        storage_key
+        and storage_key.startswith(
+            asset_version_artifact_prefix(asset=asset, version=version)
+        )
+    )
+
+
+def existing_generated_artifact_reference(
+    *,
+    asset: Asset,
+    version: AssetVersion,
+) -> GeneratedAsset:
+    metadata = version.generation_metadata or {}
+    artifact_flow = metadata.get("artifact_flow")
+
+    if isinstance(artifact_flow, dict):
+        source_storage_key = optional_string(artifact_flow.get("source_storage_key"))
+        if source_storage_key:
+            return GeneratedAsset(
+                url=None,
+                storage_key=source_storage_key,
+                sha256=optional_string(artifact_flow.get("source_sha256")),
+                content_type=version.artifact_content_type,
+                size_bytes=None,
+                filename=version.artifact_filename,
+            )
+
+    generated_assets = metadata.get("assets")
+    if isinstance(generated_assets, list):
+        for generated_asset in generated_assets:
+            artifact = generated_asset_from_metadata(generated_asset)
+            if artifact is not None:
+                return artifact
+
+    if (
+        version.artifact_storage_key
+        and not is_app_asset_version_artifact_key(
+            asset=asset,
+            version=version,
+            storage_key=version.artifact_storage_key,
+        )
+    ):
+        return GeneratedAsset(
+            url=None,
+            storage_key=version.artifact_storage_key,
+            sha256=None,
+            content_type=version.artifact_content_type,
+            size_bytes=version.artifact_size_bytes,
+            filename=version.artifact_filename,
+        )
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Asset version does not have a generated artifact to ingest",
+    )
+
+
+def generate_image_or_502(
+    *,
+    generation: GenblazeGenerationService,
+    prompt: str,
+    model: str | None,
+    generation_parameters: dict[str, object],
+    timeout_seconds: int | None,
+) -> GenerationResult:
+    try:
+        return generation.generate_image(
+            ImageGenerationRequest(
+                prompt=prompt,
+                model=model,
+                parameters=generation_parameters,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+    except GenerationConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except GenerationProviderError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        ) from exc
+
+
+def generated_asset_title(asset_in: AssetGenerationCreate) -> str:
+    if asset_in.title:
+        return asset_in.title
+
+    format_label = asset_in.format.value.replace("_", " ")
+    return f"{asset_in.channel} {format_label} draft"
+
+
+def generated_asset_summary(asset_in: AssetGenerationCreate) -> str:
+    if asset_in.summary:
+        return asset_in.summary
+
+    return (
+        "Genblaze-generated creative asset with durable B2 artifact storage "
+        "and provenance metadata."
     )
 
 
@@ -226,6 +777,232 @@ def list_campaign_assets(
         statement = statement.where(Asset.channel == channel)
 
     return list(db.scalars(statement).all())
+
+
+@router.post(
+    "/campaigns/{campaign_id}/assets/generate",
+    response_model=AssetRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def generate_campaign_asset(
+    campaign_id: uuid.UUID,
+    asset_in: AssetGenerationCreate,
+    db: Session = Depends(get_db),
+    storage: B2StorageService = Depends(get_storage_service),
+    generation: GenblazeGenerationService = Depends(get_generation_service),
+) -> Asset:
+    campaign = ensure_campaign_exists(campaign_id, db)
+    generation_result = generate_image_or_502(
+        generation=generation,
+        prompt=asset_in.prompt,
+        model=asset_in.model,
+        generation_parameters=asset_in.generation_parameters,
+        timeout_seconds=asset_in.timeout_seconds,
+    )
+    asset = Asset(
+        campaign_id=campaign_id,
+        title=generated_asset_title(asset_in),
+        format=asset_in.format,
+        channel=asset_in.channel,
+        status=asset_in.status,
+        reviewer=asset_in.reviewer,
+        tags=["genblaze", *asset_in.tags],
+        summary=generated_asset_summary(asset_in),
+    )
+    uploaded_artifact_key: str | None = None
+
+    try:
+        db.add(asset)
+        db.flush()
+
+        version = make_generated_asset_version(
+            asset=asset,
+            version_number=1,
+            label="Initial Genblaze draft",
+            prompt=asset_in.prompt,
+            result=generation_result,
+            generation_parameters=asset_in.generation_parameters,
+            source="backend_genblaze_generation",
+        )
+        db.add(version)
+        db.flush()
+        uploaded_artifact_key = upload_generated_artifact(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+            result=generation_result,
+        )
+        upload_asset_version_sidecar(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+        )
+        db.commit()
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        db.rollback()
+        delete_stored_artifact(
+            storage=storage,
+            storage_key=uploaded_artifact_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Generated asset was not saved because B2 storage failed",
+        ) from exc
+
+    return get_asset_or_404(asset.id, db)
+
+
+@router.post(
+    "/assets/{asset_id}/versions/generate",
+    response_model=AssetRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def generate_asset_version(
+    asset_id: uuid.UUID,
+    version_in: AssetVersionGenerationCreate,
+    db: Session = Depends(get_db),
+    storage: B2StorageService = Depends(get_storage_service),
+    generation: GenblazeGenerationService = Depends(get_generation_service),
+) -> Asset:
+    asset = get_asset_or_404(asset_id, db)
+    campaign = ensure_campaign_exists(asset.campaign_id, db)
+    latest_version = max(
+        asset.versions,
+        key=lambda asset_version: asset_version.version_number,
+        default=None,
+    )
+    version_number = (latest_version.version_number if latest_version else 0) + 1
+    generation_result = generate_image_or_502(
+        generation=generation,
+        prompt=version_in.prompt,
+        model=version_in.model,
+        generation_parameters=version_in.generation_parameters,
+        timeout_seconds=version_in.timeout_seconds,
+    )
+    version = make_generated_asset_version(
+        asset=asset,
+        version_number=version_number,
+        label=version_in.label or f"Genblaze refinement {version_number}",
+        prompt=version_in.prompt,
+        result=generation_result,
+        generation_parameters=version_in.generation_parameters,
+        source="backend_genblaze_refinement",
+        based_on_version_id=latest_version.id if latest_version else None,
+    )
+    uploaded_artifact_key: str | None = None
+
+    try:
+        db.add(version)
+        asset.updated_at = datetime.now(UTC)
+        db.flush()
+        uploaded_artifact_key = upload_generated_artifact(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+            result=generation_result,
+        )
+        upload_asset_version_sidecar(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        delete_stored_artifact(
+            storage=storage,
+            storage_key=uploaded_artifact_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Asset version number already exists",
+        ) from exc
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        db.rollback()
+        delete_stored_artifact(
+            storage=storage,
+            storage_key=uploaded_artifact_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Generated asset version was not saved because B2 storage failed",
+        ) from exc
+
+    return get_asset_or_404(asset.id, db)
+
+
+@router.post(
+    "/assets/{asset_id}/versions/{version_id}/artifact/ingest-generated",
+    response_model=AssetVersionRead,
+)
+def ingest_generated_asset_version_artifact(
+    asset_id: uuid.UUID,
+    version_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    storage: B2StorageService = Depends(get_storage_service),
+) -> AssetVersion:
+    asset = get_asset_or_404(asset_id, db)
+    campaign = ensure_campaign_exists(asset.campaign_id, db)
+    version = get_asset_version_or_404(
+        asset_id=asset_id,
+        version_id=version_id,
+        db=db,
+    )
+    generated_artifact = existing_generated_artifact_reference(
+        asset=asset,
+        version=version,
+    )
+    previous_artifact_key = version.artifact_storage_key
+    uploaded_artifact_key: str | None = None
+
+    try:
+        uploaded_artifact_key = upload_generated_artifact_reference(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+            artifact=generated_artifact,
+            source="genblaze_ingest",
+        )
+        asset.updated_at = datetime.now(UTC)
+        upload_asset_version_sidecar(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+        )
+        db.commit()
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        db.rollback()
+        delete_stored_artifact(
+            storage=storage,
+            storage_key=uploaded_artifact_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Generated artifact was not ingested because B2 storage failed",
+        ) from exc
+
+    if (
+        previous_artifact_key != uploaded_artifact_key
+        and is_app_asset_version_artifact_key(
+            asset=asset,
+            version=version,
+            storage_key=previous_artifact_key,
+        )
+    ):
+        delete_stored_artifact(
+            storage=storage,
+            storage_key=previous_artifact_key,
+        )
+
+    db.refresh(version)
+
+    return version
 
 
 @router.post(

@@ -1,8 +1,12 @@
 import json
 import re
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import BytesIO
+from urllib.error import URLError
+from urllib.parse import unquote, urlparse
+from urllib.request import Request, urlopen
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -23,6 +27,17 @@ from app.services.storage import (
 
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
+MAX_EXPORT_ARTIFACT_SIZE_BYTES = 25 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ExportArtifactReference:
+    storage_key: str | None
+    url: str | None
+    filename: str | None
+    content_type: str | None
+    size_bytes: int | None
+    source: str
 
 
 def get_campaign_or_404(campaign_id: uuid.UUID, db: Session) -> Campaign:
@@ -70,7 +85,10 @@ def build_campaign_export_manifest(
     campaign: Campaign,
     approved_assets: list[Asset],
     metadata_paths: dict[uuid.UUID, str],
+    metadata_sources: dict[uuid.UUID, str],
+    metadata_export_errors: dict[uuid.UUID, str],
     artifact_paths: dict[uuid.UUID, str],
+    artifact_sources: dict[uuid.UUID, str],
     artifact_export_errors: dict[uuid.UUID, str],
 ) -> dict[str, object]:
     return {
@@ -111,11 +129,16 @@ def build_campaign_export_manifest(
                         "provider": version.provider,
                         "metadata_storage_key": version.storage_key,
                         "metadata_zip_path": metadata_paths[version.id],
+                        "metadata_export_source": metadata_sources.get(version.id),
+                        "metadata_export_error": metadata_export_errors.get(
+                            version.id
+                        ),
                         "artifact_storage_key": version.artifact_storage_key,
                         "artifact_filename": version.artifact_filename,
                         "artifact_content_type": version.artifact_content_type,
                         "artifact_size_bytes": version.artifact_size_bytes,
                         "artifact_zip_path": artifact_paths.get(version.id),
+                        "artifact_export_source": artifact_sources.get(version.id),
                         "artifact_export_error": artifact_export_errors.get(
                             version.id
                         ),
@@ -180,6 +203,175 @@ def build_version_metadata_sidecar(
     }
 
 
+def encode_pretty_json(data: dict[str, object]) -> bytes:
+    return json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def optional_string(value: object) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+
+    return None
+
+
+def optional_int(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+
+    return None
+
+
+def optional_metadata_dict(value: object) -> dict[str, object]:
+    if isinstance(value, dict):
+        return value
+
+    return {}
+
+
+def optional_asset_metadata_list(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+
+    return [item for item in value if isinstance(item, dict)]
+
+
+def filename_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+
+    filename = unquote(urlparse(url).path.rsplit("/", maxsplit=1)[-1]).strip()
+    return filename or None
+
+
+def generated_artifact_references(
+    version: AssetVersion,
+) -> list[ExportArtifactReference]:
+    metadata = version.generation_metadata or {}
+    references: list[ExportArtifactReference] = []
+    artifact_flow = optional_metadata_dict(metadata.get("artifact_flow"))
+
+    if artifact_flow:
+        references.append(
+            ExportArtifactReference(
+                storage_key=optional_string(artifact_flow.get("storage_key")),
+                url=None,
+                filename=optional_string(artifact_flow.get("filename")),
+                content_type=optional_string(artifact_flow.get("content_type")),
+                size_bytes=optional_int(artifact_flow.get("size_bytes")),
+                source="generation_metadata_artifact_flow",
+            )
+        )
+        references.append(
+            ExportArtifactReference(
+                storage_key=optional_string(artifact_flow.get("source_storage_key")),
+                url=None,
+                filename=optional_string(artifact_flow.get("filename")),
+                content_type=optional_string(artifact_flow.get("content_type")),
+                size_bytes=None,
+                source="genblaze_source_artifact",
+            )
+        )
+
+    provenance = optional_metadata_dict(metadata.get("provenance"))
+    for source_name, asset_items in (
+        ("generation_metadata_asset", optional_asset_metadata_list(metadata.get("assets"))),
+        (
+            "generation_provenance_asset",
+            optional_asset_metadata_list(provenance.get("assets")),
+        ),
+    ):
+        for asset_item in asset_items:
+            url = optional_string(asset_item.get("url"))
+            storage_key = optional_string(asset_item.get("storage_key"))
+            if not url and not storage_key:
+                continue
+
+            references.append(
+                ExportArtifactReference(
+                    storage_key=storage_key,
+                    url=url,
+                    filename=optional_string(asset_item.get("filename"))
+                    or filename_from_url(url),
+                    content_type=optional_string(asset_item.get("content_type")),
+                    size_bytes=optional_int(asset_item.get("size_bytes")),
+                    source=source_name,
+                )
+            )
+
+    return [
+        reference
+        for reference in references
+        if reference.storage_key or reference.url
+    ]
+
+
+def version_artifact_reference(version: AssetVersion) -> ExportArtifactReference | None:
+    if version.artifact_storage_key:
+        return ExportArtifactReference(
+            storage_key=version.artifact_storage_key,
+            url=None,
+            filename=version.artifact_filename,
+            content_type=version.artifact_content_type,
+            size_bytes=version.artifact_size_bytes,
+            source="asset_version_artifact",
+        )
+
+    for reference in generated_artifact_references(version):
+        return reference
+
+    return None
+
+
+def safe_artifact_filename(
+    *,
+    version: AssetVersion,
+    reference: ExportArtifactReference,
+) -> str:
+    try:
+        return normalize_artifact_filename(
+            reference.filename
+            or version.artifact_filename
+            or f"artifact-{version.id}"
+        )
+    except ValueError:
+        return f"artifact-{version.id}"
+
+
+def download_url_bytes(url: str) -> bytes:
+    request = Request(
+        url,
+        headers={"User-Agent": "SereneSet-Spark/1.0"},
+    )
+
+    with urlopen(request, timeout=60) as response:
+        body = response.read(MAX_EXPORT_ARTIFACT_SIZE_BYTES + 1)
+
+    if not body:
+        raise ValueError("Generated artifact URL returned an empty body")
+
+    if len(body) > MAX_EXPORT_ARTIFACT_SIZE_BYTES:
+        raise ValueError("Generated artifact is larger than 25 MB")
+
+    return body
+
+
+def download_artifact_bytes(
+    *,
+    storage: B2StorageService,
+    reference: ExportArtifactReference,
+) -> bytes:
+    if reference.storage_key:
+        return storage.download_bytes(key=reference.storage_key)
+
+    if reference.url:
+        return download_url_bytes(reference.url)
+
+    raise ValueError("Artifact reference did not include a B2 key or URL")
+
+
 def make_campaign_export_zip(
     *,
     campaign: Campaign,
@@ -194,7 +386,10 @@ def make_campaign_export_zip(
         key=lambda asset: (asset.channel, asset.title),
     )
     metadata_paths: dict[uuid.UUID, str] = {}
+    metadata_sources: dict[uuid.UUID, str] = {}
+    metadata_export_errors: dict[uuid.UUID, str] = {}
     artifact_paths: dict[uuid.UUID, str] = {}
+    artifact_sources: dict[uuid.UUID, str] = {}
     artifact_export_errors: dict[uuid.UUID, str] = {}
     zip_buffer = BytesIO()
 
@@ -207,42 +402,68 @@ def make_campaign_export_zip(
                 base_path = version_directory(asset, version)
                 metadata_path = f"metadata/{base_path}/metadata.json"
                 metadata_paths[version.id] = metadata_path
-                export_zip.writestr(
-                    metadata_path,
-                    json.dumps(
-                        build_version_metadata_sidecar(
-                            campaign=campaign,
-                            asset=asset,
-                            version=version,
-                        ),
-                        indent=2,
-                        ensure_ascii=False,
-                    ),
+                generated_metadata = build_version_metadata_sidecar(
+                    campaign=campaign,
+                    asset=asset,
+                    version=version,
                 )
+                try:
+                    export_zip.writestr(
+                        metadata_path,
+                        storage.download_bytes(key=version.storage_key),
+                    )
+                    metadata_sources[version.id] = "b2_sidecar"
+                except (StorageConfigurationError, BotoCoreError, ClientError):
+                    export_zip.writestr(
+                        metadata_path,
+                        encode_pretty_json(generated_metadata),
+                    )
+                    metadata_sources[version.id] = "generated_fallback"
+                    metadata_export_errors[version.id] = (
+                        "B2 sidecar metadata could not be downloaded during "
+                        "export; wrote generated fallback metadata"
+                    )
 
-                if version.artifact_storage_key is None:
+                artifact_reference = version_artifact_reference(version)
+                if artifact_reference is None:
                     continue
 
-                artifact_filename = normalize_artifact_filename(
-                    version.artifact_filename or f"artifact-{version.id}",
+                artifact_filename = safe_artifact_filename(
+                    version=version,
+                    reference=artifact_reference,
                 )
                 artifact_path = f"artifacts/{base_path}/{artifact_filename}"
                 try:
                     export_zip.writestr(
                         artifact_path,
-                        storage.download_bytes(key=version.artifact_storage_key),
+                        download_artifact_bytes(
+                            storage=storage,
+                            reference=artifact_reference,
+                        ),
                     )
                     artifact_paths[version.id] = artifact_path
-                except (StorageConfigurationError, BotoCoreError, ClientError):
+                    artifact_sources[version.id] = artifact_reference.source
+                except (
+                    StorageConfigurationError,
+                    BotoCoreError,
+                    ClientError,
+                    OSError,
+                    URLError,
+                    ValueError,
+                ):
                     artifact_export_errors[version.id] = (
-                        "Artifact could not be downloaded from B2 during export"
+                        "Artifact could not be downloaded from its source "
+                        "during export"
                     )
 
         manifest = build_campaign_export_manifest(
             campaign=campaign,
             approved_assets=approved_assets,
             metadata_paths=metadata_paths,
+            metadata_sources=metadata_sources,
+            metadata_export_errors=metadata_export_errors,
             artifact_paths=artifact_paths,
+            artifact_sources=artifact_sources,
             artifact_export_errors=artifact_export_errors,
         )
         export_zip.writestr(

@@ -22,6 +22,20 @@ class Settings(BaseSettings):
     b2_bucket_name: str = Field(default="", alias="B2_BUCKET_NAME")
     b2_application_key_id: str = Field(default="", alias="B2_APPLICATION_KEY_ID")
     b2_application_key: str = Field(default="", alias="B2_APPLICATION_KEY")
+    genblaze_gmi_api_key: str = Field(default="", alias="GMI_API_KEY")
+    genblaze_image_model: str = Field(
+        default="seedream-5.0-lite",
+        alias="GENBLAZE_IMAGE_MODEL",
+    )
+    genblaze_timeout_seconds: int = Field(
+        default=600,
+        alias="GENBLAZE_TIMEOUT_SECONDS",
+        ge=30,
+    )
+    genblaze_storage_prefix: str = Field(
+        default="sereneset-spark/genblaze",
+        alias="GENBLAZE_STORAGE_PREFIX",
+    )
     cors_origins: list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"],
         alias="CORS_ORIGINS",
@@ -49,6 +63,11 @@ class Settings(BaseSettings):
             raise ValueError("B2_ENDPOINT_URL must start with https://")
 
         return value.rstrip("/")
+
+    @field_validator("genblaze_storage_prefix")
+    @classmethod
+    def validate_genblaze_storage_prefix(cls, value: str) -> str:
+        return value.strip().replace("\\", "/").strip("/")
 
 
 @lru_cache
