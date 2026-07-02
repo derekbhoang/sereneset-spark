@@ -132,7 +132,8 @@
 .asset-row,
 .asset-foot,
 .board-toolbar,
-.panel-heading {
+.panel-heading,
+.latest-version-heading {
   display: flex;
   align-items: center;
 }
@@ -864,6 +865,39 @@ a:focus-visible {
   background: rgba(21, 28, 32, 0.8);
   font-size: 12px;
   padding: 7px 10px;
+}
+
+.latest-version-preview {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.latest-version-heading {
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.latest-version-heading strong {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  color: #176b5d;
+  background: #e0eee7;
+  line-height: 1;
+  padding: 6px 9px;
+}
+
+.latest-version-preview .artifact-image-preview img {
+  height: 210px;
+}
+
+.latest-version-preview .artifact-file-preview,
+.latest-version-preview .artifact-preview-state {
+  min-height: 178px;
 }
 
 .metadata-list {

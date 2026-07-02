@@ -335,6 +335,13 @@ function getAssetCardPreviewVersion(asset: Asset): AssetVersion | null {
   }, null)
 }
 
+function sortVersionsNewestFirst(versions: AssetVersion[]): AssetVersion[] {
+  return [...versions].sort(
+    (firstVersion, secondVersion) =>
+      secondVersion.versionNumber - firstVersion.versionNumber,
+  )
+}
+
 function getImagePreviewUrl(
   version: AssetVersion,
   previewUrls: Record<string, ArtifactPreviewUrl>,
@@ -534,6 +541,9 @@ function App() {
   const [artifactPreviewErrors, setArtifactPreviewErrors] = useState<
     Record<string, string>
   >({})
+  const [openProvenanceVersionIds, setOpenProvenanceVersionIds] = useState<
+    Record<string, boolean>
+  >({})
   const [refinePrompts, setRefinePrompts] = useState<Record<string, string>>({})
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
@@ -670,6 +680,13 @@ function App() {
     filteredAssets.find((asset) => asset.id === selectedAssetId) ??
     filteredAssets[0] ??
     null
+
+  const selectedVersions = useMemo(
+    () => (selectedAsset ? sortVersionsNewestFirst(selectedAsset.versions) : []),
+    [selectedAsset],
+  )
+  const latestSelectedVersion = selectedVersions[0] ?? null
+  const previousSelectedVersions = selectedVersions.slice(1)
 
   const refinePrompt = selectedAsset
     ? (refinePrompts[selectedAsset.id] ?? buildRefinePrompt(selectedAsset))
@@ -1280,7 +1297,7 @@ function App() {
       : 'Not recorded'
 
     return (
-      <div className="provenance-panel">
+      <div className="provenance-panel" id={`provenance-${version.versionId}`}>
         <div className="provenance-grid">
           <div>
             <span>Provider</span>
@@ -1332,6 +1349,29 @@ function App() {
           <span>{version.artifactStorageKey ? 'Export ready' : 'Needs artifact'}</span>
         </div>
       </div>
+    )
+  }
+
+  function toggleProvenance(versionId: string) {
+    setOpenProvenanceVersionIds((currentVersionIds) => ({
+      ...currentVersionIds,
+      [versionId]: !currentVersionIds[versionId],
+    }))
+  }
+
+  function renderProvenanceButton(version: AssetVersion) {
+    const isOpen = Boolean(openProvenanceVersionIds[version.versionId])
+
+    return (
+      <button
+        aria-controls={`provenance-${version.versionId}`}
+        aria-expanded={isOpen}
+        className="metadata-button"
+        onClick={() => toggleProvenance(version.versionId)}
+        type="button"
+      >
+        {isOpen ? 'Hide provenance' : 'Show provenance'}
+      </button>
     )
   }
 
@@ -1945,10 +1985,29 @@ function App() {
                       </span>
                     </div>
 
-                    <div className={`detail-preview ${selectedAsset.preview}`}>
-                      <span />
-                      <strong>{selectedAsset.format}</strong>
-                    </div>
+                    {latestSelectedVersion ? (
+                      <div className="latest-version-preview">
+                        <div className="latest-version-heading">
+                          <span>Latest version</span>
+                          <strong>{latestSelectedVersion.id.toUpperCase()}</strong>
+                        </div>
+                        {renderArtifactPreview(latestSelectedVersion)}
+                        <div
+                          className="version-actions latest-version-actions"
+                          aria-label={`${latestSelectedVersion.id} actions`}
+                        >
+                          {renderProvenanceButton(latestSelectedVersion)}
+                        </div>
+                        {openProvenanceVersionIds[
+                          latestSelectedVersion.versionId
+                        ] && renderProvenanceDetails(latestSelectedVersion)}
+                      </div>
+                    ) : (
+                      <div className={`detail-preview ${selectedAsset.preview}`}>
+                        <span />
+                        <strong>{selectedAsset.format}</strong>
+                      </div>
+                    )}
 
                     <p className="detail-copy">{selectedAsset.copy}</p>
 
@@ -2018,78 +2077,86 @@ function App() {
                     </div>
 
                     <div className="version-list">
-                      <h3>Versions</h3>
-                      {selectedAsset.versions.map((version) => (
-                        <div className="version-row" key={version.versionId}>
-                          <span className="version-title">
-                            <strong>{version.id.toUpperCase()}</strong>
-                            {version.label}
-                          </span>
-                          <span className="version-provider">
-                            {version.created}
-                          </span>
-                          <code>{version.storageKey}</code>
-                          {renderArtifactPreview(version)}
-                          {renderProvenanceDetails(version)}
-                          <div
-                            className="version-actions"
-                            aria-label={`${version.id} actions`}
-                          >
-                            <label
-                              aria-disabled={
-                                uploadingArtifactVersionId === version.versionId
-                              }
-                              className={`metadata-button artifact-upload ${
-                                uploadingArtifactVersionId === version.versionId
-                                  ? 'is-disabled'
-                                  : ''
-                              }`}
+                      <h3>Previous Version</h3>
+                      {previousSelectedVersions.length > 0 ? (
+                        previousSelectedVersions.map((version) => (
+                          <div className="version-row" key={version.versionId}>
+                            <span className="version-title">
+                              <strong>{version.id.toUpperCase()}</strong>
+                              {version.label}
+                            </span>
+                            <span className="version-provider">
+                              {version.created}
+                            </span>
+                            <code>{version.storageKey}</code>
+                            {renderArtifactPreview(version)}
+                            <div
+                              className="version-actions"
+                              aria-label={`${version.id} actions`}
                             >
-                              {uploadingArtifactVersionId === version.versionId
-                                ? 'Uploading...'
-                                : version.artifactStorageKey
-                                  ? 'Replace artifact'
-                                  : 'Attach output'}
-                              <input
-                                disabled={
+                              {renderProvenanceButton(version)}
+                              <label
+                                aria-disabled={
                                   uploadingArtifactVersionId ===
                                   version.versionId
                                 }
-                                onChange={(event) => {
-                                  const file =
-                                    event.currentTarget.files?.[0] ?? null
-                                  event.currentTarget.value = ''
-                                  void uploadArtifact(version, file)
-                                }}
-                                type="file"
-                              />
-                            </label>
-                            <button
-                              className="metadata-button"
-                              disabled={
-                                !version.artifactStorageKey ||
-                                openingArtifactVersionId === version.versionId
-                              }
-                              onClick={() => openArtifact(version)}
-                              type="button"
-                            >
-                              {openingArtifactVersionId === version.versionId
-                                ? 'Opening...'
-                                : 'Open artifact'}
-                            </button>
-                            <button
-                              className="metadata-button"
-                              disabled={openingVersionId === version.versionId}
-                              onClick={() => openStoredMetadata(version)}
-                              type="button"
-                            >
-                              {openingVersionId === version.versionId
-                                ? 'Opening...'
-                                : 'Open stored metadata'}
-                            </button>
+                                className={`metadata-button artifact-upload ${
+                                  uploadingArtifactVersionId ===
+                                  version.versionId
+                                    ? 'is-disabled'
+                                    : ''
+                                }`}
+                              >
+                                {uploadingArtifactVersionId === version.versionId
+                                  ? 'Uploading...'
+                                  : version.artifactStorageKey
+                                    ? 'Replace artifact'
+                                    : 'Attach output'}
+                                <input
+                                  disabled={
+                                    uploadingArtifactVersionId ===
+                                    version.versionId
+                                  }
+                                  onChange={(event) => {
+                                    const file =
+                                      event.currentTarget.files?.[0] ?? null
+                                    event.currentTarget.value = ''
+                                    void uploadArtifact(version, file)
+                                  }}
+                                  type="file"
+                                />
+                              </label>
+                              <button
+                                className="metadata-button"
+                                disabled={
+                                  !version.artifactStorageKey ||
+                                  openingArtifactVersionId === version.versionId
+                                }
+                                onClick={() => openArtifact(version)}
+                                type="button"
+                              >
+                                {openingArtifactVersionId === version.versionId
+                                  ? 'Opening...'
+                                  : 'Open artifact'}
+                              </button>
+                              <button
+                                className="metadata-button"
+                                disabled={openingVersionId === version.versionId}
+                                onClick={() => openStoredMetadata(version)}
+                                type="button"
+                              >
+                                {openingVersionId === version.versionId
+                                  ? 'Opening...'
+                                  : 'Open stored metadata'}
+                              </button>
+                            </div>
+                            {openProvenanceVersionIds[version.versionId] &&
+                              renderProvenanceDetails(version)}
                           </div>
-                        </div>
-                      ))}
+                        ))
+                      ) : (
+                        <div className="empty-state">No previous versions yet.</div>
+                      )}
                     </div>
                   </>
                 ) : (
