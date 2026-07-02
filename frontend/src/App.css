@@ -715,6 +715,17 @@ a:focus-visible {
     linear-gradient(160deg, transparent 0 52%, #176b5d 52% 65%, #a3482e 65%);
 }
 
+.asset-preview.has-image {
+  background: #151c20;
+}
+
+.asset-preview-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
 .preview-band,
 .preview-copy,
 .preview-chip {

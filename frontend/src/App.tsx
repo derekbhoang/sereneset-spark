@@ -321,6 +321,37 @@ function hasImageArtifact(version: AssetVersion): boolean {
   return Boolean(version.artifactStorageKey && generatedPreview)
 }
 
+function getAssetCardPreviewVersion(asset: Asset): AssetVersion | null {
+  return asset.versions.reduce<AssetVersion | null>((latestVersion, version) => {
+    if (!hasImageArtifact(version)) {
+      return latestVersion
+    }
+
+    if (!latestVersion || version.versionNumber > latestVersion.versionNumber) {
+      return version
+    }
+
+    return latestVersion
+  }, null)
+}
+
+function getImagePreviewUrl(
+  version: AssetVersion,
+  previewUrls: Record<string, ArtifactPreviewUrl>,
+): string | null {
+  const generatedPreviewUrl = version.generatedPreview?.url ?? null
+  const previewUrl = previewUrls[version.versionId]
+
+  if (
+    version.artifactStorageKey &&
+    previewUrl?.storageKey === version.artifactStorageKey
+  ) {
+    return previewUrl.url
+  }
+
+  return generatedPreviewUrl
+}
+
 function titleCase(value: string): string {
   return value
     .replace(/_/g, ' ')
@@ -622,14 +653,18 @@ function App() {
     [selectedCampaign],
   )
 
-  const filteredAssets = campaignAssets.filter((asset) => {
-    const matchesStatus =
-      statusFilter === 'all' ? true : asset.status === statusFilter
-    const matchesChannel =
-      channelFilter === 'All' ? true : asset.channel === channelFilter
+  const filteredAssets = useMemo(
+    () =>
+      campaignAssets.filter((asset) => {
+        const matchesStatus =
+          statusFilter === 'all' ? true : asset.status === statusFilter
+        const matchesChannel =
+          channelFilter === 'All' ? true : asset.channel === channelFilter
 
-    return matchesStatus && matchesChannel
-  })
+        return matchesStatus && matchesChannel
+      }),
+    [campaignAssets, channelFilter, statusFilter],
+  )
 
   const selectedAsset =
     filteredAssets.find((asset) => asset.id === selectedAssetId) ??
@@ -711,6 +746,82 @@ function App() {
       isCancelled = true
     }
   }, [selectedAsset])
+
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadAssetCardPreviews() {
+      const previewTargets: Array<{
+        assetId: string
+        version: AssetVersion
+      }> = []
+
+      for (const asset of filteredAssets) {
+        const version = getAssetCardPreviewVersion(asset)
+
+        if (version?.artifactStorageKey) {
+          previewTargets.push({
+            assetId: asset.id,
+            version,
+          })
+        }
+      }
+
+      await Promise.all(
+        previewTargets.map(async ({ assetId, version }) => {
+          setArtifactPreviewLoadingIds((currentLoadingIds) => ({
+            ...currentLoadingIds,
+            [version.versionId]: true,
+          }))
+
+          try {
+            const download = await fetchAssetVersionArtifactDownloadUrl(
+              assetId,
+              version.versionId,
+            )
+
+            if (isCancelled) {
+              return
+            }
+
+            setArtifactPreviewUrls((currentPreviewUrls) => ({
+              ...currentPreviewUrls,
+              [version.versionId]: {
+                storageKey: version.artifactStorageKey ?? '',
+                url: download.download_url,
+              },
+            }))
+            setArtifactPreviewErrors((currentPreviewErrors) => {
+              const nextPreviewErrors = { ...currentPreviewErrors }
+              delete nextPreviewErrors[version.versionId]
+              return nextPreviewErrors
+            })
+          } catch (error) {
+            if (!isCancelled) {
+              setArtifactPreviewErrors((currentPreviewErrors) => ({
+                ...currentPreviewErrors,
+                [version.versionId]: getErrorMessage(error),
+              }))
+            }
+          } finally {
+            if (!isCancelled) {
+              setArtifactPreviewLoadingIds((currentLoadingIds) => {
+                const nextLoadingIds = { ...currentLoadingIds }
+                delete nextLoadingIds[version.versionId]
+                return nextLoadingIds
+              })
+            }
+          }
+        }),
+      )
+    }
+
+    void loadAssetCardPreviews()
+
+    return () => {
+      isCancelled = true
+    }
+  }, [filteredAssets])
 
   function selectCampaign(campaignId: string) {
     if (campaignId === selectedCampaignId) {
@@ -1755,36 +1866,61 @@ function App() {
                 ) : (
                   <>
                     <div className="asset-grid">
-                      {filteredAssets.map((asset) => (
-                        <button
-                          className={`asset-card ${
-                            selectedAsset?.id === asset.id ? 'is-active' : ''
-                          }`}
-                          key={asset.id}
-                          onClick={() => setSelectedAssetId(asset.id)}
-                          type="button"
-                        >
-                          <span className={`asset-preview ${asset.preview}`}>
-                            <span className="preview-band" />
-                            <span className="preview-copy" />
-                            <span className="preview-chip" />
-                          </span>
-                          <span className="asset-card-body">
-                            <span className="asset-row">
-                              <strong>{asset.title}</strong>
-                              <span className={`status-pill ${asset.status}`}>
-                                {statusLabels[asset.status]}
+                      {filteredAssets.map((asset) => {
+                        const cardPreviewVersion =
+                          getAssetCardPreviewVersion(asset)
+                        const cardPreviewUrl = cardPreviewVersion
+                          ? getImagePreviewUrl(
+                              cardPreviewVersion,
+                              artifactPreviewUrls,
+                            )
+                          : null
+
+                        return (
+                          <button
+                            className={`asset-card ${
+                              selectedAsset?.id === asset.id ? 'is-active' : ''
+                            }`}
+                            key={asset.id}
+                            onClick={() => setSelectedAssetId(asset.id)}
+                            type="button"
+                          >
+                            <span
+                              className={`asset-preview ${asset.preview} ${
+                                cardPreviewUrl ? 'has-image' : ''
+                              }`}
+                            >
+                              {cardPreviewUrl ? (
+                                <img
+                                  alt={`${asset.title} generated asset`}
+                                  className="asset-preview-image"
+                                  src={cardPreviewUrl}
+                                />
+                              ) : (
+                                <>
+                                  <span className="preview-band" />
+                                  <span className="preview-copy" />
+                                  <span className="preview-chip" />
+                                </>
+                              )}
+                            </span>
+                            <span className="asset-card-body">
+                              <span className="asset-row">
+                                <strong>{asset.title}</strong>
+                                <span className={`status-pill ${asset.status}`}>
+                                  {statusLabels[asset.status]}
+                                </span>
+                              </span>
+                              <span className="asset-copy">{asset.copy}</span>
+                              <span className="asset-foot">
+                                <span>{asset.format}</span>
+                                <span>{asset.channel}</span>
+                                <span>{asset.updated}</span>
                               </span>
                             </span>
-                            <span className="asset-copy">{asset.copy}</span>
-                            <span className="asset-foot">
-                              <span>{asset.format}</span>
-                              <span>{asset.channel}</span>
-                              <span>{asset.updated}</span>
-                            </span>
-                          </span>
-                        </button>
-                      ))}
+                          </button>
+                        )
+                      })}
                     </div>
 
                     {filteredAssets.length === 0 && (
