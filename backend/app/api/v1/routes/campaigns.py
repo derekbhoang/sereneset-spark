@@ -540,6 +540,18 @@ def get_campaign(
     return get_campaign_or_404(campaign_id, db)
 
 
+@router.delete("/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_campaign(
+    campaign_id: uuid.UUID,
+    db: Session = Depends(get_db),
+) -> Response:
+    campaign = get_campaign_or_404(campaign_id, db)
+    db.delete(campaign)
+    db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 @router.patch("/{campaign_id}", response_model=CampaignRead)
 def update_campaign(
     campaign_id: uuid.UUID,

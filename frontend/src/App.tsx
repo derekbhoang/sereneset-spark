@@ -1,5 +1,7 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import {
+  createCampaign,
+  deleteCampaign,
   exportCampaignPack,
   fetchAsset,
   fetchAssetVersionArtifactDownloadUrl,
@@ -82,8 +84,36 @@ type GeneratedPreview = {
   filename: string | null
 }
 
+type CampaignFormState = {
+  name: string
+  product: string
+  audience: string
+  status: string
+  dueDate: string
+  owner: string
+  goal: string
+  tone: string
+  brief: string
+  channels: string
+  brandInputs: string
+}
+
 const defaultPrompt =
   'Generate a composed launch asset that keeps the product central and uses calm, benefit-led messaging.'
+
+const defaultCampaignForm: CampaignFormState = {
+  name: '',
+  product: '',
+  audience: '',
+  status: 'drafting',
+  dueDate: '',
+  owner: '',
+  goal: '',
+  tone: 'Calm, benefit-led',
+  brief: '',
+  channels: 'Paid social, Email',
+  brandInputs: '',
+}
 
 const reviewStatuses: ReviewStatus[] = [
   'draft',
@@ -339,6 +369,26 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong'
 }
 
+function splitCommaList(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function canCreateCampaign(form: CampaignFormState): boolean {
+  return Boolean(
+    form.name.trim() &&
+      form.product.trim() &&
+      form.audience.trim() &&
+      form.owner.trim() &&
+      form.goal.trim() &&
+      form.tone.trim() &&
+      form.brief.trim() &&
+      splitCommaList(form.channels).length > 0,
+  )
+}
+
 function buildRefinePrompt(asset: Asset): string {
   return `Refine "${asset.title}" for ${asset.channel}. Keep the strongest idea, improve clarity, and make the next version more production-ready.`
 }
@@ -423,10 +473,20 @@ function App() {
   const [requestPrompt, setRequestPrompt] = useState(defaultPrompt)
   const [isLoadingCampaigns, setIsLoadingCampaigns] = useState(true)
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
+  const [isCreateCampaignOpen, setIsCreateCampaignOpen] = useState(false)
+  const [isCreatingCampaign, setIsCreatingCampaign] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
   const [isSavingStatus, setIsSavingStatus] = useState(false)
   const [isRefining, setIsRefining] = useState(false)
+  const [deletingCampaignId, setDeletingCampaignId] = useState<string | null>(
+    null,
+  )
+  const [openCampaignMenuId, setOpenCampaignMenuId] = useState<string | null>(
+    null,
+  )
+  const [campaignForm, setCampaignForm] =
+    useState<CampaignFormState>(defaultCampaignForm)
   const [openingVersionId, setOpeningVersionId] = useState<string | null>(null)
   const [openingArtifactVersionId, setOpeningArtifactVersionId] = useState<
     string | null
@@ -487,6 +547,23 @@ function App() {
       campaigns.find((campaign) => campaign.id === selectedCampaignId) ?? null,
     [campaigns, selectedCampaignId],
   )
+
+  useEffect(() => {
+    if (!isCreateCampaignOpen) {
+      return
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setCampaignForm(defaultCampaignForm)
+        setIsCreateCampaignOpen(false)
+      }
+    }
+
+    window.addEventListener('keydown', closeOnEscape)
+
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [isCreateCampaignOpen])
 
   useEffect(() => {
     let isCancelled = false
@@ -637,17 +714,110 @@ function App() {
 
   function selectCampaign(campaignId: string) {
     if (campaignId === selectedCampaignId) {
+      setOpenCampaignMenuId(null)
       return
     }
 
     const nextCampaign = campaigns.find((campaign) => campaign.id === campaignId)
 
+    setOpenCampaignMenuId(null)
+    setIsCreateCampaignOpen(false)
     setSelectedCampaignId(campaignId)
     setSelectedAssetId('')
     setAssets([])
     setStatusFilter('all')
     setChannelFilter('All')
     setRequestChannel(nextCampaign?.channels[0] ?? '')
+  }
+
+  async function createCampaignFromForm(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    if (!canCreateCampaign(campaignForm)) {
+      return
+    }
+
+    setIsCreatingCampaign(true)
+    setErrorMessage(null)
+
+    try {
+      const createdCampaign = mapCampaign(
+        await createCampaign({
+          name: campaignForm.name.trim(),
+          product: campaignForm.product.trim(),
+          audience: campaignForm.audience.trim(),
+          status: campaignForm.status.trim() || 'drafting',
+          due_date: campaignForm.dueDate || null,
+          owner: campaignForm.owner.trim(),
+          goal: campaignForm.goal.trim(),
+          tone: campaignForm.tone.trim(),
+          brief: campaignForm.brief.trim(),
+          channels: splitCommaList(campaignForm.channels),
+          brand_inputs: splitCommaList(campaignForm.brandInputs),
+        }),
+        0,
+      )
+
+      setCampaigns((currentCampaigns) => [
+        createdCampaign,
+        ...currentCampaigns.filter(
+          (campaign) => campaign.id !== createdCampaign.id,
+        ),
+      ])
+      setSelectedCampaignId(createdCampaign.id)
+      setSelectedAssetId('')
+      setAssets([])
+      setStatusFilter('all')
+      setChannelFilter('All')
+      setRequestChannel(createdCampaign.channels[0] ?? '')
+      setCampaignForm(defaultCampaignForm)
+      setIsCreateCampaignOpen(false)
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setIsCreatingCampaign(false)
+    }
+  }
+
+  async function deleteCampaignFromMenu(campaign: Campaign) {
+    const shouldDelete = window.confirm(
+      `Delete "${campaign.name}" and its database assets?`,
+    )
+
+    if (!shouldDelete) {
+      return
+    }
+
+    setDeletingCampaignId(campaign.id)
+    setErrorMessage(null)
+
+    try {
+      await deleteCampaign(campaign.id)
+
+      const nextCampaigns = campaigns.filter(
+        (currentCampaign) => currentCampaign.id !== campaign.id,
+      )
+      const nextSelectedCampaign =
+        selectedCampaignId === campaign.id
+          ? (nextCampaigns[0] ?? null)
+          : selectedCampaign
+
+      setCampaigns(nextCampaigns)
+      setOpenCampaignMenuId(null)
+
+      if (selectedCampaignId === campaign.id) {
+        setSelectedCampaignId(nextSelectedCampaign?.id ?? '')
+        setSelectedAssetId('')
+        setAssets([])
+        setStatusFilter('all')
+        setChannelFilter('All')
+        setRequestChannel(nextSelectedCampaign?.channels[0] ?? '')
+      }
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setDeletingCampaignId(null)
+    }
   }
 
   async function downloadCampaignExport() {
@@ -1123,36 +1293,295 @@ function App() {
         </div>
       )}
 
+      {isCreateCampaignOpen && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={() => {
+            setCampaignForm(defaultCampaignForm)
+            setIsCreateCampaignOpen(false)
+          }}
+        >
+          <section
+            aria-labelledby="campaign-modal-title"
+            aria-modal="true"
+            className="campaign-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <div className="campaign-modal-header">
+              <div>
+                <span className="eyebrow">Campaign</span>
+                <h2 id="campaign-modal-title">New campaign</h2>
+              </div>
+              <button
+                aria-label="Close campaign form"
+                className="modal-close-button"
+                onClick={() => {
+                  setCampaignForm(defaultCampaignForm)
+                  setIsCreateCampaignOpen(false)
+                }}
+                type="button"
+              >
+                x
+              </button>
+            </div>
+
+            <form
+              className="campaign-create-panel"
+              onSubmit={createCampaignFromForm}
+            >
+              <div className="campaign-form-grid">
+                <label className="field">
+                  <span>Name</span>
+                  <input
+                    autoFocus
+                    onChange={(event) =>
+                      setCampaignForm((currentForm) => ({
+                        ...currentForm,
+                        name: event.target.value,
+                      }))
+                    }
+                    required
+                    value={campaignForm.name}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Product</span>
+                  <input
+                    onChange={(event) =>
+                      setCampaignForm((currentForm) => ({
+                        ...currentForm,
+                        product: event.target.value,
+                      }))
+                    }
+                    required
+                    value={campaignForm.product}
+                  />
+                </label>
+              </div>
+
+              <label className="field">
+                <span>Audience</span>
+                <input
+                  onChange={(event) =>
+                    setCampaignForm((currentForm) => ({
+                      ...currentForm,
+                      audience: event.target.value,
+                    }))
+                  }
+                  required
+                  value={campaignForm.audience}
+                />
+              </label>
+
+              <div className="campaign-form-grid">
+                <label className="field">
+                  <span>Owner</span>
+                  <input
+                    onChange={(event) =>
+                      setCampaignForm((currentForm) => ({
+                        ...currentForm,
+                        owner: event.target.value,
+                      }))
+                    }
+                    required
+                    value={campaignForm.owner}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Due</span>
+                  <input
+                    onChange={(event) =>
+                      setCampaignForm((currentForm) => ({
+                        ...currentForm,
+                        dueDate: event.target.value,
+                      }))
+                    }
+                    type="date"
+                    value={campaignForm.dueDate}
+                  />
+                </label>
+              </div>
+
+              <label className="field">
+                <span>Goal</span>
+                <textarea
+                  onChange={(event) =>
+                    setCampaignForm((currentForm) => ({
+                      ...currentForm,
+                      goal: event.target.value,
+                    }))
+                  }
+                  required
+                  rows={3}
+                  value={campaignForm.goal}
+                />
+              </label>
+
+              <label className="field">
+                <span>Tone</span>
+                <input
+                  onChange={(event) =>
+                    setCampaignForm((currentForm) => ({
+                      ...currentForm,
+                      tone: event.target.value,
+                    }))
+                  }
+                  required
+                  value={campaignForm.tone}
+                />
+              </label>
+
+              <label className="field">
+                <span>Brief</span>
+                <textarea
+                  onChange={(event) =>
+                    setCampaignForm((currentForm) => ({
+                      ...currentForm,
+                      brief: event.target.value,
+                    }))
+                  }
+                  required
+                  rows={4}
+                  value={campaignForm.brief}
+                />
+              </label>
+
+              <div className="campaign-form-grid">
+                <label className="field">
+                  <span>Channels</span>
+                  <input
+                    onChange={(event) =>
+                      setCampaignForm((currentForm) => ({
+                        ...currentForm,
+                        channels: event.target.value,
+                      }))
+                    }
+                    required
+                    value={campaignForm.channels}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Brand inputs</span>
+                  <input
+                    onChange={(event) =>
+                      setCampaignForm((currentForm) => ({
+                        ...currentForm,
+                        brandInputs: event.target.value,
+                      }))
+                    }
+                    value={campaignForm.brandInputs}
+                  />
+                </label>
+              </div>
+
+              <div className="campaign-form-actions">
+                <button
+                  className="button button-secondary"
+                  onClick={() => {
+                    setCampaignForm(defaultCampaignForm)
+                    setIsCreateCampaignOpen(false)
+                  }}
+                  type="button"
+                >
+                  Cancel
+                </button>
+                <button
+                  className="button button-primary"
+                  disabled={isCreatingCampaign || !canCreateCampaign(campaignForm)}
+                  type="submit"
+                >
+                  {isCreatingCampaign ? 'Creating...' : 'Create campaign'}
+                </button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
+
       <div className="workspace" id="campaigns">
         <aside className="campaign-rail" aria-label="Campaigns">
           <div className="rail-heading">
             <span>Campaigns</span>
-            <strong>{isLoadingCampaigns ? '...' : campaigns.length}</strong>
+            <div className="rail-actions">
+              <strong>{isLoadingCampaigns ? '...' : campaigns.length}</strong>
+              <button
+                aria-expanded={isCreateCampaignOpen}
+                aria-haspopup="dialog"
+                className="rail-action-button"
+                onClick={() => {
+                  setIsCreateCampaignOpen(true)
+                  setOpenCampaignMenuId(null)
+                }}
+                type="button"
+              >
+                New
+              </button>
+            </div>
           </div>
 
           <div className="campaign-list">
             {campaigns.map((campaign) => (
-              <button
+              <div
                 className={`campaign-card ${
                   campaign.id === selectedCampaignId ? 'is-active' : ''
                 }`}
                 key={campaign.id}
-                onClick={() => selectCampaign(campaign.id)}
-                type="button"
               >
-                <span className="campaign-card-top">
-                  <strong>{campaign.name}</strong>
-                  <span>{campaign.status}</span>
-                </span>
-                <span className="muted">{campaign.product}</span>
-                <span className="campaign-meta">
-                  <span>{campaign.due}</span>
-                  <span>{campaign.owner}</span>
-                </span>
-                <span className="health-track" aria-hidden="true">
-                  <span style={{ width: `${campaign.health}%` }} />
-                </span>
-              </button>
+                <button
+                  className="campaign-select"
+                  onClick={() => selectCampaign(campaign.id)}
+                  type="button"
+                >
+                  <span className="campaign-card-top">
+                    <strong>{campaign.name}</strong>
+                    <span>{campaign.status}</span>
+                  </span>
+                  <span className="muted">{campaign.product}</span>
+                  <span className="campaign-meta">
+                    <span>{campaign.due}</span>
+                    <span>{campaign.owner}</span>
+                  </span>
+                  <span className="health-track" aria-hidden="true">
+                    <span style={{ width: `${campaign.health}%` }} />
+                  </span>
+                </button>
+
+                <div className="campaign-menu">
+                  <button
+                    aria-expanded={openCampaignMenuId === campaign.id}
+                    aria-haspopup="menu"
+                    aria-label={`More options for ${campaign.name}`}
+                    className="campaign-menu-button"
+                    onClick={() =>
+                      setOpenCampaignMenuId((currentCampaignId) =>
+                        currentCampaignId === campaign.id ? null : campaign.id,
+                      )
+                    }
+                    type="button"
+                  >
+                    ...
+                  </button>
+
+                  {openCampaignMenuId === campaign.id && (
+                    <div className="campaign-options-menu" role="menu">
+                      <button
+                        disabled={deletingCampaignId === campaign.id}
+                        onClick={() => void deleteCampaignFromMenu(campaign)}
+                        role="menuitem"
+                        type="button"
+                      >
+                        {deletingCampaignId === campaign.id
+                          ? 'Deleting...'
+                          : 'Delete campaign'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
             ))}
           </div>
 

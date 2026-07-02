@@ -18,6 +18,20 @@ export type CampaignDto = {
   updated_at: string
 }
 
+export type CampaignCreateDto = {
+  name: string
+  product: string
+  audience: string
+  status?: string
+  due_date?: string | null
+  owner: string
+  goal: string
+  tone: string
+  brief: string
+  channels: string[]
+  brand_inputs: string[]
+}
+
 export type AssetVersionDto = {
   id: string
   asset_id: string
@@ -149,6 +163,23 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function requestVoid(
+  path: string,
+  init: RequestInit = {},
+): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...init.headers,
+    },
+  })
+
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response))
+  }
+}
+
 async function uploadRequest<T>(path: string, formData: FormData): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`, {
     method: 'POST',
@@ -194,6 +225,21 @@ async function downloadRequest(
 
 export function fetchCampaigns(): Promise<CampaignDto[]> {
   return request<CampaignDto[]>('/campaigns')
+}
+
+export function createCampaign(
+  campaign: CampaignCreateDto,
+): Promise<CampaignDto> {
+  return request<CampaignDto>('/campaigns', {
+    method: 'POST',
+    body: JSON.stringify(campaign),
+  })
+}
+
+export function deleteCampaign(campaignId: string): Promise<void> {
+  return requestVoid(`/campaigns/${campaignId}`, {
+    method: 'DELETE',
+  })
 }
 
 export function exportCampaignPack(campaignId: string): Promise<DownloadedFile> {
