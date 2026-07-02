@@ -191,8 +191,40 @@ function readString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null
 }
 
+function readBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
 function readAssetMetadataList(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value) ? value.filter(isRecord) : []
+}
+
+function firstString(...values: unknown[]): string | null {
+  for (const value of values) {
+    const stringValue = readString(value)
+
+    if (stringValue) {
+      return stringValue
+    }
+  }
+
+  return null
+}
+
+function displayValue(value: string | null): string {
+  return value ?? 'Not recorded'
+}
+
+function formatVerifiedState(value: boolean | null): string {
+  if (value === true) {
+    return 'Verified'
+  }
+
+  if (value === false) {
+    return 'Not verified'
+  }
+
+  return 'Not recorded'
 }
 
 function isImageDescriptor(
@@ -929,6 +961,99 @@ function App() {
     )
   }
 
+  function getVersionProvenance(version: AssetVersion) {
+    const metadata = version.generationMetadata
+    const provenance = isRecord(metadata.provenance) ? metadata.provenance : {}
+    const artifactFlow = isRecord(metadata.artifact_flow)
+      ? metadata.artifact_flow
+      : isRecord(provenance.artifact_flow)
+        ? provenance.artifact_flow
+        : {}
+
+    return {
+      provider: firstString(metadata.provider, provenance.provider, version.provider),
+      model: firstString(metadata.model, provenance.model, version.model),
+      prompt: firstString(metadata.prompt, provenance.prompt, version.prompt),
+      source: firstString(metadata.source, provenance.source),
+      manifestUri: firstString(metadata.manifest_uri, provenance.manifest_uri),
+      manifestHash: firstString(metadata.manifest_hash, provenance.manifest_hash),
+      manifestVerified:
+        readBoolean(metadata.manifest_verified) ??
+        readBoolean(provenance.manifest_verified),
+      generatedStorageKey: firstString(
+        artifactFlow.source_storage_key,
+        version.generatedPreview?.storageKey,
+      ),
+      artifactStorageKey: firstString(
+        artifactFlow.storage_key,
+        version.artifactStorageKey,
+      ),
+      sidecarStorageKey: version.storageKey,
+    }
+  }
+
+  function renderProvenanceDetails(version: AssetVersion) {
+    const provenance = getVersionProvenance(version)
+    const manifestLabel = provenance.manifestUri
+      ? formatVerifiedState(provenance.manifestVerified)
+      : 'Not recorded'
+
+    return (
+      <div className="provenance-panel">
+        <div className="provenance-grid">
+          <div>
+            <span>Provider</span>
+            <strong>{displayValue(provenance.provider)}</strong>
+          </div>
+          <div>
+            <span>Model</span>
+            <strong>{displayValue(provenance.model)}</strong>
+          </div>
+          <div>
+            <span>Manifest</span>
+            <strong>{manifestLabel}</strong>
+          </div>
+        </div>
+
+        <div className="provenance-item">
+          <span>Prompt</span>
+          <p>{displayValue(provenance.prompt)}</p>
+        </div>
+
+        <div className="provenance-item">
+          <span>Storage flow</span>
+          <ol className="provenance-flow">
+            <li>
+              <span>Generated</span>
+              <code>{displayValue(provenance.generatedStorageKey)}</code>
+            </li>
+            <li>
+              <span>B2 artifact</span>
+              <code>{displayValue(provenance.artifactStorageKey)}</code>
+            </li>
+            <li>
+              <span>Sidecar</span>
+              <code>{displayValue(provenance.sidecarStorageKey)}</code>
+            </li>
+          </ol>
+        </div>
+
+        <div className="provenance-item">
+          <span>Manifest details</span>
+          <div className="provenance-kv">
+            <code>{displayValue(provenance.manifestUri)}</code>
+            <code>{displayValue(provenance.manifestHash)}</code>
+          </div>
+        </div>
+
+        <div className="provenance-foot">
+          <span>{displayValue(provenance.source)}</span>
+          <span>{version.artifactStorageKey ? 'Export ready' : 'Needs artifact'}</span>
+        </div>
+      </div>
+    )
+  }
+
   async function openStoredMetadata(version: AssetVersion) {
     if (!selectedAsset) {
       return
@@ -1340,6 +1465,7 @@ function App() {
                           </span>
                           <code>{version.storageKey}</code>
                           {renderArtifactPreview(version)}
+                          {renderProvenanceDetails(version)}
                           <div
                             className="version-actions"
                             aria-label={`${version.id} actions`}

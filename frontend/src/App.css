@@ -869,6 +869,108 @@ a:focus-visible {
   background: #f2f8f5;
 }
 
+.provenance-panel {
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid #d6ddd8;
+  border-radius: 8px;
+  background: #fbfcf8;
+}
+
+.provenance-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.provenance-grid div,
+.provenance-item {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.provenance-grid span,
+.provenance-item > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.provenance-grid strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--heading);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.provenance-item p {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  color: var(--heading);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.provenance-flow {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.provenance-flow li {
+  display: grid;
+  grid-template-columns: 78px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.provenance-flow span {
+  color: #176b5d;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.provenance-flow code,
+.provenance-kv code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  color: #263238;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.provenance-kv {
+  display: grid;
+  gap: 5px;
+}
+
+.provenance-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.provenance-foot span {
+  border: 1px solid #cdd9d4;
+  border-radius: 999px;
+  color: #176b5d;
+  background: #f2f8f5;
+  font-size: 11px;
+  font-weight: 900;
+  padding: 5px 8px;
+}
+
 .version-actions {
   display: flex;
   flex-wrap: wrap;
