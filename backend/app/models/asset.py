@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, TYPE_CHECKING
 
+from sqlalchemy import DateTime
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
@@ -118,3 +120,35 @@ class AssetVersion(IdMixin, Base):
     )
 
     asset: Mapped["Asset"] = relationship("Asset", back_populates="versions")
+    inputs: Mapped[list["AssetVersionInput"]] = relationship(
+        "AssetVersionInput",
+        back_populates="asset_version",
+        cascade="all, delete-orphan",
+        order_by="AssetVersionInput.created_at.asc()",
+    )
+
+
+class AssetVersionInput(IdMixin, Base):
+    __tablename__ = "asset_version_inputs"
+
+    asset_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("asset_versions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    storage_key: Mapped[str] = mapped_column(String(600), nullable=False)
+    filename: Mapped[str] = mapped_column(String(240), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    asset_version: Mapped["AssetVersion"] = relationship(
+        "AssetVersion",
+        back_populates="inputs",
+    )
