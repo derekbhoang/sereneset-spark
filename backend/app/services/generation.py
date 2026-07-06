@@ -18,12 +18,26 @@ class GenerationProviderError(RuntimeError):
     pass
 
 
+GENBLAZE_INPUT_ASSETS_PARAMETER = "input_assets"
+SERENESET_INPUT_ASSETS_PARAMETER = "sereneset_input_assets"
+INPUT_ASSET_METADATA_KEYS = (
+    "role",
+    "storage_key",
+    "filename",
+    "content_type",
+    "size_bytes",
+    "sha256",
+    "source",
+)
+
+
 @dataclass(frozen=True)
 class ImageGenerationRequest:
     prompt: str
     model: str | None = None
     timeout_seconds: int | None = None
     parameters: dict[str, Any] = field(default_factory=dict)
+    input_assets: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -142,6 +156,37 @@ def coerce_pipeline_result(result: Any) -> tuple[Any, Any]:
     return getattr(result, "run", None), getattr(result, "manifest", None)
 
 
+def serialize_input_asset(input_asset: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: input_asset[key]
+        for key in INPUT_ASSET_METADATA_KEYS
+        if input_asset.get(key) is not None
+    }
+
+
+def build_pipeline_parameters(
+    *,
+    parameters: dict[str, Any],
+    input_assets: list[dict[str, Any]],
+) -> tuple[dict[str, Any], str | None]:
+    pipeline_parameters = dict(parameters)
+
+    if not input_assets:
+        return pipeline_parameters, None
+
+    serialized_input_assets = [
+        serialize_input_asset(input_asset)
+        for input_asset in input_assets
+    ]
+
+    if GENBLAZE_INPUT_ASSETS_PARAMETER in pipeline_parameters:
+        pipeline_parameters[SERENESET_INPUT_ASSETS_PARAMETER] = serialized_input_assets
+        return pipeline_parameters, SERENESET_INPUT_ASSETS_PARAMETER
+
+    pipeline_parameters[GENBLAZE_INPUT_ASSETS_PARAMETER] = serialized_input_assets
+    return pipeline_parameters, GENBLAZE_INPUT_ASSETS_PARAMETER
+
+
 class GenblazeGenerationService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -218,6 +263,10 @@ class GenblazeGenerationService:
         timeout_seconds = (
             request.timeout_seconds or self.settings.genblaze_timeout_seconds
         )
+        pipeline_parameters, input_assets_parameter = build_pipeline_parameters(
+            parameters=request.parameters,
+            input_assets=request.input_assets,
+        )
 
         try:
             pipeline = Pipeline("sereneset-image-generation").step(
@@ -225,7 +274,7 @@ class GenblazeGenerationService:
                 model=model,
                 prompt=request.prompt,
                 modality=Modality.IMAGE,
-                **request.parameters,
+                **pipeline_parameters,
             )
             result = pipeline.run(
                 sink=self._make_storage_sink(),
@@ -267,6 +316,8 @@ class GenblazeGenerationService:
                     "manifest_hash": getattr(manifest, "canonical_hash", None),
                     "manifest_verified": manifest_verified,
                     "asset_count": len(assets),
+                    "input_asset_count": len(request.input_assets),
+                    "input_assets_parameter": input_assets_parameter,
                 }
             },
         )

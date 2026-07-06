@@ -358,6 +358,29 @@ def add_asset_version_inputs(
         )
 
 
+def stored_generation_input_to_metadata(
+    stored_input: StoredGenerationInput,
+) -> dict[str, object]:
+    return {
+        "role": stored_input.role,
+        "storage_key": stored_input.storage_key,
+        "filename": stored_input.filename,
+        "content_type": stored_input.content_type,
+        "size_bytes": stored_input.size_bytes,
+        "sha256": stored_input.sha256,
+        "source": "user_upload",
+    }
+
+
+def stored_generation_inputs_to_metadata(
+    stored_inputs: list[StoredGenerationInput],
+) -> list[dict[str, object]]:
+    return [
+        stored_generation_input_to_metadata(stored_input)
+        for stored_input in stored_inputs
+    ]
+
+
 def get_asset_or_404(asset_id: uuid.UUID, db: Session) -> Asset:
     statement = (
         select(Asset)
@@ -445,6 +468,7 @@ def make_generated_asset_version(
     generation_parameters: dict[str, object],
     source: str,
     based_on_version_id: uuid.UUID | None = None,
+    input_assets: list[dict[str, object]] | None = None,
 ) -> AssetVersion:
     version = AssetVersion(
         asset_id=asset.id,
@@ -463,6 +487,7 @@ def make_generated_asset_version(
             generation_parameters=generation_parameters,
             source=source,
             based_on_version_id=based_on_version_id,
+            input_assets=input_assets,
         ),
     )
 
@@ -493,10 +518,16 @@ def build_version_generation_metadata(
     manifest_hash: str | None = None,
     manifest_verified: bool | None = None,
     assets: list[dict[str, object | None]] | None = None,
+    input_assets: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     existing_provenance = base_metadata.get("provenance")
     based_on_version = (
         str(based_on_version_id) if based_on_version_id is not None else None
+    )
+    input_asset_records = (
+        input_assets
+        if input_assets is not None
+        else optional_asset_metadata_list(base_metadata.get("input_assets"))
     )
     provenance: dict[str, object] = {
         "provider": provider,
@@ -508,6 +539,7 @@ def build_version_generation_metadata(
         "manifest_uri": manifest_uri,
         "manifest_hash": manifest_hash,
         "manifest_verified": manifest_verified,
+        "input_assets": input_asset_records,
         "assets": assets or [],
         "recorded_at": datetime.now(UTC).isoformat(),
     }
@@ -526,6 +558,7 @@ def build_version_generation_metadata(
         "manifest_uri": manifest_uri,
         "manifest_hash": manifest_hash,
         "manifest_verified": manifest_verified,
+        "input_assets": input_asset_records,
         "assets": assets or [],
         "provenance": provenance,
     }
@@ -537,6 +570,7 @@ def build_generation_metadata(
     generation_parameters: dict[str, object],
     source: str,
     based_on_version_id: uuid.UUID | None = None,
+    input_assets: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     return build_version_generation_metadata(
         provider=result.provider,
@@ -550,6 +584,7 @@ def build_generation_metadata(
         manifest_hash=result.manifest_hash,
         manifest_verified=result.manifest_verified,
         assets=[generated_asset_to_metadata(asset) for asset in result.assets],
+        input_assets=input_assets,
     )
 
 
@@ -809,6 +844,7 @@ def ensure_version_generation_metadata(
         manifest_hash=optional_string(metadata.get("manifest_hash")),
         manifest_verified=optional_bool(metadata.get("manifest_verified")),
         assets=optional_asset_metadata_list(metadata.get("assets")),
+        input_assets=optional_asset_metadata_list(metadata.get("input_assets")),
     )
 
 
@@ -918,6 +954,7 @@ def generate_image_or_502(
     model: str | None,
     generation_parameters: dict[str, object],
     timeout_seconds: int | None,
+    input_assets: list[dict[str, object]] | None = None,
 ) -> GenerationResult:
     try:
         return generation.generate_image(
@@ -926,6 +963,7 @@ def generate_image_or_502(
                 model=model,
                 parameters=generation_parameters,
                 timeout_seconds=timeout_seconds,
+                input_assets=input_assets or [],
             )
         )
     except GenerationConfigurationError as exc:
@@ -1211,12 +1249,14 @@ def generate_campaign_asset_with_inputs(
             version_number=1,
             generation_inputs=generation_inputs,
         )
+        input_assets = stored_generation_inputs_to_metadata(stored_inputs)
         generation_result = generate_image_or_502(
             generation=generation,
             prompt=asset_in.prompt,
             model=asset_in.model,
             generation_parameters=asset_in.generation_parameters,
             timeout_seconds=asset_in.timeout_seconds,
+            input_assets=input_assets,
         )
         version = make_generated_asset_version(
             asset=asset,
@@ -1226,6 +1266,7 @@ def generate_campaign_asset_with_inputs(
             result=generation_result,
             generation_parameters=asset_in.generation_parameters,
             source="backend_genblaze_generation",
+            input_assets=input_assets,
         )
         db.add(version)
         db.flush()
@@ -1389,12 +1430,14 @@ def generate_asset_version_with_inputs(
             version_number=version_number,
             generation_inputs=generation_inputs,
         )
+        input_assets = stored_generation_inputs_to_metadata(stored_inputs)
         generation_result = generate_image_or_502(
             generation=generation,
             prompt=version_in.prompt,
             model=version_in.model,
             generation_parameters=version_in.generation_parameters,
             timeout_seconds=version_in.timeout_seconds,
+            input_assets=input_assets,
         )
         version = make_generated_asset_version(
             asset=asset,
@@ -1405,6 +1448,7 @@ def generate_asset_version_with_inputs(
             generation_parameters=version_in.generation_parameters,
             source="backend_genblaze_refinement",
             based_on_version_id=latest_version.id if latest_version else None,
+            input_assets=input_assets,
         )
         db.add(version)
         asset.updated_at = datetime.now(UTC)
