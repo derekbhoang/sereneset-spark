@@ -1,3 +1,4 @@
+import hashlib
 import mimetypes
 import uuid
 from dataclasses import dataclass
@@ -6,13 +7,23 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from botocore.exceptions import BotoCoreError, ClientError
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_db
-from app.models.asset import Asset, AssetVersion, ReviewStatus
+from app.models.asset import Asset, AssetVersion, AssetVersionInput, ReviewStatus
 from app.models.campaign import Campaign
 from app.schemas.asset import (
     AssetCreate,
@@ -38,14 +49,31 @@ from app.services.storage import (
     B2StorageService,
     StorageConfigurationError,
     build_asset_version_artifact_storage_key,
+    build_asset_version_input_storage_key,
     build_asset_version_storage_key,
     get_storage_service,
+    normalize_asset_version_input_role,
     normalize_artifact_filename,
 )
 
 
 router = APIRouter(tags=["assets"])
 MAX_ARTIFACT_SIZE_BYTES = 25 * 1024 * 1024
+MAX_GENERATION_INPUT_FILES = 5
+MAX_GENERATION_INPUT_SIZE_BYTES = 25 * 1024 * 1024
+DEFAULT_GENERATION_INPUT_ROLE = "style_reference"
+ALLOWED_GENERATION_INPUT_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+ALLOWED_GENERATION_INPUT_ROLES = {
+    "avoid_reference",
+    "brand_reference",
+    "product",
+    "source_creative",
+    "style_reference",
+}
 
 
 @dataclass(frozen=True)
@@ -54,10 +82,286 @@ class GeneratedArtifactPayload:
     content_type: str | None
 
 
+@dataclass(frozen=True)
+class MultipartGenerationInput:
+    file: UploadFile
+    role: str
+    filename: str
+    content_type: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class StoredGenerationInput:
+    role: str
+    storage_key: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+
+
+def parse_asset_generation_payload(payload: str) -> AssetGenerationCreate:
+    try:
+        return AssetGenerationCreate.model_validate_json(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.errors(),
+        ) from exc
+
+
+def parse_asset_version_generation_payload(
+    payload: str,
+) -> AssetVersionGenerationCreate:
+    try:
+        return AssetVersionGenerationCreate.model_validate_json(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.errors(),
+        ) from exc
+
+
+def parse_multipart_generation_inputs(
+    *,
+    files: list[UploadFile] | None,
+    roles: list[str] | None,
+) -> list[MultipartGenerationInput]:
+    input_files = files or []
+    input_roles = roles or []
+
+    if not input_files:
+        if input_roles:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Roles were provided without input files",
+            )
+
+        return []
+
+    if len(input_files) > MAX_GENERATION_INPUT_FILES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Generation input images are limited to {MAX_GENERATION_INPUT_FILES}",
+        )
+
+    if not input_roles:
+        input_roles = [DEFAULT_GENERATION_INPUT_ROLE] * len(input_files)
+    elif len(input_roles) != len(input_files):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Roles must include one value for each input file",
+        )
+
+    return [
+        validate_multipart_generation_input(file=file, role=role)
+        for file, role in zip(input_files, input_roles, strict=True)
+    ]
+
+
+def normalize_generation_input_content_type(file: UploadFile) -> str:
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+
+    if content_type not in ALLOWED_GENERATION_INPUT_CONTENT_TYPES:
+        allowed_types = ", ".join(sorted(ALLOWED_GENERATION_INPUT_CONTENT_TYPES))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Input image '{file.filename or 'unnamed'}' must use one of: "
+                f"{allowed_types}"
+            ),
+        )
+
+    return content_type
+
+
+def normalize_generation_input_filename(file: UploadFile) -> str:
+    try:
+        return normalize_artifact_filename(file.filename or "")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc).replace("Artifact", "Input image"),
+        ) from exc
+
+
+def normalize_generation_input_role(role: str) -> str:
+    try:
+        normalized_role = normalize_asset_version_input_role(role)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    if normalized_role not in ALLOWED_GENERATION_INPUT_ROLES:
+        allowed_roles = ", ".join(sorted(ALLOWED_GENERATION_INPUT_ROLES))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Input role must be one of: {allowed_roles}",
+        )
+
+    return normalized_role
+
+
+def read_generation_input_for_validation(file: UploadFile) -> bytes:
+    file.file.seek(0)
+    content = file.file.read(MAX_GENERATION_INPUT_SIZE_BYTES + 1)
+    file.file.seek(0)
+
+    if not content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Input image '{file.filename or 'unnamed'}' must not be empty",
+        )
+
+    if len(content) > MAX_GENERATION_INPUT_SIZE_BYTES:
+        max_megabytes = MAX_GENERATION_INPUT_SIZE_BYTES // (1024 * 1024)
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"Input image '{file.filename or 'unnamed'}' must be "
+                f"{max_megabytes} MB or smaller"
+            ),
+        )
+
+    return content
+
+
+def validate_multipart_generation_input(
+    *,
+    file: UploadFile,
+    role: str,
+) -> MultipartGenerationInput:
+    filename = normalize_generation_input_filename(file)
+    normalized_role = normalize_generation_input_role(role)
+    content_type = normalize_generation_input_content_type(file)
+    content = read_generation_input_for_validation(file)
+
+    return MultipartGenerationInput(
+        file=file,
+        role=normalized_role,
+        filename=filename,
+        content_type=content_type,
+        size_bytes=len(content),
+    )
+
+
+def deduplicate_generation_input_filename(filename: str, occurrence: int) -> str:
+    if occurrence <= 1:
+        return filename
+
+    stem, separator, suffix = filename.rpartition(".")
+    if separator and stem:
+        return f"{stem}-{occurrence}.{suffix}"
+
+    return f"{filename}-{occurrence}"
+
+
+def upload_generation_input(
+    *,
+    storage: B2StorageService,
+    campaign: Campaign,
+    asset: Asset,
+    version_number: int,
+    generation_input: MultipartGenerationInput,
+    filename: str,
+) -> StoredGenerationInput:
+    body = read_generation_input_for_validation(generation_input.file)
+    sha256 = hashlib.sha256(body).hexdigest()
+    storage_key = build_asset_version_input_storage_key(
+        campaign_id=asset.campaign_id,
+        asset_id=asset.id,
+        version_number=version_number,
+        role=generation_input.role,
+        filename=filename,
+    )
+    stored_object = storage.upload_bytes(
+        key=storage_key,
+        body=body,
+        content_type=generation_input.content_type,
+        metadata={
+            "campaign_id": str(campaign.id),
+            "asset_id": str(asset.id),
+            "version_number": version_number,
+            "content_kind": "asset-version-input",
+            "role": generation_input.role,
+            "filename": filename,
+            "sha256": sha256,
+        },
+    )
+
+    return StoredGenerationInput(
+        role=generation_input.role,
+        storage_key=stored_object.key,
+        filename=filename,
+        content_type=stored_object.content_type,
+        size_bytes=stored_object.size,
+        sha256=sha256,
+    )
+
+
+def upload_generation_inputs(
+    *,
+    storage: B2StorageService,
+    campaign: Campaign,
+    asset: Asset,
+    version_number: int,
+    generation_inputs: list[MultipartGenerationInput],
+) -> list[StoredGenerationInput]:
+    stored_inputs: list[StoredGenerationInput] = []
+    filename_counts: dict[tuple[str, str], int] = {}
+
+    try:
+        for generation_input in generation_inputs:
+            filename_key = (generation_input.role, generation_input.filename)
+            filename_counts[filename_key] = filename_counts.get(filename_key, 0) + 1
+            filename = deduplicate_generation_input_filename(
+                generation_input.filename,
+                filename_counts[filename_key],
+            )
+            stored_inputs.append(
+                upload_generation_input(
+                    storage=storage,
+                    campaign=campaign,
+                    asset=asset,
+                    version_number=version_number,
+                    generation_input=generation_input,
+                    filename=filename,
+                )
+            )
+    except (StorageConfigurationError, BotoCoreError, ClientError):
+        delete_stored_inputs(storage=storage, stored_inputs=stored_inputs)
+        raise
+
+    return stored_inputs
+
+
+def add_asset_version_inputs(
+    *,
+    db: Session,
+    version: AssetVersion,
+    stored_inputs: list[StoredGenerationInput],
+) -> None:
+    for stored_input in stored_inputs:
+        db.add(
+            AssetVersionInput(
+                asset_version_id=version.id,
+                role=stored_input.role,
+                storage_key=stored_input.storage_key,
+                filename=stored_input.filename,
+                content_type=stored_input.content_type,
+                size_bytes=stored_input.size_bytes,
+                sha256=stored_input.sha256,
+            )
+        )
+
+
 def get_asset_or_404(asset_id: uuid.UUID, db: Session) -> Asset:
     statement = (
         select(Asset)
-        .options(selectinload(Asset.versions))
+        .options(selectinload(Asset.versions).selectinload(AssetVersion.inputs))
         .where(Asset.id == asset_id)
     )
     asset = db.scalar(statement)
@@ -76,9 +380,13 @@ def get_asset_version_or_404(
     version_id: uuid.UUID,
     db: Session,
 ) -> AssetVersion:
-    statement = select(AssetVersion).where(
-        AssetVersion.id == version_id,
-        AssetVersion.asset_id == asset_id,
+    statement = (
+        select(AssetVersion)
+        .options(selectinload(AssetVersion.inputs))
+        .where(
+            AssetVersion.id == version_id,
+            AssetVersion.asset_id == asset_id,
+        )
     )
     version = db.scalar(statement)
     if version is None:
@@ -750,6 +1058,15 @@ def delete_stored_artifact(
         pass
 
 
+def delete_stored_inputs(
+    *,
+    storage: B2StorageService,
+    stored_inputs: list[StoredGenerationInput],
+) -> None:
+    for stored_input in stored_inputs:
+        delete_stored_artifact(storage=storage, storage_key=stored_input.storage_key)
+
+
 @router.get("/campaigns/{campaign_id}/assets", response_model=list[AssetRead])
 def list_campaign_assets(
     campaign_id: uuid.UUID,
@@ -763,7 +1080,7 @@ def list_campaign_assets(
 
     statement = (
         select(Asset)
-        .options(selectinload(Asset.versions))
+        .options(selectinload(Asset.versions).selectinload(AssetVersion.inputs))
         .where(Asset.campaign_id == campaign_id)
         .order_by(Asset.updated_at.desc())
         .offset(offset)
@@ -855,6 +1172,108 @@ def generate_campaign_asset(
 
 
 @router.post(
+    "/campaigns/{campaign_id}/assets/generate-with-inputs",
+    response_model=AssetRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def generate_campaign_asset_with_inputs(
+    campaign_id: uuid.UUID,
+    payload: str = Form(...),
+    files: list[UploadFile] | None = File(default=None),
+    roles: list[str] | None = Form(default=None),
+    db: Session = Depends(get_db),
+    storage: B2StorageService = Depends(get_storage_service),
+    generation: GenblazeGenerationService = Depends(get_generation_service),
+) -> Asset:
+    asset_in = parse_asset_generation_payload(payload)
+    generation_inputs = parse_multipart_generation_inputs(files=files, roles=roles)
+    campaign = ensure_campaign_exists(campaign_id, db)
+    asset = Asset(
+        campaign_id=campaign_id,
+        title=generated_asset_title(asset_in),
+        format=asset_in.format,
+        channel=asset_in.channel,
+        status=asset_in.status,
+        reviewer=asset_in.reviewer,
+        tags=["genblaze", *asset_in.tags],
+        summary=generated_asset_summary(asset_in),
+    )
+    stored_inputs: list[StoredGenerationInput] = []
+    uploaded_artifact_key: str | None = None
+
+    try:
+        db.add(asset)
+        db.flush()
+        stored_inputs = upload_generation_inputs(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version_number=1,
+            generation_inputs=generation_inputs,
+        )
+        generation_result = generate_image_or_502(
+            generation=generation,
+            prompt=asset_in.prompt,
+            model=asset_in.model,
+            generation_parameters=asset_in.generation_parameters,
+            timeout_seconds=asset_in.timeout_seconds,
+        )
+        version = make_generated_asset_version(
+            asset=asset,
+            version_number=1,
+            label="Initial Genblaze draft",
+            prompt=asset_in.prompt,
+            result=generation_result,
+            generation_parameters=asset_in.generation_parameters,
+            source="backend_genblaze_generation",
+        )
+        db.add(version)
+        db.flush()
+        add_asset_version_inputs(
+            db=db,
+            version=version,
+            stored_inputs=stored_inputs,
+        )
+        uploaded_artifact_key = upload_generated_artifact(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+            result=generation_result,
+        )
+        upload_asset_version_sidecar(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        delete_stored_inputs(storage=storage, stored_inputs=stored_inputs)
+        delete_stored_artifact(storage=storage, storage_key=uploaded_artifact_key)
+        raise
+    except IntegrityError as exc:
+        db.rollback()
+        delete_stored_inputs(storage=storage, stored_inputs=stored_inputs)
+        delete_stored_artifact(storage=storage, storage_key=uploaded_artifact_key)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Generated asset could not be saved because database constraints failed",
+        ) from exc
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        db.rollback()
+        delete_stored_inputs(storage=storage, stored_inputs=stored_inputs)
+        delete_stored_artifact(storage=storage, storage_key=uploaded_artifact_key)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Generated asset was not saved because B2 storage failed",
+        ) from exc
+
+    return get_asset_or_404(asset.id, db)
+
+
+@router.post(
     "/assets/{asset_id}/versions/generate",
     response_model=AssetRead,
     status_code=status.HTTP_201_CREATED,
@@ -927,6 +1346,105 @@ def generate_asset_version(
             storage=storage,
             storage_key=uploaded_artifact_key,
         )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Generated asset version was not saved because B2 storage failed",
+        ) from exc
+
+    return get_asset_or_404(asset.id, db)
+
+
+@router.post(
+    "/assets/{asset_id}/versions/generate-with-inputs",
+    response_model=AssetRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def generate_asset_version_with_inputs(
+    asset_id: uuid.UUID,
+    payload: str = Form(...),
+    files: list[UploadFile] | None = File(default=None),
+    roles: list[str] | None = Form(default=None),
+    db: Session = Depends(get_db),
+    storage: B2StorageService = Depends(get_storage_service),
+    generation: GenblazeGenerationService = Depends(get_generation_service),
+) -> Asset:
+    version_in = parse_asset_version_generation_payload(payload)
+    generation_inputs = parse_multipart_generation_inputs(files=files, roles=roles)
+    asset = get_asset_or_404(asset_id, db)
+    campaign = ensure_campaign_exists(asset.campaign_id, db)
+    latest_version = max(
+        asset.versions,
+        key=lambda asset_version: asset_version.version_number,
+        default=None,
+    )
+    version_number = (latest_version.version_number if latest_version else 0) + 1
+    stored_inputs: list[StoredGenerationInput] = []
+    uploaded_artifact_key: str | None = None
+
+    try:
+        stored_inputs = upload_generation_inputs(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version_number=version_number,
+            generation_inputs=generation_inputs,
+        )
+        generation_result = generate_image_or_502(
+            generation=generation,
+            prompt=version_in.prompt,
+            model=version_in.model,
+            generation_parameters=version_in.generation_parameters,
+            timeout_seconds=version_in.timeout_seconds,
+        )
+        version = make_generated_asset_version(
+            asset=asset,
+            version_number=version_number,
+            label=version_in.label or f"Genblaze refinement {version_number}",
+            prompt=version_in.prompt,
+            result=generation_result,
+            generation_parameters=version_in.generation_parameters,
+            source="backend_genblaze_refinement",
+            based_on_version_id=latest_version.id if latest_version else None,
+        )
+        db.add(version)
+        asset.updated_at = datetime.now(UTC)
+        db.flush()
+        add_asset_version_inputs(
+            db=db,
+            version=version,
+            stored_inputs=stored_inputs,
+        )
+        uploaded_artifact_key = upload_generated_artifact(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+            result=generation_result,
+        )
+        upload_asset_version_sidecar(
+            storage=storage,
+            campaign=campaign,
+            asset=asset,
+            version=version,
+        )
+        db.commit()
+    except HTTPException:
+        db.rollback()
+        delete_stored_inputs(storage=storage, stored_inputs=stored_inputs)
+        delete_stored_artifact(storage=storage, storage_key=uploaded_artifact_key)
+        raise
+    except IntegrityError as exc:
+        db.rollback()
+        delete_stored_inputs(storage=storage, stored_inputs=stored_inputs)
+        delete_stored_artifact(storage=storage, storage_key=uploaded_artifact_key)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Asset version number already exists",
+        ) from exc
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        db.rollback()
+        delete_stored_inputs(storage=storage, stored_inputs=stored_inputs)
+        delete_stored_artifact(storage=storage, storage_key=uploaded_artifact_key)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Generated asset version was not saved because B2 storage failed",
@@ -1219,6 +1737,7 @@ def list_asset_versions(
 
     statement = (
         select(AssetVersion)
+        .options(selectinload(AssetVersion.inputs))
         .where(AssetVersion.asset_id == asset_id)
         .order_by(AssetVersion.version_number.desc())
     )
