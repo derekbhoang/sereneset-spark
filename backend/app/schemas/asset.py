@@ -20,6 +20,20 @@ class AssetVersionCreate(AssetVersionBase):
     model_config = ConfigDict(extra="forbid")
 
 
+class AssetVersionInputRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    asset_version_id: uuid.UUID
+    role: str
+    storage_key: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
+    created_at: datetime
+
+
 class AssetVersionRead(AssetVersionBase):
     model_config = ConfigDict(from_attributes=True)
 
@@ -30,6 +44,7 @@ class AssetVersionRead(AssetVersionBase):
     artifact_filename: str | None = None
     artifact_content_type: str | None = None
     artifact_size_bytes: int | None = None
+    inputs: list[AssetVersionInputRead] = Field(default_factory=list)
 
 
 class AssetVersionDownloadUrl(BaseModel):

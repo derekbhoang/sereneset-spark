@@ -76,6 +76,21 @@ def normalize_artifact_filename(filename: str) -> str:
     return safe_filename[:240]
 
 
+def normalize_asset_version_input_role(role: str) -> str:
+    normalized_role = role.strip().lower().replace(" ", "_")
+
+    if not normalized_role:
+        raise ValueError("Input role must not be empty")
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", normalized_role):
+        raise ValueError(
+            "Input role must contain only lowercase letters, numbers, "
+            "underscores, and hyphens"
+        )
+
+    return normalized_role
+
+
 def build_asset_version_artifact_storage_key(
     *,
     campaign_id: uuid.UUID,
@@ -96,6 +111,34 @@ def build_asset_version_artifact_storage_key(
                 "versions",
                 f"v{version_number}",
                 "artifact",
+                normalize_artifact_filename(filename),
+            ]
+        )
+    )
+
+
+def build_asset_version_input_storage_key(
+    *,
+    campaign_id: uuid.UUID,
+    asset_id: uuid.UUID,
+    version_number: int,
+    role: str,
+    filename: str,
+) -> str:
+    if version_number < 1:
+        raise ValueError("Version number must be greater than zero")
+
+    return normalize_storage_key(
+        "/".join(
+            [
+                "campaigns",
+                str(campaign_id),
+                "assets",
+                str(asset_id),
+                "versions",
+                f"v{version_number}",
+                "inputs",
+                normalize_asset_version_input_role(role),
                 normalize_artifact_filename(filename),
             ]
         )

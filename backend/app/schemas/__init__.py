@@ -8,6 +8,7 @@ from app.schemas.asset import (
     AssetVersionCreate,
     AssetVersionDownloadUrl,
     AssetVersionGenerationCreate,
+    AssetVersionInputRead,
     AssetVersionRead,
 )
 from app.schemas.campaign import CampaignCreate, CampaignRead, CampaignUpdate
@@ -22,6 +23,7 @@ __all__ = [
     "AssetVersionCreate",
     "AssetVersionDownloadUrl",
     "AssetVersionGenerationCreate",
+    "AssetVersionInputRead",
     "AssetVersionRead",
     "CampaignCreate",
     "CampaignRead",
