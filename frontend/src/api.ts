@@ -1,5 +1,16 @@
 export type ReviewStatus = 'draft' | 'in_review' | 'approved' | 'rejected'
 export type AssetFormatValue = 'copy' | 'image' | 'video_concept'
+export type GenerationInputRole =
+  | 'product'
+  | 'brand_reference'
+  | 'style_reference'
+  | 'source_creative'
+  | 'avoid_reference'
+
+export type GenerationInputFile = {
+  file: File
+  role?: GenerationInputRole
+}
 
 export type CampaignDto = {
   id: string
@@ -46,6 +57,19 @@ export type AssetVersionDto = {
   artifact_content_type: string | null
   artifact_size_bytes: number | null
   generation_metadata: Record<string, unknown>
+  inputs: AssetVersionInputDto[]
+}
+
+export type AssetVersionInputDto = {
+  id: string
+  asset_version_id: string
+  role: GenerationInputRole
+  storage_key: string
+  filename: string
+  content_type: string
+  size_bytes: number
+  sha256: string
+  created_at: string
 }
 
 export type AssetDto = {
@@ -193,6 +217,22 @@ async function uploadRequest<T>(path: string, formData: FormData): Promise<T> {
   return response.json() as Promise<T>
 }
 
+function buildGenerationInputFormData(
+  payload: AssetGenerationCreateDto | AssetVersionGenerationCreateDto,
+  inputs: GenerationInputFile[] = [],
+): FormData {
+  const formData = new FormData()
+
+  formData.append('payload', JSON.stringify(payload))
+
+  for (const input of inputs) {
+    formData.append('files', input.file)
+    formData.append('roles', input.role ?? 'style_reference')
+  }
+
+  return formData
+}
+
 function getFilenameFromContentDisposition(value: string | null): string | null {
   if (!value) {
     return null
@@ -290,6 +330,17 @@ export function generateCampaignAsset(
   })
 }
 
+export function generateCampaignAssetWithInputs(
+  campaignId: string,
+  asset: AssetGenerationCreateDto,
+  inputs: GenerationInputFile[] = [],
+): Promise<AssetDto> {
+  return uploadRequest<AssetDto>(
+    `/campaigns/${campaignId}/assets/generate-with-inputs`,
+    buildGenerationInputFormData(asset, inputs),
+  )
+}
+
 export function updateAssetStatus(
   assetId: string,
   status: ReviewStatus,
@@ -322,6 +373,17 @@ export function generateAssetVersion(
     method: 'POST',
     body: JSON.stringify(version),
   })
+}
+
+export function generateAssetVersionWithInputs(
+  assetId: string,
+  version: AssetVersionGenerationCreateDto,
+  inputs: GenerationInputFile[] = [],
+): Promise<AssetDto> {
+  return uploadRequest<AssetDto>(
+    `/assets/${assetId}/versions/generate-with-inputs`,
+    buildGenerationInputFormData(version, inputs),
+  )
 }
 
 export function fetchAssetVersionDownloadUrl(

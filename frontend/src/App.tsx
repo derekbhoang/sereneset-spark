@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react'
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from 'react'
 import {
   createCampaign,
   deleteCampaign,
@@ -9,13 +15,20 @@ import {
   fetchCampaignAssets,
   fetchCampaigns,
   generateAssetVersion,
+  generateAssetVersionWithInputs,
   generateCampaignAsset,
+  generateCampaignAssetWithInputs,
   updateAssetStatus as patchAssetStatus,
   uploadAssetVersionArtifact,
   type AssetDto,
   type AssetFormatValue,
+  type AssetGenerationCreateDto,
   type AssetVersionDto,
+  type AssetVersionGenerationCreateDto,
+  type AssetVersionInputDto,
   type CampaignDto,
+  type GenerationInputFile,
+  type GenerationInputRole,
   type ReviewStatus,
 } from './api'
 import './App.css'
@@ -55,6 +68,7 @@ type AssetVersion = {
   artifactSizeBytes: number | null
   generationMetadata: Record<string, unknown>
   generatedPreview: GeneratedPreview | null
+  inputAssets: VersionInputAsset[]
 }
 
 type Asset = {
@@ -96,6 +110,24 @@ type CampaignFormState = {
   brief: string
   channels: string
   brandInputs: string
+}
+
+type ReferenceImage = {
+  id: string
+  file: File
+  role: GenerationInputRole
+  previewUrl: string
+}
+
+type VersionInputAsset = {
+  id: string | null
+  role: string | null
+  storageKey: string | null
+  filename: string | null
+  contentType: string | null
+  sizeBytes: number | null
+  sha256: string | null
+  source: string | null
 }
 
 const defaultPrompt =
@@ -142,6 +174,26 @@ const formatValues: Record<AssetFormat, AssetFormatValue> = {
   Image: 'image',
   'Video concept': 'video_concept',
 }
+
+const referenceRoleOptions: GenerationInputRole[] = [
+  'product',
+  'brand_reference',
+  'style_reference',
+  'source_creative',
+  'avoid_reference',
+]
+
+const referenceRoleLabels: Record<GenerationInputRole, string> = {
+  product: 'Product',
+  brand_reference: 'Brand reference',
+  style_reference: 'Style reference',
+  source_creative: 'Source creative',
+  avoid_reference: 'Avoid reference',
+}
+
+const maxReferenceImageCount = 5
+const maxReferenceImageSizeBytes = 25 * 1024 * 1024
+const allowedReferenceImageTypes = ['image/png', 'image/jpeg', 'image/webp']
 
 function formatDueDate(value: string | null): string {
   if (!value) {
@@ -225,6 +277,10 @@ function readBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null
 }
 
+function readNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
 function readAssetMetadataList(value: unknown): Record<string, unknown>[] {
   return Array.isArray(value) ? value.filter(isRecord) : []
 }
@@ -243,6 +299,14 @@ function firstString(...values: unknown[]): string | null {
 
 function displayValue(value: string | null): string {
   return value ?? 'Not recorded'
+}
+
+function displayInputRole(value: string | null): string {
+  if (!value) {
+    return 'Reference'
+  }
+
+  return referenceRoleLabels[value as GenerationInputRole] ?? titleCase(value)
 }
 
 function formatVerifiedState(value: boolean | null): string {
@@ -292,6 +356,41 @@ function getGeneratedPreview(
     assetCandidates[0] ??
     null
   )
+}
+
+function getInputAssetsFromMetadata(
+  metadata: Record<string, unknown>,
+): VersionInputAsset[] {
+  const provenance = isRecord(metadata.provenance) ? metadata.provenance : null
+  const inputCandidates = [
+    ...readAssetMetadataList(metadata.input_assets),
+    ...readAssetMetadataList(provenance?.input_assets),
+  ]
+  const seenInputAssets = new Set<string>()
+
+  return inputCandidates
+    .map((inputAsset) => ({
+      id: null,
+      role: readString(inputAsset.role),
+      storageKey: readString(inputAsset.storage_key),
+      filename: readString(inputAsset.filename),
+      contentType: readString(inputAsset.content_type),
+      sizeBytes: readNumber(inputAsset.size_bytes),
+      sha256: readString(inputAsset.sha256),
+      source: readString(inputAsset.source),
+    }))
+    .filter((inputAsset) => inputAsset.storageKey || inputAsset.filename)
+    .filter((inputAsset) => {
+      const fingerprint =
+        inputAsset.storageKey ?? `${inputAsset.role}-${inputAsset.filename}`
+
+      if (seenInputAssets.has(fingerprint)) {
+        return false
+      }
+
+      seenInputAssets.add(fingerprint)
+      return true
+    })
 }
 
 function hasImageArtifact(version: AssetVersion): boolean {
@@ -427,6 +526,50 @@ function canCreateCampaign(form: CampaignFormState): boolean {
   )
 }
 
+function makeReferenceImageId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function validateReferenceFile(file: File): string | null {
+  if (!allowedReferenceImageTypes.includes(file.type)) {
+    return `${file.name} must be a PNG, JPEG, or WebP image.`
+  }
+
+  if (file.size === 0) {
+    return `${file.name} must not be empty.`
+  }
+
+  if (file.size > maxReferenceImageSizeBytes) {
+    return `${file.name} must be ${formatFileSize(maxReferenceImageSizeBytes)} or smaller.`
+  }
+
+  return null
+}
+
+function createReferenceImage(file: File): ReferenceImage {
+  return {
+    id: makeReferenceImageId(),
+    file,
+    role: 'style_reference',
+    previewUrl: URL.createObjectURL(file),
+  }
+}
+
+function revokeReferenceImages(images: ReferenceImage[]): void {
+  for (const image of images) {
+    URL.revokeObjectURL(image.previewUrl)
+  }
+}
+
+function referenceImagesToGenerationInputs(
+  images: ReferenceImage[],
+): GenerationInputFile[] {
+  return images.map((image) => ({
+    file: image.file,
+    role: image.role,
+  }))
+}
+
 function buildRefinePrompt(asset: Asset): string {
   return `Refine "${asset.title}" for ${asset.channel}. Keep the strongest idea, improve clarity, and make the next version more production-ready.`
 }
@@ -458,8 +601,22 @@ function mapCampaign(campaign: CampaignDto, index: number): Campaign {
   }
 }
 
+function mapAssetVersionInput(input: AssetVersionInputDto): VersionInputAsset {
+  return {
+    id: input.id,
+    role: input.role,
+    storageKey: input.storage_key,
+    filename: input.filename,
+    contentType: input.content_type,
+    sizeBytes: input.size_bytes,
+    sha256: input.sha256,
+    source: 'user_upload',
+  }
+}
+
 function mapAssetVersion(version: AssetVersionDto): AssetVersion {
   const generatedPreview = getGeneratedPreview(version.generation_metadata)
+  const inputAssets = (version.inputs ?? []).map(mapAssetVersionInput)
 
   return {
     id: `v${version.version_number}`,
@@ -477,6 +634,9 @@ function mapAssetVersion(version: AssetVersionDto): AssetVersion {
     artifactSizeBytes: version.artifact_size_bytes,
     generationMetadata: version.generation_metadata,
     generatedPreview,
+    inputAssets: inputAssets.length
+      ? inputAssets
+      : getInputAssetsFromMetadata(version.generation_metadata),
   }
 }
 
@@ -545,7 +705,15 @@ function App() {
     Record<string, boolean>
   >({})
   const [refinePrompts, setRefinePrompts] = useState<Record<string, string>>({})
+  const [generationReferenceImages, setGenerationReferenceImages] = useState<
+    ReferenceImage[]
+  >([])
+  const [refineReferenceImages, setRefineReferenceImages] = useState<
+    Record<string, ReferenceImage[]>
+  >({})
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const generationReferenceImagesRef = useRef<ReferenceImage[]>([])
+  const refineReferenceImagesRef = useRef<Record<string, ReferenceImage[]>>({})
 
   useEffect(() => {
     let isCancelled = false
@@ -582,6 +750,24 @@ function App() {
       isCancelled = true
     }
   }, [])
+
+  useEffect(() => {
+    generationReferenceImagesRef.current = generationReferenceImages
+  }, [generationReferenceImages])
+
+  useEffect(() => {
+    refineReferenceImagesRef.current = refineReferenceImages
+  }, [refineReferenceImages])
+
+  useEffect(
+    () => () => {
+      revokeReferenceImages(generationReferenceImagesRef.current)
+      for (const images of Object.values(refineReferenceImagesRef.current)) {
+        revokeReferenceImages(images)
+      }
+    },
+    [],
+  )
 
   const selectedCampaign = useMemo(
     () =>
@@ -687,6 +873,9 @@ function App() {
   )
   const latestSelectedVersion = selectedVersions[0] ?? null
   const previousSelectedVersions = selectedVersions.slice(1)
+  const selectedRefineReferenceImages = selectedAsset
+    ? (refineReferenceImages[selectedAsset.id] ?? [])
+    : []
 
   const refinePrompt = selectedAsset
     ? (refinePrompts[selectedAsset.id] ?? buildRefinePrompt(selectedAsset))
@@ -840,6 +1029,220 @@ function App() {
     }
   }, [filteredAssets])
 
+  function createReferenceImagesFromFiles(
+    files: FileList | null,
+    currentCount: number,
+  ): ReferenceImage[] {
+    if (!files?.length) {
+      return []
+    }
+
+    const nextFiles = Array.from(files)
+
+    if (currentCount + nextFiles.length > maxReferenceImageCount) {
+      setErrorMessage(
+        `Reference images are limited to ${maxReferenceImageCount} files.`,
+      )
+      return []
+    }
+
+    for (const file of nextFiles) {
+      const validationError = validateReferenceFile(file)
+
+      if (validationError) {
+        setErrorMessage(validationError)
+        return []
+      }
+    }
+
+    setErrorMessage(null)
+    return nextFiles.map(createReferenceImage)
+  }
+
+  function addGenerationReferenceImages(files: FileList | null) {
+    const nextImages = createReferenceImagesFromFiles(
+      files,
+      generationReferenceImages.length,
+    )
+
+    if (nextImages.length) {
+      setGenerationReferenceImages((currentImages) => [
+        ...currentImages,
+        ...nextImages,
+      ])
+    }
+  }
+
+  function addRefineReferenceImages(assetId: string, files: FileList | null) {
+    const currentImages = refineReferenceImages[assetId] ?? []
+    const nextImages = createReferenceImagesFromFiles(
+      files,
+      currentImages.length,
+    )
+
+    if (nextImages.length) {
+      setRefineReferenceImages((currentImageMap) => ({
+        ...currentImageMap,
+        [assetId]: [...(currentImageMap[assetId] ?? []), ...nextImages],
+      }))
+    }
+  }
+
+  function updateGenerationReferenceRole(
+    imageId: string,
+    role: GenerationInputRole,
+  ) {
+    setGenerationReferenceImages((currentImages) =>
+      currentImages.map((image) =>
+        image.id === imageId ? { ...image, role } : image,
+      ),
+    )
+  }
+
+  function updateRefineReferenceRole(
+    assetId: string,
+    imageId: string,
+    role: GenerationInputRole,
+  ) {
+    setRefineReferenceImages((currentImageMap) => ({
+      ...currentImageMap,
+      [assetId]: (currentImageMap[assetId] ?? []).map((image) =>
+        image.id === imageId ? { ...image, role } : image,
+      ),
+    }))
+  }
+
+  function removeGenerationReferenceImage(imageId: string) {
+    setGenerationReferenceImages((currentImages) => {
+      const removedImages = currentImages.filter((image) => image.id === imageId)
+      revokeReferenceImages(removedImages)
+      return currentImages.filter((image) => image.id !== imageId)
+    })
+  }
+
+  function removeRefineReferenceImage(assetId: string, imageId: string) {
+    setRefineReferenceImages((currentImageMap) => {
+      const currentImages = currentImageMap[assetId] ?? []
+      const removedImages = currentImages.filter((image) => image.id === imageId)
+      const nextImages = currentImages.filter((image) => image.id !== imageId)
+      const nextImageMap = { ...currentImageMap }
+
+      revokeReferenceImages(removedImages)
+
+      if (nextImages.length) {
+        nextImageMap[assetId] = nextImages
+      } else {
+        delete nextImageMap[assetId]
+      }
+
+      return nextImageMap
+    })
+  }
+
+  function clearGenerationReferenceImages() {
+    setGenerationReferenceImages((currentImages) => {
+      revokeReferenceImages(currentImages)
+      return []
+    })
+  }
+
+  function clearRefineReferenceImages(assetId: string) {
+    setRefineReferenceImages((currentImageMap) => {
+      const currentImages = currentImageMap[assetId] ?? []
+      const nextImageMap = { ...currentImageMap }
+
+      revokeReferenceImages(currentImages)
+      delete nextImageMap[assetId]
+
+      return nextImageMap
+    })
+  }
+
+  function renderReferenceImagePicker({
+    images,
+    inputId,
+    disabled,
+    onAdd,
+    onRemove,
+    onRoleChange,
+  }: {
+    images: ReferenceImage[]
+    inputId: string
+    disabled: boolean
+    onAdd: (files: FileList | null) => void
+    onRemove: (imageId: string) => void
+    onRoleChange: (imageId: string, role: GenerationInputRole) => void
+  }) {
+    return (
+      <div className="reference-inputs">
+        <div className="reference-inputs-heading">
+          <span>Reference images</span>
+          <label
+            className={`metadata-button artifact-upload reference-add-button ${
+              disabled || images.length >= maxReferenceImageCount
+                ? 'is-disabled'
+                : ''
+            }`}
+            htmlFor={inputId}
+          >
+            Add images
+            <input
+              accept={allowedReferenceImageTypes.join(',')}
+              disabled={disabled || images.length >= maxReferenceImageCount}
+              id={inputId}
+              multiple
+              onChange={(event) => {
+                onAdd(event.currentTarget.files)
+                event.currentTarget.value = ''
+              }}
+              type="file"
+            />
+          </label>
+        </div>
+
+        {images.length > 0 && (
+          <div className="reference-image-list">
+            {images.map((image) => (
+              <div className="reference-image-card" key={image.id}>
+                <img alt={`${image.file.name} reference`} src={image.previewUrl} />
+                <div className="reference-image-meta">
+                  <strong>{image.file.name}</strong>
+                  <small>{formatFileSize(image.file.size)}</small>
+                  <select
+                    aria-label={`Role for ${image.file.name}`}
+                    disabled={disabled}
+                    onChange={(event) =>
+                      onRoleChange(
+                        image.id,
+                        event.target.value as GenerationInputRole,
+                      )
+                    }
+                    value={image.role}
+                  >
+                    {referenceRoleOptions.map((role) => (
+                      <option key={role} value={role}>
+                        {referenceRoleLabels[role]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  aria-label={`Remove ${image.file.name}`}
+                  className="reference-remove-button"
+                  disabled={disabled}
+                  onClick={() => onRemove(image.id)}
+                  type="button"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   function selectCampaign(campaignId: string) {
     if (campaignId === selectedCampaignId) {
       setOpenCampaignMenuId(null)
@@ -856,6 +1259,7 @@ function App() {
     setStatusFilter('all')
     setChannelFilter('All')
     setRequestChannel(nextCampaign?.channels[0] ?? '')
+    clearGenerationReferenceImages()
   }
 
   async function createCampaignFromForm(event: FormEvent<HTMLFormElement>) {
@@ -898,6 +1302,7 @@ function App() {
       setStatusFilter('all')
       setChannelFilter('All')
       setRequestChannel(createdCampaign.channels[0] ?? '')
+      clearGenerationReferenceImages()
       setCampaignForm(defaultCampaignForm)
       setIsCreateCampaignOpen(false)
     } catch (error) {
@@ -940,6 +1345,7 @@ function App() {
         setStatusFilter('all')
         setChannelFilter('All')
         setRequestChannel(nextSelectedCampaign?.channels[0] ?? '')
+        clearGenerationReferenceImages()
       }
     } catch (error) {
       setErrorMessage(getErrorMessage(error))
@@ -1022,25 +1428,33 @@ function App() {
     setErrorMessage(null)
 
     try {
-      const createdAsset = mapAsset(
-        await generateCampaignAsset(selectedCampaign.id, {
-          title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
+      const assetPayload: AssetGenerationCreateDto = {
+        title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
+        format: formatValue,
+        channel: requestChannel,
+        prompt: requestPrompt,
+        status: 'draft',
+        reviewer: null,
+        tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
+        summary:
+          'A Genblaze-generated creative direction with durable B2 storage and provenance metadata.',
+        generation_parameters: {
+          campaign_name: selectedCampaign.name,
+          product: selectedCampaign.product,
+          audience: selectedCampaign.audience,
           format: formatValue,
           channel: requestChannel,
-          prompt: requestPrompt,
-          status: 'draft',
-          reviewer: null,
-          tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
-          summary:
-            'A Genblaze-generated creative direction with durable B2 storage and provenance metadata.',
-          generation_parameters: {
-            campaign_name: selectedCampaign.name,
-            product: selectedCampaign.product,
-            audience: selectedCampaign.audience,
-            format: formatValue,
-            channel: requestChannel,
-          },
-        }),
+        },
+      }
+      const createdAssetDto = generationReferenceImages.length
+        ? await generateCampaignAssetWithInputs(
+            selectedCampaign.id,
+            assetPayload,
+            referenceImagesToGenerationInputs(generationReferenceImages),
+          )
+        : await generateCampaignAsset(selectedCampaign.id, assetPayload)
+      const createdAsset = mapAsset(
+        createdAssetDto,
       )
       setAssets((currentAssets) => [
         createdAsset,
@@ -1049,6 +1463,7 @@ function App() {
       setSelectedAssetId(createdAsset.id)
       setStatusFilter('all')
       setChannelFilter('All')
+      clearGenerationReferenceImages()
     } catch (error) {
       setErrorMessage(getErrorMessage(error))
     } finally {
@@ -1073,16 +1488,25 @@ function App() {
     setErrorMessage(null)
 
     try {
+      const referenceImages = refineReferenceImages[selectedAsset.id] ?? []
+      const versionPayload: AssetVersionGenerationCreateDto = {
+        prompt: trimmedPrompt,
+        label: `Genblaze refinement ${versionNumber}`,
+        generation_parameters: {
+          asset_title: selectedAsset.title,
+          format: formatValues[selectedAsset.format],
+          channel: selectedAsset.channel,
+        },
+      }
+      const refreshedAssetDto = referenceImages.length
+        ? await generateAssetVersionWithInputs(
+            selectedAsset.id,
+            versionPayload,
+            referenceImagesToGenerationInputs(referenceImages),
+          )
+        : await generateAssetVersion(selectedAsset.id, versionPayload)
       const refreshedAsset = mapAsset(
-        await generateAssetVersion(selectedAsset.id, {
-          prompt: trimmedPrompt,
-          label: `Genblaze refinement ${versionNumber}`,
-          generation_parameters: {
-            asset_title: selectedAsset.title,
-            format: formatValues[selectedAsset.format],
-            channel: selectedAsset.channel,
-          },
-        }),
+        refreshedAssetDto,
       )
       setAssets((currentAssets) =>
         currentAssets.map((asset) =>
@@ -1095,6 +1519,7 @@ function App() {
         delete nextPrompts[selectedAsset.id]
         return nextPrompts
       })
+      clearRefineReferenceImages(selectedAsset.id)
     } catch (error) {
       setErrorMessage(getErrorMessage(error))
     } finally {
@@ -1287,6 +1712,9 @@ function App() {
         version.artifactStorageKey,
       ),
       sidecarStorageKey: version.storageKey,
+      inputAssets: version.inputAssets.length
+        ? version.inputAssets
+        : getInputAssetsFromMetadata(metadata),
     }
   }
 
@@ -1316,6 +1744,46 @@ function App() {
         <div className="provenance-item">
           <span>Prompt</span>
           <p>{displayValue(provenance.prompt)}</p>
+        </div>
+
+        <div className="provenance-item">
+          <span>Input assets</span>
+          {provenance.inputAssets.length > 0 ? (
+            <div className="provenance-input-list">
+              {provenance.inputAssets.map((inputAsset, index) => (
+                <div
+                  className="provenance-input-card"
+                  key={
+                    inputAsset.id ??
+                    inputAsset.storageKey ??
+                    `${inputAsset.role}-${inputAsset.filename}-${index}`
+                  }
+                >
+                  <div className="provenance-input-head">
+                    <strong>{displayInputRole(inputAsset.role)}</strong>
+                    <span>
+                      {[
+                        inputAsset.contentType,
+                        inputAsset.sizeBytes === null
+                          ? null
+                          : formatFileSize(inputAsset.sizeBytes),
+                      ]
+                        .filter(Boolean)
+                        .join(' / ') || 'Stored input'}
+                    </span>
+                  </div>
+                  <p>{displayValue(inputAsset.filename)}</p>
+                  <code>{displayValue(inputAsset.storageKey)}</code>
+                  <div className="provenance-input-foot">
+                    <span>{displayValue(inputAsset.source)}</span>
+                    <span>{inputAsset.sha256?.slice(0, 12) ?? 'No hash'}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p>No reference images recorded.</p>
+          )}
         </div>
 
         <div className="provenance-item">
@@ -1849,6 +2317,15 @@ function App() {
                     />
                   </label>
 
+                  {renderReferenceImagePicker({
+                    images: generationReferenceImages,
+                    inputId: 'generation-reference-images',
+                    disabled: isGenerating,
+                    onAdd: addGenerationReferenceImages,
+                    onRemove: removeGenerationReferenceImage,
+                    onRoleChange: updateGenerationReferenceRole,
+                  })}
+
                   <button
                     className="button button-primary"
                     disabled={isGenerating || !requestChannel}
@@ -2065,6 +2542,22 @@ function App() {
                           value={refinePrompt}
                         />
                       </label>
+
+                      {renderReferenceImagePicker({
+                        images: selectedRefineReferenceImages,
+                        inputId: `refine-reference-images-${selectedAsset.id}`,
+                        disabled: isRefining,
+                        onAdd: (files) =>
+                          addRefineReferenceImages(selectedAsset.id, files),
+                        onRemove: (imageId) =>
+                          removeRefineReferenceImage(selectedAsset.id, imageId),
+                        onRoleChange: (imageId, role) =>
+                          updateRefineReferenceRole(
+                            selectedAsset.id,
+                            imageId,
+                            role,
+                          ),
+                      })}
 
                       <button
                         className="button button-primary"

@@ -996,6 +996,36 @@ def generated_asset_summary(asset_in: AssetGenerationCreate) -> str:
     )
 
 
+def asset_version_input_to_sidecar(
+    version_input: AssetVersionInput,
+) -> dict[str, object]:
+    return {
+        "id": str(version_input.id),
+        "role": version_input.role,
+        "storage_key": version_input.storage_key,
+        "filename": version_input.filename,
+        "content_type": version_input.content_type,
+        "size_bytes": version_input.size_bytes,
+        "sha256": version_input.sha256,
+        "created_at": version_input.created_at.isoformat(),
+    }
+
+
+def version_input_sidecar_records(version: AssetVersion) -> list[dict[str, object]]:
+    records = [
+        asset_version_input_to_sidecar(version_input)
+        for version_input in sorted(
+            version.inputs,
+            key=lambda item: item.created_at,
+        )
+    ]
+    if records:
+        return records
+
+    metadata = version.generation_metadata or {}
+    return optional_asset_metadata_list(metadata.get("input_assets"))
+
+
 def build_asset_version_sidecar(
     *,
     campaign: Campaign,
@@ -1034,6 +1064,7 @@ def build_asset_version_sidecar(
             "artifact_filename": version.artifact_filename,
             "artifact_content_type": version.artifact_content_type,
             "artifact_size_bytes": version.artifact_size_bytes,
+            "input_assets": version_input_sidecar_records(version),
             "generation_metadata": version.generation_metadata,
         },
         "stored_at": datetime.now(UTC).isoformat(),

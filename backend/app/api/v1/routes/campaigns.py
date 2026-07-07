@@ -4,6 +4,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import BytesIO
+from pathlib import PurePosixPath
 from urllib.error import URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
@@ -15,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_db
-from app.models.asset import Asset, AssetVersion, ReviewStatus
+from app.models.asset import Asset, AssetVersion, AssetVersionInput, ReviewStatus
 from app.models.campaign import Campaign
 from app.schemas.campaign import CampaignCreate, CampaignRead, CampaignUpdate
 from app.services.storage import (
@@ -40,6 +41,20 @@ class ExportArtifactReference:
     source: str
 
 
+@dataclass(frozen=True)
+class ExportInputReference:
+    id: uuid.UUID | None
+    role: str | None
+    storage_key: str | None
+    url: str | None
+    filename: str | None
+    content_type: str | None
+    size_bytes: int | None
+    sha256: str | None
+    created_at: str | None
+    source: str
+
+
 def get_campaign_or_404(campaign_id: uuid.UUID, db: Session) -> Campaign:
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:
@@ -57,7 +72,11 @@ def get_campaign_with_assets_or_404(
 ) -> Campaign:
     statement = (
         select(Campaign)
-        .options(selectinload(Campaign.assets).selectinload(Asset.versions))
+        .options(
+            selectinload(Campaign.assets)
+            .selectinload(Asset.versions)
+            .selectinload(AssetVersion.inputs)
+        )
         .where(Campaign.id == campaign_id)
     )
     campaign = db.scalar(statement)
@@ -80,6 +99,72 @@ def version_directory(asset: Asset, version: AssetVersion) -> str:
     return f"{asset_slug}-{asset.id}/v{version.version_number}"
 
 
+def unique_zip_path(path: str, used_paths: set[str]) -> str:
+    if path not in used_paths:
+        used_paths.add(path)
+        return path
+
+    directory, _, filename = path.rpartition("/")
+    stem = PurePosixPath(filename).stem or "file"
+    suffix = PurePosixPath(filename).suffix
+    counter = 2
+
+    while True:
+        candidate_filename = f"{stem}-{counter}{suffix}"
+        candidate = (
+            f"{directory}/{candidate_filename}" if directory else candidate_filename
+        )
+        if candidate not in used_paths:
+            used_paths.add(candidate)
+            return candidate
+
+        counter += 1
+
+
+def safe_export_filename(filename: str | None, fallback: str) -> str:
+    try:
+        return normalize_artifact_filename(filename or fallback)
+    except ValueError:
+        return fallback
+
+
+def serialize_asset_version_input(
+    version_input: AssetVersionInput,
+) -> dict[str, object]:
+    return {
+        "id": str(version_input.id),
+        "role": version_input.role,
+        "storage_key": version_input.storage_key,
+        "filename": version_input.filename,
+        "content_type": version_input.content_type,
+        "size_bytes": version_input.size_bytes,
+        "sha256": version_input.sha256,
+        "created_at": version_input.created_at.isoformat(),
+    }
+
+
+def export_input_record(
+    reference: ExportInputReference,
+    *,
+    zip_path: str | None = None,
+    export_error: str | None = None,
+) -> dict[str, object]:
+    return {
+        "id": str(reference.id) if reference.id is not None else None,
+        "role": reference.role,
+        "storage_key": reference.storage_key,
+        "url": reference.url,
+        "filename": reference.filename,
+        "content_type": reference.content_type,
+        "size_bytes": reference.size_bytes,
+        "sha256": reference.sha256,
+        "created_at": reference.created_at,
+        "metadata_source": reference.source,
+        "zip_path": zip_path,
+        "export_error": export_error,
+    }
+
+
 def build_campaign_export_manifest(
     *,
     campaign: Campaign,
@@ -90,6 +175,7 @@ def build_campaign_export_manifest(
     artifact_paths: dict[uuid.UUID, str],
     artifact_sources: dict[uuid.UUID, str],
     artifact_export_errors: dict[uuid.UUID, str],
+    input_exports: dict[uuid.UUID, list[dict[str, object]]],
 ) -> dict[str, object]:
     return {
         "exported_at": datetime.now(UTC).isoformat(),
@@ -142,6 +228,7 @@ def build_campaign_export_manifest(
                         "artifact_export_error": artifact_export_errors.get(
                             version.id
                         ),
+                        "input_assets": input_exports.get(version.id, []),
                         "generation_metadata": version.generation_metadata,
                     }
                     for version in sorted(
@@ -197,6 +284,13 @@ def build_version_metadata_sidecar(
             "artifact_filename": version.artifact_filename,
             "artifact_content_type": version.artifact_content_type,
             "artifact_size_bytes": version.artifact_size_bytes,
+            "input_assets": [
+                serialize_asset_version_input(version_input)
+                for version_input in sorted(
+                    version.inputs,
+                    key=lambda item: item.created_at,
+                )
+            ],
             "generation_metadata": version.generation_metadata,
         },
         "exported_at": datetime.now(UTC).isoformat(),
@@ -236,6 +330,99 @@ def optional_asset_metadata_list(value: object) -> list[dict[str, object]]:
         return []
 
     return [item for item in value if isinstance(item, dict)]
+
+
+def asset_version_input_reference(
+    version_input: AssetVersionInput,
+) -> ExportInputReference:
+    return ExportInputReference(
+        id=version_input.id,
+        role=version_input.role,
+        storage_key=version_input.storage_key,
+        url=None,
+        filename=version_input.filename,
+        content_type=version_input.content_type,
+        size_bytes=version_input.size_bytes,
+        sha256=version_input.sha256,
+        created_at=version_input.created_at.isoformat(),
+        source="asset_version_input",
+    )
+
+
+def metadata_input_asset_references(
+    version: AssetVersion,
+) -> list[ExportInputReference]:
+    metadata = version.generation_metadata or {}
+    provenance = optional_metadata_dict(metadata.get("provenance"))
+    references: list[ExportInputReference] = []
+
+    for source_name, input_items in (
+        (
+            "generation_metadata_input_asset",
+            optional_asset_metadata_list(metadata.get("input_assets")),
+        ),
+        (
+            "generation_provenance_input_asset",
+            optional_asset_metadata_list(provenance.get("input_assets")),
+        ),
+    ):
+        for input_item in input_items:
+            storage_key = optional_string(input_item.get("storage_key"))
+            url = optional_string(input_item.get("url"))
+            if not storage_key and not url:
+                continue
+
+            references.append(
+                ExportInputReference(
+                    id=None,
+                    role=optional_string(input_item.get("role")),
+                    storage_key=storage_key,
+                    url=url,
+                    filename=optional_string(input_item.get("filename"))
+                    or filename_from_url(url),
+                    content_type=optional_string(input_item.get("content_type")),
+                    size_bytes=optional_int(input_item.get("size_bytes")),
+                    sha256=optional_string(input_item.get("sha256")),
+                    created_at=optional_string(input_item.get("created_at")),
+                    source=source_name,
+                )
+            )
+
+    return references
+
+
+def input_reference_identity(reference: ExportInputReference) -> tuple[str, str]:
+    if reference.id is not None:
+        return ("id", str(reference.id))
+
+    if reference.storage_key:
+        return ("storage_key", reference.storage_key)
+
+    if reference.url:
+        return ("url", reference.url)
+
+    return ("filename", reference.filename or "")
+
+
+def version_input_references(version: AssetVersion) -> list[ExportInputReference]:
+    references: list[ExportInputReference] = []
+    seen: set[tuple[str, str]] = set()
+
+    for version_input in sorted(version.inputs, key=lambda item: item.created_at):
+        reference = asset_version_input_reference(version_input)
+        seen.add(input_reference_identity(reference))
+        if reference.storage_key or reference.url:
+            references.append(reference)
+
+    for reference in metadata_input_asset_references(version):
+        identity = input_reference_identity(reference)
+        if identity in seen:
+            continue
+
+        seen.add(identity)
+        references.append(reference)
+
+    return references
 
 
 def filename_from_url(url: str | None) -> str | None:
@@ -372,6 +559,39 @@ def download_artifact_bytes(
     raise ValueError("Artifact reference did not include a B2 key or URL")
 
 
+def download_input_bytes(
+    *,
+    storage: B2StorageService,
+    reference: ExportInputReference,
+) -> bytes:
+    if reference.storage_key:
+        return storage.download_bytes(key=reference.storage_key)
+
+    if reference.url:
+        return download_url_bytes(reference.url)
+
+    raise ValueError("Input reference did not include a B2 key or URL")
+
+
+def make_input_zip_path(
+    *,
+    asset: Asset,
+    version: AssetVersion,
+    reference: ExportInputReference,
+    used_paths: set[str],
+) -> str:
+    role_path = slugify_filename(reference.role or "reference", fallback="reference")
+    filename = safe_export_filename(
+        reference.filename,
+        fallback=f"input-{reference.id or version.id}",
+    )
+
+    return unique_zip_path(
+        f"inputs/{version_directory(asset, version)}/{role_path}/{filename}",
+        used_paths,
+    )
+
+
 def make_campaign_export_zip(
     *,
     campaign: Campaign,
@@ -391,6 +611,8 @@ def make_campaign_export_zip(
     artifact_paths: dict[uuid.UUID, str] = {}
     artifact_sources: dict[uuid.UUID, str] = {}
     artifact_export_errors: dict[uuid.UUID, str] = {}
+    input_exports: dict[uuid.UUID, list[dict[str, object]]] = {}
+    used_input_paths: set[str] = set()
     zip_buffer = BytesIO()
 
     with ZipFile(zip_buffer, mode="w", compression=ZIP_DEFLATED) as export_zip:
@@ -425,36 +647,73 @@ def make_campaign_export_zip(
                     )
 
                 artifact_reference = version_artifact_reference(version)
-                if artifact_reference is None:
-                    continue
+                if artifact_reference is not None:
+                    artifact_filename = safe_artifact_filename(
+                        version=version,
+                        reference=artifact_reference,
+                    )
+                    artifact_path = f"artifacts/{base_path}/{artifact_filename}"
+                    try:
+                        export_zip.writestr(
+                            artifact_path,
+                            download_artifact_bytes(
+                                storage=storage,
+                                reference=artifact_reference,
+                            ),
+                        )
+                        artifact_paths[version.id] = artifact_path
+                        artifact_sources[version.id] = artifact_reference.source
+                    except (
+                        StorageConfigurationError,
+                        BotoCoreError,
+                        ClientError,
+                        OSError,
+                        URLError,
+                        ValueError,
+                    ):
+                        artifact_export_errors[version.id] = (
+                            "Artifact could not be downloaded from its source "
+                            "during export"
+                        )
 
-                artifact_filename = safe_artifact_filename(
-                    version=version,
-                    reference=artifact_reference,
-                )
-                artifact_path = f"artifacts/{base_path}/{artifact_filename}"
-                try:
-                    export_zip.writestr(
-                        artifact_path,
-                        download_artifact_bytes(
-                            storage=storage,
-                            reference=artifact_reference,
-                        ),
+                for input_reference in version_input_references(version):
+                    input_path = make_input_zip_path(
+                        asset=asset,
+                        version=version,
+                        reference=input_reference,
+                        used_paths=used_input_paths,
                     )
-                    artifact_paths[version.id] = artifact_path
-                    artifact_sources[version.id] = artifact_reference.source
-                except (
-                    StorageConfigurationError,
-                    BotoCoreError,
-                    ClientError,
-                    OSError,
-                    URLError,
-                    ValueError,
-                ):
-                    artifact_export_errors[version.id] = (
-                        "Artifact could not be downloaded from its source "
-                        "during export"
-                    )
+                    try:
+                        export_zip.writestr(
+                            input_path,
+                            download_input_bytes(
+                                storage=storage,
+                                reference=input_reference,
+                            ),
+                        )
+                        input_exports.setdefault(version.id, []).append(
+                            export_input_record(
+                                input_reference,
+                                zip_path=input_path,
+                            )
+                        )
+                    except (
+                        StorageConfigurationError,
+                        BotoCoreError,
+                        ClientError,
+                        OSError,
+                        URLError,
+                        ValueError,
+                    ):
+                        input_exports.setdefault(version.id, []).append(
+                            export_input_record(
+                                input_reference,
+                                export_error=(
+                                    "Input asset could not be downloaded from "
+                                    "its source during export"
+                                ),
+                            )
+                        )
 
         manifest = build_campaign_export_manifest(
             campaign=campaign,
@@ -465,6 +724,7 @@ def make_campaign_export_zip(
             artifact_paths=artifact_paths,
             artifact_sources=artifact_sources,
             artifact_export_errors=artifact_export_errors,
+            input_exports=input_exports,
         )
         export_zip.writestr(
             "manifest.json",
