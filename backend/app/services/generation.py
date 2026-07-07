@@ -18,8 +18,7 @@ class GenerationProviderError(RuntimeError):
     pass
 
 
-GENBLAZE_INPUT_ASSETS_PARAMETER = "input_assets"
-SERENESET_INPUT_ASSETS_PARAMETER = "sereneset_input_assets"
+GENBLAZE_EXTERNAL_INPUTS_PARAMETER = "external_inputs"
 INPUT_ASSET_METADATA_KEYS = (
     "role",
     "storage_key",
@@ -83,7 +82,13 @@ def call_with_supported_kwargs(callable_object: Any, *args: Any, **kwargs: Any) 
 
 def require_genblaze_imports() -> tuple[Any, ...]:
     try:
-        from genblaze_core import KeyStrategy, Modality, ObjectStorageSink, Pipeline
+        from genblaze_core import (
+            Asset as GenblazeAsset,
+            KeyStrategy,
+            Modality,
+            ObjectStorageSink,
+            Pipeline,
+        )
         from genblaze_gmicloud import GMICloudImageProvider
         from genblaze_s3 import S3StorageBackend
     except ImportError as exc:
@@ -92,6 +97,7 @@ def require_genblaze_imports() -> tuple[Any, ...]:
         ) from exc
 
     return (
+        GenblazeAsset,
         KeyStrategy,
         Modality,
         ObjectStorageSink,
@@ -164,27 +170,68 @@ def serialize_input_asset(input_asset: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def optional_string(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+
+    return None
+
+
+def optional_int(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+
+    return None
+
+
+def build_external_input_assets(
+    *,
+    input_assets: list[dict[str, Any]],
+    genblaze_asset_class: Any,
+) -> list[Any]:
+    external_inputs: list[Any] = []
+    missing_url_filenames: list[str] = []
+
+    for input_asset in input_assets:
+        url = optional_string(input_asset.get("url"))
+        filename = optional_string(input_asset.get("filename")) or "input image"
+        if url is None:
+            missing_url_filenames.append(filename)
+            continue
+
+        external_inputs.append(
+            genblaze_asset_class(
+                url=url,
+                media_type=optional_string(input_asset.get("content_type"))
+                or "image/png",
+                sha256=optional_string(input_asset.get("sha256")),
+                size_bytes=optional_int(input_asset.get("size_bytes")),
+                metadata=serialize_input_asset(input_asset),
+            )
+        )
+
+    if missing_url_filenames:
+        joined_filenames = ", ".join(missing_url_filenames)
+        raise GenerationProviderError(
+            "Generation input images were uploaded but no downloadable B2 URL "
+            f"was prepared for: {joined_filenames}"
+        )
+
+    return external_inputs
+
+
 def build_pipeline_parameters(
     *,
     parameters: dict[str, Any],
     input_assets: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], str | None]:
     pipeline_parameters = dict(parameters)
+    pipeline_parameters.pop(GENBLAZE_EXTERNAL_INPUTS_PARAMETER, None)
 
     if not input_assets:
         return pipeline_parameters, None
 
-    serialized_input_assets = [
-        serialize_input_asset(input_asset)
-        for input_asset in input_assets
-    ]
-
-    if GENBLAZE_INPUT_ASSETS_PARAMETER in pipeline_parameters:
-        pipeline_parameters[SERENESET_INPUT_ASSETS_PARAMETER] = serialized_input_assets
-        return pipeline_parameters, SERENESET_INPUT_ASSETS_PARAMETER
-
-    pipeline_parameters[GENBLAZE_INPUT_ASSETS_PARAMETER] = serialized_input_assets
-    return pipeline_parameters, GENBLAZE_INPUT_ASSETS_PARAMETER
+    return pipeline_parameters, GENBLAZE_EXTERNAL_INPUTS_PARAMETER
 
 
 class GenblazeGenerationService:
@@ -218,6 +265,7 @@ class GenblazeGenerationService:
 
     def _make_storage_sink(self) -> Any:
         (
+            _GenblazeAsset,
             KeyStrategy,
             _Modality,
             ObjectStorageSink,
@@ -251,6 +299,7 @@ class GenblazeGenerationService:
         self._configure_env()
 
         (
+            GenblazeAsset,
             _KeyStrategy,
             Modality,
             _ObjectStorageSink,
@@ -267,6 +316,10 @@ class GenblazeGenerationService:
             parameters=request.parameters,
             input_assets=request.input_assets,
         )
+        external_inputs = build_external_input_assets(
+            input_assets=request.input_assets,
+            genblaze_asset_class=GenblazeAsset,
+        )
 
         try:
             pipeline = Pipeline("sereneset-image-generation").step(
@@ -274,6 +327,7 @@ class GenblazeGenerationService:
                 model=model,
                 prompt=request.prompt,
                 modality=Modality.IMAGE,
+                external_inputs=external_inputs or None,
                 **pipeline_parameters,
             )
             result = pipeline.run(
@@ -317,6 +371,7 @@ class GenblazeGenerationService:
                     "manifest_verified": manifest_verified,
                     "asset_count": len(assets),
                     "input_asset_count": len(request.input_assets),
+                    "external_input_count": len(external_inputs),
                     "input_assets_parameter": input_assets_parameter,
                 }
             },

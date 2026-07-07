@@ -61,6 +61,7 @@ router = APIRouter(tags=["assets"])
 MAX_ARTIFACT_SIZE_BYTES = 25 * 1024 * 1024
 MAX_GENERATION_INPUT_FILES = 5
 MAX_GENERATION_INPUT_SIZE_BYTES = 25 * 1024 * 1024
+GENERATION_INPUT_DOWNLOAD_URL_EXPIRES_SECONDS = 3600
 DEFAULT_GENERATION_INPUT_ROLE = "style_reference"
 ALLOWED_GENERATION_INPUT_CONTENT_TYPES = {
     "image/jpeg",
@@ -372,11 +373,39 @@ def stored_generation_input_to_metadata(
     }
 
 
+def stored_generation_input_to_request_asset(
+    *,
+    storage: B2StorageService,
+    stored_input: StoredGenerationInput,
+) -> dict[str, object]:
+    return {
+        **stored_generation_input_to_metadata(stored_input),
+        "url": storage.generate_presigned_download_url(
+            key=stored_input.storage_key,
+            expires_seconds=GENERATION_INPUT_DOWNLOAD_URL_EXPIRES_SECONDS,
+        ),
+    }
+
+
 def stored_generation_inputs_to_metadata(
     stored_inputs: list[StoredGenerationInput],
 ) -> list[dict[str, object]]:
     return [
         stored_generation_input_to_metadata(stored_input)
+        for stored_input in stored_inputs
+    ]
+
+
+def stored_generation_inputs_to_request_assets(
+    *,
+    storage: B2StorageService,
+    stored_inputs: list[StoredGenerationInput],
+) -> list[dict[str, object]]:
+    return [
+        stored_generation_input_to_request_asset(
+            storage=storage,
+            stored_input=stored_input,
+        )
         for stored_input in stored_inputs
     ]
 
@@ -1280,14 +1309,18 @@ def generate_campaign_asset_with_inputs(
             version_number=1,
             generation_inputs=generation_inputs,
         )
-        input_assets = stored_generation_inputs_to_metadata(stored_inputs)
+        metadata_input_assets = stored_generation_inputs_to_metadata(stored_inputs)
+        request_input_assets = stored_generation_inputs_to_request_assets(
+            storage=storage,
+            stored_inputs=stored_inputs,
+        )
         generation_result = generate_image_or_502(
             generation=generation,
             prompt=asset_in.prompt,
             model=asset_in.model,
             generation_parameters=asset_in.generation_parameters,
             timeout_seconds=asset_in.timeout_seconds,
-            input_assets=input_assets,
+            input_assets=request_input_assets,
         )
         version = make_generated_asset_version(
             asset=asset,
@@ -1297,7 +1330,7 @@ def generate_campaign_asset_with_inputs(
             result=generation_result,
             generation_parameters=asset_in.generation_parameters,
             source="backend_genblaze_generation",
-            input_assets=input_assets,
+            input_assets=metadata_input_assets,
         )
         db.add(version)
         db.flush()
@@ -1461,14 +1494,18 @@ def generate_asset_version_with_inputs(
             version_number=version_number,
             generation_inputs=generation_inputs,
         )
-        input_assets = stored_generation_inputs_to_metadata(stored_inputs)
+        metadata_input_assets = stored_generation_inputs_to_metadata(stored_inputs)
+        request_input_assets = stored_generation_inputs_to_request_assets(
+            storage=storage,
+            stored_inputs=stored_inputs,
+        )
         generation_result = generate_image_or_502(
             generation=generation,
             prompt=version_in.prompt,
             model=version_in.model,
             generation_parameters=version_in.generation_parameters,
             timeout_seconds=version_in.timeout_seconds,
-            input_assets=input_assets,
+            input_assets=request_input_assets,
         )
         version = make_generated_asset_version(
             asset=asset,
@@ -1479,7 +1516,7 @@ def generate_asset_version_with_inputs(
             generation_parameters=version_in.generation_parameters,
             source="backend_genblaze_refinement",
             based_on_version_id=latest_version.id if latest_version else None,
-            input_assets=input_assets,
+            input_assets=metadata_input_assets,
         )
         db.add(version)
         asset.updated_at = datetime.now(UTC)
