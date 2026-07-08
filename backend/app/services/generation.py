@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import mimetypes
 import os
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -184,6 +185,27 @@ def optional_int(value: Any) -> int | None:
     return None
 
 
+def infer_asset_media_type(
+    *,
+    content_type: str | None,
+    filename: str | None,
+    url: str | None,
+) -> str:
+    normalized_content_type = (content_type or "").split(";")[0].strip().lower()
+    guessed_content_type, _encoding = mimetypes.guess_type(filename or url or "")
+
+    if (
+        guessed_content_type
+        and (
+            not normalized_content_type
+            or normalized_content_type == "application/octet-stream"
+        )
+    ):
+        return guessed_content_type
+
+    return normalized_content_type or "image/png"
+
+
 def build_external_input_assets(
     *,
     input_assets: list[dict[str, Any]],
@@ -202,8 +224,11 @@ def build_external_input_assets(
         external_inputs.append(
             genblaze_asset_class(
                 url=url,
-                media_type=optional_string(input_asset.get("content_type"))
-                or "image/png",
+                media_type=infer_asset_media_type(
+                    content_type=optional_string(input_asset.get("content_type")),
+                    filename=filename,
+                    url=url,
+                ),
                 sha256=optional_string(input_asset.get("sha256")),
                 size_bytes=optional_int(input_asset.get("size_bytes")),
                 metadata=serialize_input_asset(input_asset),

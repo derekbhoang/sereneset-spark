@@ -410,6 +410,140 @@ def stored_generation_inputs_to_request_assets(
     ]
 
 
+def is_image_asset_descriptor(
+    *,
+    content_type: str | None,
+    filename: str | None,
+) -> bool:
+    normalized_content_type = (content_type or "").split(";")[0].strip().lower()
+    if normalized_content_type.startswith("image/"):
+        return True
+
+    guessed_content_type, _encoding = mimetypes.guess_type(filename or "")
+    return bool(guessed_content_type and guessed_content_type.startswith("image/"))
+
+
+def infer_content_type_from_filename(
+    *,
+    content_type: str | None,
+    filename: str | None,
+    default: str = "application/octet-stream",
+) -> str:
+    normalized_content_type = (content_type or "").split(";")[0].strip().lower()
+    guessed_content_type, _encoding = mimetypes.guess_type(filename or "")
+
+    if (
+        guessed_content_type
+        and (
+            not normalized_content_type
+            or normalized_content_type == "application/octet-stream"
+        )
+    ):
+        return guessed_content_type
+
+    return normalized_content_type or default
+
+
+def latest_version_artifact_input_metadata(
+    latest_version: AssetVersion | None,
+) -> list[dict[str, object]]:
+    if latest_version is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Asset does not have a latest version to refine from",
+        )
+
+    if latest_version.artifact_storage_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Latest version does not have a stored artifact to refine from",
+        )
+
+    if not is_image_asset_descriptor(
+        content_type=latest_version.artifact_content_type,
+        filename=latest_version.artifact_filename,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Latest version artifact must be an image to refine from",
+        )
+
+    artifact_flow = optional_metadata_dict(
+        (latest_version.generation_metadata or {}).get("artifact_flow")
+    )
+    artifact_filename = (
+        latest_version.artifact_filename
+        or f"version-{latest_version.version_number}-artifact"
+    )
+    artifact_content_type = infer_content_type_from_filename(
+        content_type=latest_version.artifact_content_type,
+        filename=artifact_filename,
+        default="image/png",
+    )
+    return [
+        {
+            "role": "source_creative",
+            "storage_key": latest_version.artifact_storage_key,
+            "filename": artifact_filename,
+            "content_type": artifact_content_type,
+            "size_bytes": latest_version.artifact_size_bytes,
+            "sha256": optional_string(artifact_flow.get("source_sha256")),
+            "source": "latest_version_artifact",
+            "source_version_id": str(latest_version.id),
+            "source_version_number": latest_version.version_number,
+        }
+    ]
+
+
+def latest_version_artifact_request_assets(
+    *,
+    storage: B2StorageService,
+    latest_version: AssetVersion | None,
+) -> list[dict[str, object]]:
+    return [
+        {
+            **input_asset,
+            "url": storage.generate_presigned_download_url(
+                key=str(input_asset["storage_key"]),
+                expires_seconds=GENERATION_INPUT_DOWNLOAD_URL_EXPIRES_SECONDS,
+            ),
+        }
+        for input_asset in latest_version_artifact_input_metadata(latest_version)
+    ]
+
+
+def input_asset_fingerprint(input_asset: dict[str, object | None]) -> str:
+    storage_key = optional_string(input_asset.get("storage_key"))
+    if storage_key:
+        return f"storage:{storage_key}"
+
+    url = optional_string(input_asset.get("url"))
+    if url:
+        return f"url:{url}"
+
+    role = optional_string(input_asset.get("role")) or "reference"
+    filename = optional_string(input_asset.get("filename")) or "input"
+    return f"name:{role}:{filename}"
+
+
+def merge_input_asset_records(
+    *input_asset_groups: list[dict[str, object | None]],
+) -> list[dict[str, object | None]]:
+    merged_input_assets: list[dict[str, object | None]] = []
+    seen_input_assets: set[str] = set()
+
+    for input_asset_group in input_asset_groups:
+        for input_asset in input_asset_group:
+            fingerprint = input_asset_fingerprint(input_asset)
+            if fingerprint in seen_input_assets:
+                continue
+
+            seen_input_assets.add(fingerprint)
+            merged_input_assets.append(input_asset)
+
+    return merged_input_assets
+
+
 def get_asset_or_404(asset_id: uuid.UUID, db: Session) -> Asset:
     statement = (
         select(Asset)
@@ -724,7 +858,7 @@ def upload_generated_artifact_reference(
     source: str,
 ) -> str:
     payload = read_generated_artifact_payload(storage=storage, artifact=artifact)
-    artifact_content_type = (
+    raw_artifact_content_type = (
         artifact.content_type
         or payload.content_type
         or "application/octet-stream"
@@ -732,7 +866,11 @@ def upload_generated_artifact_reference(
     artifact_filename = generated_artifact_filename(
         artifact=artifact,
         version=version,
-        content_type=artifact_content_type,
+        content_type=raw_artifact_content_type,
+    )
+    artifact_content_type = infer_content_type_from_filename(
+        content_type=raw_artifact_content_type,
+        filename=artifact_filename,
     )
     artifact_storage_key = build_asset_version_artifact_storage_key(
         campaign_id=asset.campaign_id,
@@ -1036,6 +1174,7 @@ def asset_version_input_to_sidecar(
         "content_type": version_input.content_type,
         "size_bytes": version_input.size_bytes,
         "sha256": version_input.sha256,
+        "source": "user_upload",
         "created_at": version_input.created_at.isoformat(),
     }
 
@@ -1048,11 +1187,11 @@ def version_input_sidecar_records(version: AssetVersion) -> list[dict[str, objec
             key=lambda item: item.created_at,
         )
     ]
-    if records:
-        return records
-
     metadata = version.generation_metadata or {}
-    return optional_asset_metadata_list(metadata.get("input_assets"))
+    return merge_input_asset_records(
+        optional_asset_metadata_list(metadata.get("input_assets")),
+        records,
+    )
 
 
 def build_asset_version_sidecar(
@@ -1398,12 +1537,25 @@ def generate_asset_version(
         default=None,
     )
     version_number = (latest_version.version_number if latest_version else 0) + 1
+    metadata_input_assets = latest_version_artifact_input_metadata(latest_version)
+    try:
+        request_input_assets = latest_version_artifact_request_assets(
+            storage=storage,
+            latest_version=latest_version,
+        )
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Latest version artifact could not be prepared as a generation input",
+        ) from exc
+
     generation_result = generate_image_or_502(
         generation=generation,
         prompt=version_in.prompt,
         model=version_in.model,
         generation_parameters=version_in.generation_parameters,
         timeout_seconds=version_in.timeout_seconds,
+        input_assets=request_input_assets,
     )
     version = make_generated_asset_version(
         asset=asset,
@@ -1414,6 +1566,7 @@ def generate_asset_version(
         generation_parameters=version_in.generation_parameters,
         source="backend_genblaze_refinement",
         based_on_version_id=latest_version.id if latest_version else None,
+        input_assets=metadata_input_assets,
     )
     uploaded_artifact_key: str | None = None
 
@@ -1483,6 +1636,20 @@ def generate_asset_version_with_inputs(
         default=None,
     )
     version_number = (latest_version.version_number if latest_version else 0) + 1
+    latest_metadata_input_assets = latest_version_artifact_input_metadata(
+        latest_version
+    )
+    try:
+        latest_request_input_assets = latest_version_artifact_request_assets(
+            storage=storage,
+            latest_version=latest_version,
+        )
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Latest version artifact could not be prepared as a generation input",
+        ) from exc
+
     stored_inputs: list[StoredGenerationInput] = []
     uploaded_artifact_key: str | None = None
 
@@ -1494,11 +1661,18 @@ def generate_asset_version_with_inputs(
             version_number=version_number,
             generation_inputs=generation_inputs,
         )
-        metadata_input_assets = stored_generation_inputs_to_metadata(stored_inputs)
-        request_input_assets = stored_generation_inputs_to_request_assets(
+        metadata_input_assets = merge_input_asset_records(
+            latest_metadata_input_assets,
+            stored_generation_inputs_to_metadata(stored_inputs),
+        )
+        uploaded_request_input_assets = stored_generation_inputs_to_request_assets(
             storage=storage,
             stored_inputs=stored_inputs,
         )
+        request_input_assets = [
+            *latest_request_input_assets,
+            *uploaded_request_input_assets,
+        ]
         generation_result = generate_image_or_502(
             generation=generation,
             prompt=version_in.prompt,

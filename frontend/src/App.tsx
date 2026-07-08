@@ -366,31 +366,58 @@ function getInputAssetsFromMetadata(
     ...readAssetMetadataList(metadata.input_assets),
     ...readAssetMetadataList(provenance?.input_assets),
   ]
-  const seenInputAssets = new Set<string>()
 
-  return inputCandidates
-    .map((inputAsset) => ({
-      id: null,
-      role: readString(inputAsset.role),
-      storageKey: readString(inputAsset.storage_key),
-      filename: readString(inputAsset.filename),
-      contentType: readString(inputAsset.content_type),
-      sizeBytes: readNumber(inputAsset.size_bytes),
-      sha256: readString(inputAsset.sha256),
-      source: readString(inputAsset.source),
-    }))
-    .filter((inputAsset) => inputAsset.storageKey || inputAsset.filename)
-    .filter((inputAsset) => {
-      const fingerprint =
-        inputAsset.storageKey ?? `${inputAsset.role}-${inputAsset.filename}`
+  return mergeVersionInputAssets(
+    inputCandidates
+      .map((inputAsset) => ({
+        id: null,
+        role: readString(inputAsset.role),
+        storageKey: readString(inputAsset.storage_key),
+        filename: readString(inputAsset.filename),
+        contentType: readString(inputAsset.content_type),
+        sizeBytes: readNumber(inputAsset.size_bytes),
+        sha256: readString(inputAsset.sha256),
+        source: readString(inputAsset.source),
+      }))
+      .filter((inputAsset) => inputAsset.storageKey || inputAsset.filename),
+  )
+}
 
-      if (seenInputAssets.has(fingerprint)) {
-        return false
+function getVersionInputFingerprint(inputAsset: VersionInputAsset): string {
+  if (inputAsset.storageKey) {
+    return `storage:${inputAsset.storageKey}`
+  }
+
+  return `name:${inputAsset.role ?? 'reference'}:${inputAsset.filename ?? 'input'}`
+}
+
+function mergeVersionInputAssets(
+  ...inputAssetGroups: VersionInputAsset[][]
+): VersionInputAsset[] {
+  const mergedInputAssets: VersionInputAsset[] = []
+  const inputAssetIndexes = new Map<string, number>()
+
+  for (const inputAssetGroup of inputAssetGroups) {
+    for (const inputAsset of inputAssetGroup) {
+      const fingerprint = getVersionInputFingerprint(inputAsset)
+      const existingIndex = inputAssetIndexes.get(fingerprint)
+
+      if (existingIndex === undefined) {
+        inputAssetIndexes.set(fingerprint, mergedInputAssets.length)
+        mergedInputAssets.push(inputAsset)
+        continue
       }
 
-      seenInputAssets.add(fingerprint)
-      return true
-    })
+      if (!mergedInputAssets[existingIndex].id && inputAsset.id) {
+        mergedInputAssets[existingIndex] = {
+          ...inputAsset,
+          source: mergedInputAssets[existingIndex].source ?? inputAsset.source,
+        }
+      }
+    }
+  }
+
+  return mergedInputAssets
 }
 
 function hasImageArtifact(version: AssetVersion): boolean {
@@ -616,7 +643,14 @@ function mapAssetVersionInput(input: AssetVersionInputDto): VersionInputAsset {
 
 function mapAssetVersion(version: AssetVersionDto): AssetVersion {
   const generatedPreview = getGeneratedPreview(version.generation_metadata)
-  const inputAssets = (version.inputs ?? []).map(mapAssetVersionInput)
+  const metadataInputAssets = getInputAssetsFromMetadata(
+    version.generation_metadata,
+  )
+  const databaseInputAssets = (version.inputs ?? []).map(mapAssetVersionInput)
+  const inputAssets = mergeVersionInputAssets(
+    metadataInputAssets,
+    databaseInputAssets,
+  )
 
   return {
     id: `v${version.version_number}`,
@@ -634,9 +668,7 @@ function mapAssetVersion(version: AssetVersionDto): AssetVersion {
     artifactSizeBytes: version.artifact_size_bytes,
     generationMetadata: version.generation_metadata,
     generatedPreview,
-    inputAssets: inputAssets.length
-      ? inputAssets
-      : getInputAssetsFromMetadata(version.generation_metadata),
+    inputAssets,
   }
 }
 
