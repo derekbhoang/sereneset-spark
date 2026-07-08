@@ -2474,6 +2474,22 @@ function App() {
                           aria-label={`${latestSelectedVersion.id} actions`}
                         >
                           {renderProvenanceButton(latestSelectedVersion)}
+                          <button
+                            className="metadata-button"
+                            disabled={
+                              openingVersionId ===
+                              latestSelectedVersion.versionId
+                            }
+                            onClick={() =>
+                              openStoredMetadata(latestSelectedVersion)
+                            }
+                            type="button"
+                          >
+                            {openingVersionId ===
+                            latestSelectedVersion.versionId
+                              ? 'Opening...'
+                              : 'Open stored metadata'}
+                          </button>
                         </div>
                         {openProvenanceVersionIds[
                           latestSelectedVersion.versionId
