@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.brand_asset import BrandAssetType
 
@@ -43,6 +43,14 @@ class BrandAssetUpdate(BaseModel):
     tags: list[BrandAssetTag] | None = None
     source_url: str | None = Field(default=None, max_length=1000)
     is_active: bool | None = None
+
+    @field_validator("name", "asset_type", "tags", "is_active")
+    @classmethod
+    def validate_non_nullable_updates(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("Field must not be null when provided")
+
+        return value
 
 
 class BrandAssetRead(BrandAssetBase):
