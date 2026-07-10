@@ -11,6 +11,14 @@ from app.schemas.asset import (
     AssetVersionInputRead,
     AssetVersionRead,
 )
+from app.schemas.brand_asset import (
+    BrandAssetCreate,
+    BrandAssetDownloadUrl,
+    BrandAssetRead,
+    BrandAssetUpdate,
+    CampaignBrandAssetCreate,
+    CampaignBrandAssetRead,
+)
 from app.schemas.campaign import CampaignCreate, CampaignRead, CampaignUpdate
 
 __all__ = [
@@ -25,7 +33,13 @@ __all__ = [
     "AssetVersionGenerationCreate",
     "AssetVersionInputRead",
     "AssetVersionRead",
+    "BrandAssetCreate",
+    "BrandAssetDownloadUrl",
+    "BrandAssetRead",
+    "BrandAssetUpdate",
     "CampaignCreate",
+    "CampaignBrandAssetCreate",
+    "CampaignBrandAssetRead",
     "CampaignRead",
     "CampaignUpdate",
 ]

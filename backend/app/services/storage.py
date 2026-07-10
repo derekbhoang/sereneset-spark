@@ -76,6 +76,23 @@ def normalize_artifact_filename(filename: str) -> str:
     return safe_filename[:240]
 
 
+def build_brand_asset_storage_key(
+    *,
+    brand_asset_id: uuid.UUID,
+    filename: str,
+) -> str:
+    return normalize_storage_key(
+        "/".join(
+            [
+                "brand-assets",
+                str(brand_asset_id),
+                "original",
+                normalize_artifact_filename(filename),
+            ]
+        )
+    )
+
+
 def normalize_asset_version_input_role(role: str) -> str:
     normalized_role = role.strip().lower().replace(" ", "_")
 
