@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_db
 from app.models.asset import Asset, AssetVersion, AssetVersionInput, ReviewStatus
+from app.models.brand_asset import BrandAsset, CampaignBrandAsset
 from app.models.campaign import Campaign
 from app.schemas.asset import (
     AssetCreate,
@@ -100,6 +101,13 @@ class StoredGenerationInput:
     content_type: str
     size_bytes: int
     sha256: str
+    source: str = "user_upload"
+    owns_storage_object: bool = True
+    brand_asset_id: uuid.UUID | None = None
+    campaign_brand_asset_id: uuid.UUID | None = None
+    brand_asset_type: str | None = None
+    brand_asset_name: str | None = None
+    usage_guidance: str | None = None
 
 
 def parse_asset_generation_payload(payload: str) -> AssetGenerationCreate:
@@ -362,15 +370,34 @@ def add_asset_version_inputs(
 def stored_generation_input_to_metadata(
     stored_input: StoredGenerationInput,
 ) -> dict[str, object]:
-    return {
+    metadata: dict[str, object] = {
         "role": stored_input.role,
         "storage_key": stored_input.storage_key,
         "filename": stored_input.filename,
         "content_type": stored_input.content_type,
         "size_bytes": stored_input.size_bytes,
         "sha256": stored_input.sha256,
-        "source": "user_upload",
+        "source": stored_input.source,
+        "storage_ownership": (
+            "asset_version" if stored_input.owns_storage_object else "brand_asset"
+        ),
     }
+
+    optional_metadata = {
+        "brand_asset_id": stored_input.brand_asset_id,
+        "campaign_brand_asset_id": stored_input.campaign_brand_asset_id,
+        "brand_asset_type": stored_input.brand_asset_type,
+        "brand_asset_name": stored_input.brand_asset_name,
+        "usage_guidance": stored_input.usage_guidance,
+    }
+    metadata.update(
+        {
+            key: str(value) if isinstance(value, uuid.UUID) else value
+            for key, value in optional_metadata.items()
+            if value is not None
+        }
+    )
+    return metadata
 
 
 def stored_generation_input_to_request_asset(
@@ -442,6 +469,82 @@ def infer_content_type_from_filename(
         return guessed_content_type
 
     return normalized_content_type or default
+
+
+def campaign_brand_asset_generation_inputs(
+    *,
+    campaign_id: uuid.UUID,
+    db: Session,
+) -> list[StoredGenerationInput]:
+    statement = (
+        select(CampaignBrandAsset)
+        .join(CampaignBrandAsset.brand_asset)
+        .options(selectinload(CampaignBrandAsset.brand_asset))
+        .where(
+            CampaignBrandAsset.campaign_id == campaign_id,
+            BrandAsset.is_active.is_(True),
+        )
+        .order_by(CampaignBrandAsset.created_at.asc())
+    )
+    links = list(db.scalars(statement).all())
+    generation_inputs: list[StoredGenerationInput] = []
+    unsupported_image_filenames: list[str] = []
+
+    for link in links:
+        brand_asset = link.brand_asset
+        content_type = infer_content_type_from_filename(
+            content_type=brand_asset.content_type,
+            filename=brand_asset.filename,
+        )
+        if content_type not in ALLOWED_GENERATION_INPUT_CONTENT_TYPES:
+            if content_type.startswith("image/"):
+                unsupported_image_filenames.append(brand_asset.filename)
+            continue
+
+        generation_inputs.append(
+            StoredGenerationInput(
+                role=link.role,
+                storage_key=brand_asset.storage_key,
+                filename=brand_asset.filename,
+                content_type=content_type,
+                size_bytes=brand_asset.size_bytes,
+                sha256=brand_asset.sha256,
+                source="campaign_brand_asset",
+                owns_storage_object=False,
+                brand_asset_id=brand_asset.id,
+                campaign_brand_asset_id=link.id,
+                brand_asset_type=brand_asset.asset_type.value,
+                brand_asset_name=brand_asset.name,
+                usage_guidance=brand_asset.usage_guidance,
+            )
+        )
+
+    if unsupported_image_filenames:
+        filenames = ", ".join(unsupported_image_filenames)
+        allowed_types = ", ".join(sorted(ALLOWED_GENERATION_INPUT_CONTENT_TYPES))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Attached brand images must use one of: {allowed_types}. "
+                f"Replace or detach: {filenames}"
+            ),
+        )
+
+    return generation_inputs
+
+
+def validate_generation_input_count(input_count: int) -> None:
+    if input_count <= MAX_GENERATION_INPUT_FILES:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            "Generation accepts at most "
+            f"{MAX_GENERATION_INPUT_FILES} image inputs across the latest version, "
+            "uploaded files, and attached campaign brand assets"
+        ),
+    )
 
 
 def latest_version_artifact_input_metadata(
@@ -1301,7 +1404,11 @@ def delete_stored_inputs(
     stored_inputs: list[StoredGenerationInput],
 ) -> None:
     for stored_input in stored_inputs:
-        delete_stored_artifact(storage=storage, storage_key=stored_input.storage_key)
+        if stored_input.owns_storage_object:
+            delete_stored_artifact(
+                storage=storage,
+                storage_key=stored_input.storage_key,
+            )
 
 
 @router.get("/campaigns/{campaign_id}/assets", response_model=list[AssetRead])
@@ -1346,12 +1453,31 @@ def generate_campaign_asset(
     generation: GenblazeGenerationService = Depends(get_generation_service),
 ) -> Asset:
     campaign = ensure_campaign_exists(campaign_id, db)
+    brand_inputs = campaign_brand_asset_generation_inputs(
+        campaign_id=campaign_id,
+        db=db,
+    )
+    validate_generation_input_count(len(brand_inputs))
+
+    try:
+        brand_request_inputs = stored_generation_inputs_to_request_assets(
+            storage=storage,
+            stored_inputs=brand_inputs,
+        )
+    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Campaign brand assets could not be prepared for generation",
+        ) from exc
+
+    brand_metadata_inputs = stored_generation_inputs_to_metadata(brand_inputs)
     generation_result = generate_image_or_502(
         generation=generation,
         prompt=asset_in.prompt,
         model=asset_in.model,
         generation_parameters=asset_in.generation_parameters,
         timeout_seconds=asset_in.timeout_seconds,
+        input_assets=brand_request_inputs,
     )
     asset = Asset(
         campaign_id=campaign_id,
@@ -1377,9 +1503,15 @@ def generate_campaign_asset(
             result=generation_result,
             generation_parameters=asset_in.generation_parameters,
             source="backend_genblaze_generation",
+            input_assets=brand_metadata_inputs,
         )
         db.add(version)
         db.flush()
+        add_asset_version_inputs(
+            db=db,
+            version=version,
+            stored_inputs=brand_inputs,
+        )
         uploaded_artifact_key = upload_generated_artifact(
             storage=storage,
             campaign=campaign,
@@ -1425,6 +1557,11 @@ def generate_campaign_asset_with_inputs(
     asset_in = parse_asset_generation_payload(payload)
     generation_inputs = parse_multipart_generation_inputs(files=files, roles=roles)
     campaign = ensure_campaign_exists(campaign_id, db)
+    brand_inputs = campaign_brand_asset_generation_inputs(
+        campaign_id=campaign_id,
+        db=db,
+    )
+    validate_generation_input_count(len(generation_inputs) + len(brand_inputs))
     asset = Asset(
         campaign_id=campaign_id,
         title=generated_asset_title(asset_in),
@@ -1448,10 +1585,11 @@ def generate_campaign_asset_with_inputs(
             version_number=1,
             generation_inputs=generation_inputs,
         )
-        metadata_input_assets = stored_generation_inputs_to_metadata(stored_inputs)
+        version_inputs = [*stored_inputs, *brand_inputs]
+        metadata_input_assets = stored_generation_inputs_to_metadata(version_inputs)
         request_input_assets = stored_generation_inputs_to_request_assets(
             storage=storage,
-            stored_inputs=stored_inputs,
+            stored_inputs=version_inputs,
         )
         generation_result = generate_image_or_502(
             generation=generation,
@@ -1476,7 +1614,7 @@ def generate_campaign_asset_with_inputs(
         add_asset_version_inputs(
             db=db,
             version=version,
-            stored_inputs=stored_inputs,
+            stored_inputs=version_inputs,
         )
         uploaded_artifact_key = upload_generated_artifact(
             storage=storage,
@@ -1537,16 +1675,38 @@ def generate_asset_version(
         default=None,
     )
     version_number = (latest_version.version_number if latest_version else 0) + 1
-    metadata_input_assets = latest_version_artifact_input_metadata(latest_version)
+    latest_metadata_input_assets = latest_version_artifact_input_metadata(
+        latest_version
+    )
+    brand_inputs = campaign_brand_asset_generation_inputs(
+        campaign_id=campaign.id,
+        db=db,
+    )
+    validate_generation_input_count(
+        len(latest_metadata_input_assets) + len(brand_inputs)
+    )
+    metadata_input_assets = merge_input_asset_records(
+        latest_metadata_input_assets,
+        stored_generation_inputs_to_metadata(brand_inputs),
+    )
     try:
-        request_input_assets = latest_version_artifact_request_assets(
-            storage=storage,
-            latest_version=latest_version,
-        )
+        request_input_assets = [
+            *latest_version_artifact_request_assets(
+                storage=storage,
+                latest_version=latest_version,
+            ),
+            *stored_generation_inputs_to_request_assets(
+                storage=storage,
+                stored_inputs=brand_inputs,
+            ),
+        ]
     except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Latest version artifact could not be prepared as a generation input",
+            detail=(
+                "Latest version artifact or campaign brand assets could not be "
+                "prepared as generation inputs"
+            ),
         ) from exc
 
     generation_result = generate_image_or_502(
@@ -1574,6 +1734,11 @@ def generate_asset_version(
         db.add(version)
         asset.updated_at = datetime.now(UTC)
         db.flush()
+        add_asset_version_inputs(
+            db=db,
+            version=version,
+            stored_inputs=brand_inputs,
+        )
         uploaded_artifact_key = upload_generated_artifact(
             storage=storage,
             campaign=campaign,
@@ -1639,6 +1804,15 @@ def generate_asset_version_with_inputs(
     latest_metadata_input_assets = latest_version_artifact_input_metadata(
         latest_version
     )
+    brand_inputs = campaign_brand_asset_generation_inputs(
+        campaign_id=campaign.id,
+        db=db,
+    )
+    validate_generation_input_count(
+        len(latest_metadata_input_assets)
+        + len(generation_inputs)
+        + len(brand_inputs)
+    )
     try:
         latest_request_input_assets = latest_version_artifact_request_assets(
             storage=storage,
@@ -1661,9 +1835,11 @@ def generate_asset_version_with_inputs(
             version_number=version_number,
             generation_inputs=generation_inputs,
         )
+        version_inputs = [*stored_inputs, *brand_inputs]
         metadata_input_assets = merge_input_asset_records(
             latest_metadata_input_assets,
             stored_generation_inputs_to_metadata(stored_inputs),
+            stored_generation_inputs_to_metadata(brand_inputs),
         )
         uploaded_request_input_assets = stored_generation_inputs_to_request_assets(
             storage=storage,
@@ -1672,6 +1848,10 @@ def generate_asset_version_with_inputs(
         request_input_assets = [
             *latest_request_input_assets,
             *uploaded_request_input_assets,
+            *stored_generation_inputs_to_request_assets(
+                storage=storage,
+                stored_inputs=brand_inputs,
+            ),
         ]
         generation_result = generate_image_or_502(
             generation=generation,
@@ -1698,7 +1878,7 @@ def generate_asset_version_with_inputs(
         add_asset_version_inputs(
             db=db,
             version=version,
-            stored_inputs=stored_inputs,
+            stored_inputs=version_inputs,
         )
         uploaded_artifact_key = upload_generated_artifact(
             storage=storage,

@@ -28,6 +28,12 @@ INPUT_ASSET_METADATA_KEYS = (
     "size_bytes",
     "sha256",
     "source",
+    "storage_ownership",
+    "brand_asset_id",
+    "campaign_brand_asset_id",
+    "brand_asset_type",
+    "brand_asset_name",
+    "usage_guidance",
 )
 
 
