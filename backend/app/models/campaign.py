@@ -11,6 +11,7 @@ from app.db.base import Base, IdMixin, TimestampMixin
 
 if TYPE_CHECKING:
     from app.models.asset import Asset
+    from app.models.brand_asset import CampaignBrandAsset
 
 
 class Campaign(IdMixin, TimestampMixin, Base):
@@ -45,4 +46,10 @@ class Campaign(IdMixin, TimestampMixin, Base):
         "Asset",
         back_populates="campaign",
         cascade="all, delete-orphan",
+    )
+    brand_asset_links: Mapped[list["CampaignBrandAsset"]] = relationship(
+        "CampaignBrandAsset",
+        back_populates="campaign",
+        cascade="all, delete-orphan",
+        order_by="CampaignBrandAsset.created_at.desc()",
     )

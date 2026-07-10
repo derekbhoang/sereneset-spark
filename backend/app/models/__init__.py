@@ -5,6 +5,7 @@ from app.models.asset import (
     AssetVersionInput,
     ReviewStatus,
 )
+from app.models.brand_asset import BrandAsset, BrandAssetType, CampaignBrandAsset
 from app.models.campaign import Campaign
 
 __all__ = [
@@ -12,6 +13,9 @@ __all__ = [
     "AssetFormat",
     "AssetVersion",
     "AssetVersionInput",
+    "BrandAsset",
+    "BrandAssetType",
+    "CampaignBrandAsset",
     "Campaign",
     "ReviewStatus",
 ]

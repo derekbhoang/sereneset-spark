@@ -7,7 +7,14 @@ from alembic import context
 
 from app.core.config import get_settings
 from app.db.base import Base
-from app.models import Asset, AssetVersion, AssetVersionInput, Campaign
+from app.models import (
+    Asset,
+    AssetVersion,
+    AssetVersionInput,
+    BrandAsset,
+    Campaign,
+    CampaignBrandAsset,
+)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
