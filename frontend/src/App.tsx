@@ -6,19 +6,25 @@ import {
   type FormEvent,
 } from 'react'
 import {
+  attachBrandAssetToCampaign,
   createCampaign,
   deleteCampaign,
+  detachBrandAssetFromCampaign,
   exportCampaignPack,
+  fetchBrandAssetDownloadUrl,
+  fetchBrandAssets,
   fetchAsset,
   fetchAssetVersionArtifactDownloadUrl,
   fetchAssetVersionDownloadUrl,
   fetchCampaignAssets,
+  fetchCampaignBrandAssets,
   fetchCampaigns,
   generateAssetVersion,
   generateAssetVersionWithInputs,
   generateCampaignAsset,
   generateCampaignAssetWithInputs,
   updateAssetStatus as patchAssetStatus,
+  uploadBrandAsset,
   uploadAssetVersionArtifact,
   type AssetDto,
   type AssetFormatValue,
@@ -26,7 +32,10 @@ import {
   type AssetVersionDto,
   type AssetVersionGenerationCreateDto,
   type AssetVersionInputDto,
+  type BrandAssetDto,
+  type BrandAssetType,
   type CampaignDto,
+  type CampaignBrandAssetDto,
   type GenerationInputFile,
   type GenerationInputRole,
   type ReviewStatus,
@@ -128,6 +137,18 @@ type VersionInputAsset = {
   sizeBytes: number | null
   sha256: string | null
   source: string | null
+  brandAssetId: string | null
+  brandAssetName: string | null
+  usageGuidance: string | null
+}
+
+type BrandAssetFormState = {
+  name: string
+  assetType: BrandAssetType
+  description: string
+  usageGuidance: string
+  tags: string
+  sourceUrl: string
 }
 
 const defaultPrompt =
@@ -146,6 +167,34 @@ const defaultCampaignForm: CampaignFormState = {
   channels: 'Paid social, Email',
   brandInputs: '',
 }
+
+const defaultBrandAssetForm: BrandAssetFormState = {
+  name: '',
+  assetType: 'logo',
+  description: '',
+  usageGuidance: '',
+  tags: '',
+  sourceUrl: '',
+}
+
+const brandAssetTypeOptions: Array<{
+  value: BrandAssetType
+  label: string
+}> = [
+  { value: 'logo', label: 'Logo' },
+  { value: 'product_image', label: 'Product image' },
+  { value: 'style_reference', label: 'Style reference' },
+  { value: 'guideline', label: 'Guideline' },
+  { value: 'font', label: 'Font' },
+  { value: 'other', label: 'Other' },
+]
+
+const campaignBrandRoleOptions = [
+  { value: 'primary_logo', label: 'Primary logo' },
+  { value: 'product', label: 'Product' },
+  { value: 'style_reference', label: 'Style reference' },
+  { value: 'brand_reference', label: 'Brand reference' },
+]
 
 const reviewStatuses: ReviewStatus[] = [
   'draft',
@@ -309,6 +358,26 @@ function displayInputRole(value: string | null): string {
   return referenceRoleLabels[value as GenerationInputRole] ?? titleCase(value)
 }
 
+function defaultCampaignBrandRole(assetType: BrandAssetType): string {
+  if (assetType === 'logo') {
+    return 'primary_logo'
+  }
+
+  if (assetType === 'product_image') {
+    return 'product'
+  }
+
+  if (assetType === 'style_reference') {
+    return 'style_reference'
+  }
+
+  return 'brand_reference'
+}
+
+function isBrandAssetPreviewable(asset: BrandAssetDto): boolean {
+  return asset.content_type.startsWith('image/')
+}
+
 function formatVerifiedState(value: boolean | null): string {
   if (value === true) {
     return 'Verified'
@@ -378,6 +447,9 @@ function getInputAssetsFromMetadata(
         sizeBytes: readNumber(inputAsset.size_bytes),
         sha256: readString(inputAsset.sha256),
         source: readString(inputAsset.source),
+        brandAssetId: readString(inputAsset.brand_asset_id),
+        brandAssetName: readString(inputAsset.brand_asset_name),
+        usageGuidance: readString(inputAsset.usage_guidance),
       }))
       .filter((inputAsset) => inputAsset.storageKey || inputAsset.filename),
   )
@@ -637,7 +709,10 @@ function mapAssetVersionInput(input: AssetVersionInputDto): VersionInputAsset {
     contentType: input.content_type,
     sizeBytes: input.size_bytes,
     sha256: input.sha256,
-    source: 'user_upload',
+    source: input.source,
+    brandAssetId: input.brand_asset_id,
+    brandAssetName: input.brand_asset_name,
+    usageGuidance: input.usage_guidance,
   }
 }
 
@@ -704,7 +779,10 @@ function App() {
   const [isLoadingCampaigns, setIsLoadingCampaigns] = useState(true)
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
   const [isCreateCampaignOpen, setIsCreateCampaignOpen] = useState(false)
+  const [isBrandAssetModalOpen, setIsBrandAssetModalOpen] = useState(false)
   const [isCreatingCampaign, setIsCreatingCampaign] = useState(false)
+  const [isLoadingBrandAssets, setIsLoadingBrandAssets] = useState(false)
+  const [isUploadingBrandAsset, setIsUploadingBrandAsset] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isExporting, setIsExporting] = useState(false)
   const [isSavingStatus, setIsSavingStatus] = useState(false)
@@ -717,6 +795,29 @@ function App() {
   )
   const [campaignForm, setCampaignForm] =
     useState<CampaignFormState>(defaultCampaignForm)
+  const [brandAssetForm, setBrandAssetForm] = useState<BrandAssetFormState>(
+    defaultBrandAssetForm,
+  )
+  const [brandAssetFile, setBrandAssetFile] = useState<File | null>(null)
+  const [attachUploadedBrandAsset, setAttachUploadedBrandAsset] = useState(true)
+  const [uploadedBrandAssetRole, setUploadedBrandAssetRole] =
+    useState('primary_logo')
+  const [brandAssets, setBrandAssets] = useState<BrandAssetDto[]>([])
+  const [campaignBrandAssets, setCampaignBrandAssets] = useState<
+    CampaignBrandAssetDto[]
+  >([])
+  const [brandAssetRoles, setBrandAssetRoles] = useState<Record<string, string>>(
+    {},
+  )
+  const [brandAssetPreviewUrls, setBrandAssetPreviewUrls] = useState<
+    Record<string, string>
+  >({})
+  const [attachingBrandAssetId, setAttachingBrandAssetId] = useState<
+    string | null
+  >(null)
+  const [detachingBrandAssetLinkId, setDetachingBrandAssetLinkId] = useState<
+    string | null
+  >(null)
   const [openingVersionId, setOpeningVersionId] = useState<string | null>(null)
   const [openingArtifactVersionId, setOpeningArtifactVersionId] = useState<
     string | null
@@ -746,6 +847,7 @@ function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const generationReferenceImagesRef = useRef<ReferenceImage[]>([])
   const refineReferenceImagesRef = useRef<Record<string, ReferenceImage[]>>({})
+  const brandAssetFileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     let isCancelled = false
@@ -825,6 +927,22 @@ function App() {
   }, [isCreateCampaignOpen])
 
   useEffect(() => {
+    if (!isBrandAssetModalOpen) {
+      return
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setIsBrandAssetModalOpen(false)
+      }
+    }
+
+    window.addEventListener('keydown', closeOnEscape)
+
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [isBrandAssetModalOpen])
+
+  useEffect(() => {
     let isCancelled = false
 
     async function loadAssets(campaignId: string) {
@@ -873,6 +991,104 @@ function App() {
       isCancelled = true
     }
   }, [selectedCampaignId])
+
+  useEffect(() => {
+    let isCancelled = false
+
+    async function loadBrandAssets(campaignId: string) {
+      setIsLoadingBrandAssets(true)
+
+      try {
+        const [library, attachments] = await Promise.all([
+          fetchBrandAssets({ isActive: true, limit: 200 }),
+          fetchCampaignBrandAssets(campaignId),
+        ])
+
+        if (isCancelled) {
+          return
+        }
+
+        setBrandAssets(library)
+        setCampaignBrandAssets(attachments)
+        setBrandAssetRoles((currentRoles) => {
+          const nextRoles = { ...currentRoles }
+          for (const asset of library) {
+            nextRoles[asset.id] ??= defaultCampaignBrandRole(asset.asset_type)
+          }
+          return nextRoles
+        })
+      } catch (error) {
+        if (!isCancelled) {
+          setBrandAssets([])
+          setCampaignBrandAssets([])
+          setErrorMessage(getErrorMessage(error))
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingBrandAssets(false)
+        }
+      }
+    }
+
+    if (!selectedCampaignId) {
+      setBrandAssets([])
+      setCampaignBrandAssets([])
+      return
+    }
+
+    void loadBrandAssets(selectedCampaignId)
+
+    return () => {
+      isCancelled = true
+    }
+  }, [selectedCampaignId])
+
+  useEffect(() => {
+    let isCancelled = false
+    const assetsById = new Map<string, BrandAssetDto>()
+
+    for (const asset of brandAssets) {
+      assetsById.set(asset.id, asset)
+    }
+    for (const attachment of campaignBrandAssets) {
+      assetsById.set(attachment.brand_asset.id, attachment.brand_asset)
+    }
+
+    const previewableAssets = [...assetsById.values()].filter(
+      isBrandAssetPreviewable,
+    )
+
+    async function loadPreviewUrls() {
+      const previewResults = await Promise.allSettled(
+        previewableAssets.map(async (asset) => ({
+          assetId: asset.id,
+          download: await fetchBrandAssetDownloadUrl(asset.id),
+        })),
+      )
+
+      if (isCancelled) {
+        return
+      }
+
+      setBrandAssetPreviewUrls((currentUrls) => {
+        const nextUrls = { ...currentUrls }
+        for (const result of previewResults) {
+          if (result.status === 'fulfilled') {
+            nextUrls[result.value.assetId] = result.value.download.download_url
+          }
+        }
+        return nextUrls
+      })
+    }
+
+    if (previewableAssets.length > 0) {
+      void loadPreviewUrls()
+    }
+
+    return () => {
+      isCancelled = true
+    }
+  }, [brandAssets, campaignBrandAssets])
 
   const campaignAssets = assets
 
@@ -1285,6 +1501,7 @@ function App() {
 
     setOpenCampaignMenuId(null)
     setIsCreateCampaignOpen(false)
+    setIsBrandAssetModalOpen(false)
     setSelectedCampaignId(campaignId)
     setSelectedAssetId('')
     setAssets([])
@@ -1292,6 +1509,149 @@ function App() {
     setChannelFilter('All')
     setRequestChannel(nextCampaign?.channels[0] ?? '')
     clearGenerationReferenceImages()
+  }
+
+  function resetBrandAssetForm() {
+    setBrandAssetForm(defaultBrandAssetForm)
+    setBrandAssetFile(null)
+    setAttachUploadedBrandAsset(true)
+    setUploadedBrandAssetRole('primary_logo')
+    if (brandAssetFileInputRef.current) {
+      brandAssetFileInputRef.current.value = ''
+    }
+  }
+
+  function closeBrandAssetModal() {
+    setIsBrandAssetModalOpen(false)
+    resetBrandAssetForm()
+  }
+
+  async function uploadBrandAssetFromForm(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    if (!selectedCampaign || !brandAssetFile || !brandAssetForm.name.trim()) {
+      return
+    }
+
+    if (brandAssetFile.size === 0) {
+      setErrorMessage('Brand asset file must not be empty')
+      return
+    }
+
+    if (brandAssetFile.size > maxReferenceImageSizeBytes) {
+      setErrorMessage('Brand asset file must be 25 MB or smaller')
+      return
+    }
+
+    setIsUploadingBrandAsset(true)
+    setErrorMessage(null)
+
+    try {
+      const uploadedAsset = await uploadBrandAsset(
+        {
+          name: brandAssetForm.name.trim(),
+          asset_type: brandAssetForm.assetType,
+          description: brandAssetForm.description.trim() || null,
+          usage_guidance: brandAssetForm.usageGuidance.trim() || null,
+          tags: splitCommaList(brandAssetForm.tags),
+          source_url: brandAssetForm.sourceUrl.trim() || null,
+        },
+        brandAssetFile,
+      )
+
+      setBrandAssets((currentAssets) => [
+        uploadedAsset,
+        ...currentAssets.filter((asset) => asset.id !== uploadedAsset.id),
+      ])
+      setBrandAssetRoles((currentRoles) => ({
+        ...currentRoles,
+        [uploadedAsset.id]: defaultCampaignBrandRole(uploadedAsset.asset_type),
+      }))
+
+      if (attachUploadedBrandAsset) {
+        const attachment = await attachBrandAssetToCampaign(
+          selectedCampaign.id,
+          {
+            brand_asset_id: uploadedAsset.id,
+            role: uploadedBrandAssetRole,
+          },
+        )
+        setCampaignBrandAssets((currentAttachments) => [
+          attachment,
+          ...currentAttachments,
+        ])
+      }
+
+      closeBrandAssetModal()
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setIsUploadingBrandAsset(false)
+    }
+  }
+
+  async function attachLibraryBrandAsset(asset: BrandAssetDto) {
+    if (!selectedCampaign) {
+      return
+    }
+
+    const role =
+      brandAssetRoles[asset.id] ?? defaultCampaignBrandRole(asset.asset_type)
+    setAttachingBrandAssetId(asset.id)
+    setErrorMessage(null)
+
+    try {
+      const attachment = await attachBrandAssetToCampaign(selectedCampaign.id, {
+        brand_asset_id: asset.id,
+        role,
+      })
+      setCampaignBrandAssets((currentAttachments) => [
+        attachment,
+        ...currentAttachments,
+      ])
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setAttachingBrandAssetId(null)
+    }
+  }
+
+  async function detachCampaignBrandAsset(attachment: CampaignBrandAssetDto) {
+    if (!selectedCampaign) {
+      return
+    }
+
+    setDetachingBrandAssetLinkId(attachment.id)
+    setErrorMessage(null)
+
+    try {
+      await detachBrandAssetFromCampaign(selectedCampaign.id, attachment.id)
+      setCampaignBrandAssets((currentAttachments) =>
+        currentAttachments.filter((item) => item.id !== attachment.id),
+      )
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setDetachingBrandAssetLinkId(null)
+    }
+  }
+
+  async function openBrandAsset(asset: BrandAssetDto) {
+    setErrorMessage(null)
+
+    try {
+      const previewUrl = brandAssetPreviewUrls[asset.id]
+      const downloadUrl = previewUrl
+        ? previewUrl
+        : (await fetchBrandAssetDownloadUrl(asset.id)).download_url
+      const openedWindow = window.open(downloadUrl, '_blank', 'noopener,noreferrer')
+
+      if (!openedWindow) {
+        setErrorMessage('The browser blocked the brand asset tab')
+      }
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    }
   }
 
   async function createCampaignFromForm(event: FormEvent<HTMLFormElement>) {
@@ -1805,6 +2165,16 @@ function App() {
                     </span>
                   </div>
                   <p>{displayValue(inputAsset.filename)}</p>
+                  {inputAsset.brandAssetName && (
+                    <p className="provenance-brand-name">
+                      Brand asset: {inputAsset.brandAssetName}
+                    </p>
+                  )}
+                  {inputAsset.usageGuidance && (
+                    <small className="provenance-guidance">
+                      {inputAsset.usageGuidance}
+                    </small>
+                  )}
                   <code>{displayValue(inputAsset.storageKey)}</code>
                   <div className="provenance-input-foot">
                     <span>{displayValue(inputAsset.source)}</span>
@@ -2153,6 +2523,297 @@ function App() {
         </div>
       )}
 
+      {isBrandAssetModalOpen && selectedCampaign && (
+        <div className="modal-backdrop" onMouseDown={closeBrandAssetModal}>
+          <section
+            aria-labelledby="brand-asset-modal-title"
+            aria-modal="true"
+            className="campaign-modal brand-asset-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <div className="campaign-modal-header">
+              <div>
+                <span className="eyebrow">Brand library</span>
+                <h2 id="brand-asset-modal-title">Manage campaign assets</h2>
+              </div>
+              <button
+                aria-label="Close brand asset manager"
+                className="modal-close-button"
+                onClick={closeBrandAssetModal}
+                type="button"
+              >
+                x
+              </button>
+            </div>
+
+            <div className="brand-asset-modal-body">
+              <form
+                className="brand-upload-panel"
+                onSubmit={uploadBrandAssetFromForm}
+              >
+                <div className="panel-heading">
+                  <div>
+                    <span className="eyebrow">Upload</span>
+                    <h2>New library asset</h2>
+                  </div>
+                </div>
+
+                <label className="field">
+                  <span>Name</span>
+                  <input
+                    autoFocus
+                    onChange={(event) =>
+                      setBrandAssetForm((currentForm) => ({
+                        ...currentForm,
+                        name: event.target.value,
+                      }))
+                    }
+                    required
+                    value={brandAssetForm.name}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Type</span>
+                  <select
+                    onChange={(event) => {
+                      const assetType = event.target.value as BrandAssetType
+                      setBrandAssetForm((currentForm) => ({
+                        ...currentForm,
+                        assetType,
+                      }))
+                      setUploadedBrandAssetRole(
+                        defaultCampaignBrandRole(assetType),
+                      )
+                    }}
+                    value={brandAssetForm.assetType}
+                  >
+                    {brandAssetTypeOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="field">
+                  <span>File</span>
+                  <input
+                    accept=".docx,.jpeg,.jpg,.md,.otf,.pdf,.png,.pptx,.svg,.ttf,.txt,.webp,.woff,.woff2"
+                    onChange={(event) =>
+                      setBrandAssetFile(event.target.files?.[0] ?? null)
+                    }
+                    ref={brandAssetFileInputRef}
+                    required
+                    type="file"
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Description</span>
+                  <textarea
+                    onChange={(event) =>
+                      setBrandAssetForm((currentForm) => ({
+                        ...currentForm,
+                        description: event.target.value,
+                      }))
+                    }
+                    rows={2}
+                    value={brandAssetForm.description}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Usage guidance</span>
+                  <textarea
+                    onChange={(event) =>
+                      setBrandAssetForm((currentForm) => ({
+                        ...currentForm,
+                        usageGuidance: event.target.value,
+                      }))
+                    }
+                    rows={3}
+                    value={brandAssetForm.usageGuidance}
+                  />
+                </label>
+
+                <div className="brand-upload-grid">
+                  <label className="field">
+                    <span>Tags</span>
+                    <input
+                      onChange={(event) =>
+                        setBrandAssetForm((currentForm) => ({
+                          ...currentForm,
+                          tags: event.target.value,
+                        }))
+                      }
+                      placeholder="approved, evergreen"
+                      value={brandAssetForm.tags}
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>Source URL</span>
+                    <input
+                      onChange={(event) =>
+                        setBrandAssetForm((currentForm) => ({
+                          ...currentForm,
+                          sourceUrl: event.target.value,
+                        }))
+                      }
+                      type="url"
+                      value={brandAssetForm.sourceUrl}
+                    />
+                  </label>
+                </div>
+
+                <label className="brand-attach-toggle">
+                  <input
+                    checked={attachUploadedBrandAsset}
+                    onChange={(event) =>
+                      setAttachUploadedBrandAsset(event.target.checked)
+                    }
+                    type="checkbox"
+                  />
+                  <span>Attach to {selectedCampaign.name}</span>
+                </label>
+
+                {attachUploadedBrandAsset && (
+                  <label className="field">
+                    <span>Campaign role</span>
+                    <select
+                      onChange={(event) =>
+                        setUploadedBrandAssetRole(event.target.value)
+                      }
+                      value={uploadedBrandAssetRole}
+                    >
+                      {campaignBrandRoleOptions.map((option) => (
+                        <option key={option.value} value={option.value}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+
+                <button
+                  className="button button-primary"
+                  disabled={
+                    isUploadingBrandAsset ||
+                    !brandAssetFile ||
+                    !brandAssetForm.name.trim()
+                  }
+                  type="submit"
+                >
+                  {isUploadingBrandAsset ? 'Uploading...' : 'Upload asset'}
+                </button>
+              </form>
+
+              <section className="brand-library-panel">
+                <div className="panel-heading">
+                  <div>
+                    <span className="eyebrow">Library</span>
+                    <h2>Reusable assets</h2>
+                  </div>
+                  <strong>{brandAssets.length}</strong>
+                </div>
+
+                {isLoadingBrandAssets ? (
+                  <div className="brand-library-empty">Loading library...</div>
+                ) : brandAssets.length === 0 ? (
+                  <div className="brand-library-empty">
+                    Upload the first reusable brand asset.
+                  </div>
+                ) : (
+                  <div className="brand-library-list">
+                    {brandAssets.map((asset) => {
+                      const role =
+                        brandAssetRoles[asset.id] ??
+                        defaultCampaignBrandRole(asset.asset_type)
+                      const attachedRoles = campaignBrandAssets
+                        .filter((item) => item.brand_asset_id === asset.id)
+                        .map((item) => item.role)
+                      const isAttachedForRole = attachedRoles.includes(role)
+
+                      return (
+                        <article className="brand-library-card" key={asset.id}>
+                          <button
+                            aria-label={`Open ${asset.name}`}
+                            className="brand-asset-preview"
+                            onClick={() => void openBrandAsset(asset)}
+                            type="button"
+                          >
+                            {brandAssetPreviewUrls[asset.id] ? (
+                              <img
+                                alt=""
+                                src={brandAssetPreviewUrls[asset.id]}
+                              />
+                            ) : (
+                              <span>{getFileExtension(asset.filename)}</span>
+                            )}
+                          </button>
+
+                          <div className="brand-library-meta">
+                            <div>
+                              <strong>{asset.name}</strong>
+                              <span>{titleCase(asset.asset_type)}</span>
+                            </div>
+                            <small>
+                              {asset.filename} / {formatFileSize(asset.size_bytes)}
+                            </small>
+                            {attachedRoles.length > 0 && (
+                              <small>
+                                Attached as{' '}
+                                {attachedRoles.map(displayInputRole).join(', ')}
+                              </small>
+                            )}
+                          </div>
+
+                          <div className="brand-library-actions">
+                            <select
+                              aria-label={`Role for ${asset.name}`}
+                              onChange={(event) =>
+                                setBrandAssetRoles((currentRoles) => ({
+                                  ...currentRoles,
+                                  [asset.id]: event.target.value,
+                                }))
+                              }
+                              value={role}
+                            >
+                              {campaignBrandRoleOptions.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                            <button
+                              className="metadata-button"
+                              disabled={
+                                isAttachedForRole ||
+                                attachingBrandAssetId === asset.id
+                              }
+                              onClick={() => void attachLibraryBrandAsset(asset)}
+                              type="button"
+                            >
+                              {attachingBrandAssetId === asset.id
+                                ? 'Attaching...'
+                                : isAttachedForRole
+                                  ? 'Attached'
+                                  : 'Attach'}
+                            </button>
+                          </div>
+                        </article>
+                      )
+                    })}
+                  </div>
+                )}
+              </section>
+            </div>
+          </section>
+        </div>
+      )}
+
       <div className="workspace" id="campaigns">
         <aside className="campaign-rail" aria-label="Campaigns">
           <div className="rail-heading">
@@ -2305,6 +2966,87 @@ function App() {
                     <span key={input}>{input}</span>
                   ))}
                 </div>
+
+                <section className="campaign-brand-panel" id="library">
+                  <div className="campaign-brand-heading">
+                    <div>
+                      <span>Brand assets</span>
+                      <strong>{campaignBrandAssets.length} attached</strong>
+                    </div>
+                    <button
+                      className="metadata-button"
+                      onClick={() => setIsBrandAssetModalOpen(true)}
+                      type="button"
+                    >
+                      Manage
+                    </button>
+                  </div>
+
+                  {isLoadingBrandAssets ? (
+                    <div className="campaign-brand-empty">Loading assets...</div>
+                  ) : campaignBrandAssets.length === 0 ? (
+                    <button
+                      className="campaign-brand-empty is-action"
+                      onClick={() => setIsBrandAssetModalOpen(true)}
+                      type="button"
+                    >
+                      Attach reusable logos, products, and style references
+                    </button>
+                  ) : (
+                    <div className="campaign-brand-list">
+                      {campaignBrandAssets.map((attachment) => (
+                        <article
+                          className="campaign-brand-card"
+                          key={attachment.id}
+                        >
+                          <button
+                            aria-label={`Open ${attachment.brand_asset.name}`}
+                            className="campaign-brand-preview"
+                            onClick={() =>
+                              void openBrandAsset(attachment.brand_asset)
+                            }
+                            type="button"
+                          >
+                            {brandAssetPreviewUrls[attachment.brand_asset_id] ? (
+                              <img
+                                alt=""
+                                src={
+                                  brandAssetPreviewUrls[
+                                    attachment.brand_asset_id
+                                  ]
+                                }
+                              />
+                            ) : (
+                              <span>
+                                {getFileExtension(
+                                  attachment.brand_asset.filename,
+                                )}
+                              </span>
+                            )}
+                          </button>
+                          <div>
+                            <strong>{attachment.brand_asset.name}</strong>
+                            <span>{displayInputRole(attachment.role)}</span>
+                          </div>
+                          <button
+                            className="campaign-brand-detach"
+                            disabled={
+                              detachingBrandAssetLinkId === attachment.id
+                            }
+                            onClick={() =>
+                              void detachCampaignBrandAsset(attachment)
+                            }
+                            type="button"
+                          >
+                            {detachingBrandAssetLinkId === attachment.id
+                              ? '...'
+                              : 'Detach'}
+                          </button>
+                        </article>
+                      ))}
+                    </div>
+                  )}
+                </section>
 
                 <div className="generator">
                   <div className="panel-heading">

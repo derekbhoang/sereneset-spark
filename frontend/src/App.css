@@ -264,6 +264,180 @@
   gap: 8px;
 }
 
+.brand-asset-modal {
+  width: min(1040px, 100%);
+  height: min(760px, calc(100svh - 48px));
+}
+
+.brand-asset-modal-body {
+  display: grid;
+  grid-template-columns: minmax(300px, 380px) minmax(0, 1fr);
+  min-height: 0;
+}
+
+.brand-upload-panel,
+.brand-library-panel {
+  min-width: 0;
+  overflow: auto;
+  padding: 20px 22px;
+}
+
+.brand-upload-panel {
+  border-right: 1px solid var(--border);
+  background: #fbfbf6;
+}
+
+.brand-upload-panel .field {
+  margin-bottom: 12px;
+}
+
+.brand-upload-panel textarea {
+  min-height: 70px;
+}
+
+.brand-upload-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+}
+
+.brand-attach-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 3px 0 13px;
+  color: var(--heading);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.brand-attach-toggle input {
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  accent-color: #176b5d;
+}
+
+.brand-library-panel {
+  background: #fff;
+}
+
+.brand-library-panel .panel-heading > strong {
+  color: #176b5d;
+  font-size: 13px;
+}
+
+.brand-library-list {
+  display: grid;
+  gap: 10px;
+}
+
+.brand-library-card {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr) 150px;
+  gap: 12px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fcfcf9;
+}
+
+.brand-asset-preview,
+.campaign-brand-preview {
+  display: grid;
+  overflow: hidden;
+  place-items: center;
+  border: 1px solid #cdd9d4;
+  border-radius: 6px;
+  color: #fff;
+  background: #263238;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.brand-asset-preview {
+  width: 72px;
+  height: 72px;
+}
+
+.brand-asset-preview img,
+.campaign-brand-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.brand-library-meta {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.brand-library-meta > div {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.brand-library-meta strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--heading);
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.brand-library-meta span {
+  flex: 0 0 auto;
+  color: #a3482e;
+  font-size: 10px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.brand-library-meta small {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.brand-library-actions {
+  display: grid;
+  gap: 7px;
+}
+
+.brand-library-actions select {
+  height: 34px;
+  padding: 0 8px;
+  font-size: 11px;
+}
+
+.brand-library-actions .metadata-button {
+  justify-self: stretch;
+}
+
+.brand-library-empty {
+  display: grid;
+  min-height: 140px;
+  place-items: center;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  color: var(--muted);
+  background: #fbfbf6;
+  font-size: 13px;
+  font-weight: 800;
+  text-align: center;
+  padding: 20px;
+}
+
 .campaign-list {
   display: grid;
   gap: 10px;
@@ -989,6 +1163,116 @@ a:focus-visible {
   padding: 6px 9px;
 }
 
+.campaign-brand-panel {
+  display: grid;
+  gap: 10px;
+  margin: 0 0 20px;
+  padding: 13px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.campaign-brand-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.campaign-brand-heading > div {
+  display: grid;
+  gap: 2px;
+}
+
+.campaign-brand-heading span {
+  color: var(--heading);
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.campaign-brand-heading strong {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.campaign-brand-list {
+  display: grid;
+  gap: 7px;
+}
+
+.campaign-brand-card {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+  min-width: 0;
+}
+
+.campaign-brand-preview {
+  width: 46px;
+  height: 46px;
+}
+
+.campaign-brand-card > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.campaign-brand-card strong {
+  overflow: hidden;
+  color: var(--heading);
+  font-size: 12px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.campaign-brand-card > div span {
+  color: #176b5d;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.campaign-brand-detach {
+  min-height: 30px;
+  border: 0;
+  color: #8f3326;
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 900;
+  cursor: pointer;
+}
+
+.campaign-brand-detach:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.campaign-brand-empty {
+  min-height: 48px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+  color: var(--muted);
+  background: #fbfbf6;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+  text-align: center;
+  padding: 9px;
+}
+
+.campaign-brand-empty.is-action {
+  cursor: pointer;
+}
+
+.campaign-brand-empty.is-action:hover {
+  border-color: #176b5d;
+  color: #176b5d;
+}
+
 .latest-version-preview .artifact-image-preview img {
   height: 210px;
 }
@@ -1323,6 +1607,16 @@ a:focus-visible {
   line-height: 1.3;
 }
 
+.provenance-input-card .provenance-brand-name {
+  color: #176b5d;
+}
+
+.provenance-guidance {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .provenance-foot {
   display: flex;
   flex-wrap: wrap;
@@ -1442,6 +1736,39 @@ code {
   .campaign-form-grid,
   .campaign-form-actions {
     grid-template-columns: 1fr;
+  }
+
+  .brand-asset-modal-body,
+  .brand-upload-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .brand-asset-modal-body {
+    overflow: auto;
+  }
+
+  .brand-upload-panel,
+  .brand-library-panel {
+    overflow: visible;
+  }
+
+  .brand-upload-panel {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .brand-library-card {
+    grid-template-columns: 64px minmax(0, 1fr);
+  }
+
+  .brand-asset-preview {
+    width: 64px;
+    height: 64px;
+  }
+
+  .brand-library-actions {
+    grid-column: 2;
+    grid-template-columns: minmax(0, 1fr) auto;
   }
 
   .modal-backdrop {
