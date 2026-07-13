@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import uuid
@@ -17,6 +18,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_db
 from app.models.asset import Asset, AssetVersion, AssetVersionInput, ReviewStatus
+from app.models.brand_asset import BrandAsset, CampaignBrandAsset
 from app.models.campaign import Campaign
 from app.schemas.campaign import CampaignCreate, CampaignRead, CampaignUpdate
 from app.services.storage import (
@@ -62,6 +64,12 @@ class ExportInputReference:
     usage_guidance: str | None = None
 
 
+@dataclass(frozen=True)
+class ExportBrandAssetResult:
+    zip_path: str | None = None
+    export_error: str | None = None
+
+
 def get_campaign_or_404(campaign_id: uuid.UUID, db: Session) -> Campaign:
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:
@@ -82,7 +90,10 @@ def get_campaign_with_assets_or_404(
         .options(
             selectinload(Campaign.assets)
             .selectinload(Asset.versions)
-            .selectinload(AssetVersion.inputs)
+            .selectinload(AssetVersion.inputs),
+            selectinload(Campaign.brand_asset_links).selectinload(
+                CampaignBrandAsset.brand_asset
+            ),
         )
         .where(Campaign.id == campaign_id)
     )
@@ -133,6 +144,113 @@ def safe_export_filename(filename: str | None, fallback: str) -> str:
         return normalize_artifact_filename(filename or fallback)
     except ValueError:
         return fallback
+
+
+def campaign_brand_asset_links(
+    campaign: Campaign,
+) -> list[CampaignBrandAsset]:
+    return sorted(
+        campaign.brand_asset_links,
+        key=lambda link: (
+            link.brand_asset.asset_type.value,
+            link.brand_asset.name.casefold(),
+            link.role,
+            str(link.id),
+        ),
+    )
+
+
+def unique_campaign_brand_assets(campaign: Campaign) -> list[BrandAsset]:
+    assets_by_id: dict[uuid.UUID, BrandAsset] = {}
+    for link in campaign_brand_asset_links(campaign):
+        assets_by_id.setdefault(link.brand_asset.id, link.brand_asset)
+
+    return list(assets_by_id.values())
+
+
+def brand_asset_zip_path(brand_asset: BrandAsset) -> str:
+    asset_type = slugify_filename(
+        brand_asset.asset_type.value,
+        fallback="other",
+    )
+    asset_name = slugify_filename(
+        brand_asset.name,
+        fallback="brand-asset",
+    )
+    filename = safe_export_filename(
+        brand_asset.filename,
+        fallback=f"brand-asset-{brand_asset.id}",
+    )
+    return f"brand-assets/{asset_type}/{asset_name}-{brand_asset.id}/{filename}"
+
+
+def download_verified_brand_asset_bytes(
+    *,
+    storage: B2StorageService,
+    brand_asset: BrandAsset,
+) -> bytes:
+    body = storage.download_bytes(key=brand_asset.storage_key)
+
+    if len(body) != brand_asset.size_bytes:
+        raise ValueError("Brand asset size did not match stored metadata")
+
+    if hashlib.sha256(body).hexdigest() != brand_asset.sha256:
+        raise ValueError("Brand asset checksum did not match stored metadata")
+
+    return body
+
+
+def build_campaign_brand_asset_manifest(
+    *,
+    campaign: Campaign,
+    export_results: dict[uuid.UUID, ExportBrandAssetResult],
+) -> list[dict[str, object]]:
+    links_by_asset_id: dict[uuid.UUID, list[CampaignBrandAsset]] = {}
+    for link in campaign_brand_asset_links(campaign):
+        links_by_asset_id.setdefault(link.brand_asset_id, []).append(link)
+
+    return [
+        {
+            "id": str(brand_asset.id),
+            "name": brand_asset.name,
+            "asset_type": brand_asset.asset_type.value,
+            "description": brand_asset.description,
+            "usage_guidance": brand_asset.usage_guidance,
+            "storage_key": brand_asset.storage_key,
+            "filename": brand_asset.filename,
+            "content_type": brand_asset.content_type,
+            "size_bytes": brand_asset.size_bytes,
+            "sha256": brand_asset.sha256,
+            "tags": brand_asset.tags,
+            "source_url": brand_asset.source_url,
+            "is_active": brand_asset.is_active,
+            "created_at": brand_asset.created_at.isoformat(),
+            "updated_at": brand_asset.updated_at.isoformat(),
+            "attachments": [
+                {
+                    "id": str(link.id),
+                    "role": link.role,
+                    "attached_at": link.created_at.isoformat(),
+                }
+                for link in links_by_asset_id[brand_asset.id]
+            ],
+            "zip_path": export_results.get(
+                brand_asset.id,
+                ExportBrandAssetResult(),
+            ).zip_path,
+            "integrity_verified": bool(
+                export_results.get(
+                    brand_asset.id,
+                    ExportBrandAssetResult(),
+                ).zip_path
+            ),
+            "export_error": export_results.get(
+                brand_asset.id,
+                ExportBrandAssetResult(),
+            ).export_error,
+        }
+        for brand_asset in unique_campaign_brand_assets(campaign)
+    ]
 
 
 def serialize_asset_version_input(
@@ -197,6 +315,7 @@ def export_input_record(
 def build_campaign_export_manifest(
     *,
     campaign: Campaign,
+    brand_assets: list[dict[str, object]],
     approved_assets: list[Asset],
     metadata_paths: dict[uuid.UUID, str],
     metadata_sources: dict[uuid.UUID, str],
@@ -224,6 +343,8 @@ def build_campaign_export_manifest(
             "channels": campaign.channels,
             "brand_inputs": campaign.brand_inputs,
         },
+        "brand_assets_manifest_path": "brand-assets/manifest.json",
+        "brand_assets": brand_assets,
         "assets": [
             {
                 "id": str(asset.id),
@@ -676,9 +797,54 @@ def make_campaign_export_zip(
     artifact_export_errors: dict[uuid.UUID, str] = {}
     input_exports: dict[uuid.UUID, list[dict[str, object]]] = {}
     used_input_paths: set[str] = set()
+    brand_asset_export_results: dict[uuid.UUID, ExportBrandAssetResult] = {}
     zip_buffer = BytesIO()
 
     with ZipFile(zip_buffer, mode="w", compression=ZIP_DEFLATED) as export_zip:
+        for brand_asset in unique_campaign_brand_assets(campaign):
+            zip_path = brand_asset_zip_path(brand_asset)
+            try:
+                export_zip.writestr(
+                    zip_path,
+                    download_verified_brand_asset_bytes(
+                        storage=storage,
+                        brand_asset=brand_asset,
+                    ),
+                )
+                brand_asset_export_results[brand_asset.id] = (
+                    ExportBrandAssetResult(zip_path=zip_path)
+                )
+            except (
+                StorageConfigurationError,
+                BotoCoreError,
+                ClientError,
+                OSError,
+                ValueError,
+            ):
+                brand_asset_export_results[brand_asset.id] = (
+                    ExportBrandAssetResult(
+                        export_error=(
+                            "Brand asset could not be downloaded or did not "
+                            "match its stored integrity metadata"
+                        )
+                    )
+                )
+
+        brand_assets = build_campaign_brand_asset_manifest(
+            campaign=campaign,
+            export_results=brand_asset_export_results,
+        )
+        export_zip.writestr(
+            "brand-assets/manifest.json",
+            encode_pretty_json(
+                {
+                    "campaign_id": str(campaign.id),
+                    "exported_at": datetime.now(UTC).isoformat(),
+                    "brand_assets": brand_assets,
+                }
+            ),
+        )
+
         for asset in approved_assets:
             for version in sorted(
                 asset.versions,
@@ -780,6 +946,7 @@ def make_campaign_export_zip(
 
         manifest = build_campaign_export_manifest(
             campaign=campaign,
+            brand_assets=brand_assets,
             approved_assets=approved_assets,
             metadata_paths=metadata_paths,
             metadata_sources=metadata_sources,
