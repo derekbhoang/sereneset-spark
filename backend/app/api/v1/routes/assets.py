@@ -363,6 +363,17 @@ def add_asset_version_inputs(
                 content_type=stored_input.content_type,
                 size_bytes=stored_input.size_bytes,
                 sha256=stored_input.sha256,
+                source=stored_input.source,
+                storage_ownership=(
+                    "asset_version"
+                    if stored_input.owns_storage_object
+                    else "brand_asset"
+                ),
+                brand_asset_id=stored_input.brand_asset_id,
+                campaign_brand_asset_id=stored_input.campaign_brand_asset_id,
+                brand_asset_type=stored_input.brand_asset_type,
+                brand_asset_name=stored_input.brand_asset_name,
+                usage_guidance=stored_input.usage_guidance,
             )
         )
 
@@ -1277,7 +1288,21 @@ def asset_version_input_to_sidecar(
         "content_type": version_input.content_type,
         "size_bytes": version_input.size_bytes,
         "sha256": version_input.sha256,
-        "source": "user_upload",
+        "source": version_input.source,
+        "storage_ownership": version_input.storage_ownership,
+        "brand_asset_id": (
+            str(version_input.brand_asset_id)
+            if version_input.brand_asset_id is not None
+            else None
+        ),
+        "campaign_brand_asset_id": (
+            str(version_input.campaign_brand_asset_id)
+            if version_input.campaign_brand_asset_id is not None
+            else None
+        ),
+        "brand_asset_type": version_input.brand_asset_type,
+        "brand_asset_name": version_input.brand_asset_name,
+        "usage_guidance": version_input.usage_guidance,
         "created_at": version_input.created_at.isoformat(),
     }
 

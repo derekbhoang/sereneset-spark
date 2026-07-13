@@ -53,6 +53,13 @@ class ExportInputReference:
     sha256: str | None
     created_at: str | None
     source: str
+    input_source: str | None = None
+    storage_ownership: str | None = None
+    brand_asset_id: str | None = None
+    campaign_brand_asset_id: str | None = None
+    brand_asset_type: str | None = None
+    brand_asset_name: str | None = None
+    usage_guidance: str | None = None
 
 
 def get_campaign_or_404(campaign_id: uuid.UUID, db: Session) -> Campaign:
@@ -139,6 +146,21 @@ def serialize_asset_version_input(
         "content_type": version_input.content_type,
         "size_bytes": version_input.size_bytes,
         "sha256": version_input.sha256,
+        "source": version_input.source,
+        "storage_ownership": version_input.storage_ownership,
+        "brand_asset_id": (
+            str(version_input.brand_asset_id)
+            if version_input.brand_asset_id is not None
+            else None
+        ),
+        "campaign_brand_asset_id": (
+            str(version_input.campaign_brand_asset_id)
+            if version_input.campaign_brand_asset_id is not None
+            else None
+        ),
+        "brand_asset_type": version_input.brand_asset_type,
+        "brand_asset_name": version_input.brand_asset_name,
+        "usage_guidance": version_input.usage_guidance,
         "created_at": version_input.created_at.isoformat(),
     }
 
@@ -160,6 +182,13 @@ def export_input_record(
         "sha256": reference.sha256,
         "created_at": reference.created_at,
         "metadata_source": reference.source,
+        "source": reference.input_source,
+        "storage_ownership": reference.storage_ownership,
+        "brand_asset_id": reference.brand_asset_id,
+        "campaign_brand_asset_id": reference.campaign_brand_asset_id,
+        "brand_asset_type": reference.brand_asset_type,
+        "brand_asset_name": reference.brand_asset_name,
+        "usage_guidance": reference.usage_guidance,
         "zip_path": zip_path,
         "export_error": export_error,
     }
@@ -346,6 +375,21 @@ def asset_version_input_reference(
         sha256=version_input.sha256,
         created_at=version_input.created_at.isoformat(),
         source="asset_version_input",
+        input_source=version_input.source,
+        storage_ownership=version_input.storage_ownership,
+        brand_asset_id=(
+            str(version_input.brand_asset_id)
+            if version_input.brand_asset_id is not None
+            else None
+        ),
+        campaign_brand_asset_id=(
+            str(version_input.campaign_brand_asset_id)
+            if version_input.campaign_brand_asset_id is not None
+            else None
+        ),
+        brand_asset_type=version_input.brand_asset_type,
+        brand_asset_name=version_input.brand_asset_name,
+        usage_guidance=version_input.usage_guidance,
     )
 
 
@@ -385,6 +429,25 @@ def metadata_input_asset_references(
                     sha256=optional_string(input_item.get("sha256")),
                     created_at=optional_string(input_item.get("created_at")),
                     source=source_name,
+                    input_source=optional_string(input_item.get("source")),
+                    storage_ownership=optional_string(
+                        input_item.get("storage_ownership")
+                    ),
+                    brand_asset_id=optional_string(
+                        input_item.get("brand_asset_id")
+                    ),
+                    campaign_brand_asset_id=optional_string(
+                        input_item.get("campaign_brand_asset_id")
+                    ),
+                    brand_asset_type=optional_string(
+                        input_item.get("brand_asset_type")
+                    ),
+                    brand_asset_name=optional_string(
+                        input_item.get("brand_asset_name")
+                    ),
+                    usage_guidance=optional_string(
+                        input_item.get("usage_guidance")
+                    ),
                 )
             )
 

@@ -142,6 +142,35 @@ class AssetVersionInput(IdMixin, Base):
     content_type: Mapped[str] = mapped_column(String(120), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source: Mapped[str] = mapped_column(
+        String(40),
+        default="user_upload",
+        nullable=False,
+        index=True,
+    )
+    storage_ownership: Mapped[str] = mapped_column(
+        String(40),
+        default="asset_version",
+        nullable=False,
+    )
+    # These are immutable provenance snapshots, not live foreign keys.
+    brand_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        index=True,
+    )
+    campaign_brand_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        index=True,
+    )
+    brand_asset_type: Mapped[str | None] = mapped_column(
+        String(40),
+        nullable=True,
+    )
+    brand_asset_name: Mapped[str | None] = mapped_column(
+        String(160),
+        nullable=True,
+    )
+    usage_guidance: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),

@@ -31,6 +31,13 @@ class AssetVersionInputRead(BaseModel):
     content_type: str
     size_bytes: int
     sha256: str
+    source: str
+    storage_ownership: str
+    brand_asset_id: uuid.UUID | None = None
+    campaign_brand_asset_id: uuid.UUID | None = None
+    brand_asset_type: str | None = None
+    brand_asset_name: str | None = None
+    usage_guidance: str | None = None
     created_at: datetime
 
 
