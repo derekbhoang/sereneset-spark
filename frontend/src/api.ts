@@ -12,6 +12,83 @@ export type GenerationInputFile = {
   role?: GenerationInputRole
 }
 
+export type BrandAssetType =
+  | 'logo'
+  | 'product_image'
+  | 'style_reference'
+  | 'guideline'
+  | 'font'
+  | 'other'
+
+export type BrandAssetDto = {
+  id: string
+  name: string
+  asset_type: BrandAssetType
+  description: string | null
+  usage_guidance: string | null
+  tags: string[]
+  source_url: string | null
+  storage_key: string
+  filename: string
+  content_type: string
+  size_bytes: number
+  sha256: string
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export type BrandAssetCreateDto = {
+  name: string
+  asset_type: BrandAssetType
+  description?: string | null
+  usage_guidance?: string | null
+  tags?: string[]
+  source_url?: string | null
+}
+
+export type BrandAssetUpdateDto = {
+  name?: string
+  asset_type?: BrandAssetType
+  description?: string | null
+  usage_guidance?: string | null
+  tags?: string[]
+  source_url?: string | null
+  is_active?: boolean
+}
+
+export type BrandAssetDownloadUrlDto = {
+  brand_asset_id: string
+  storage_key: string
+  filename: string
+  content_type: string
+  size_bytes: number
+  download_url: string
+  expires_seconds: number
+}
+
+export type CampaignBrandAssetDto = {
+  id: string
+  campaign_id: string
+  brand_asset_id: string
+  role: string
+  created_at: string
+  brand_asset: BrandAssetDto
+}
+
+export type CampaignBrandAssetCreateDto = {
+  brand_asset_id: string
+  role?: string
+}
+
+export type BrandAssetFilters = {
+  assetType?: BrandAssetType
+  isActive?: boolean
+  search?: string
+  offset?: number
+  limit?: number
+}
+
 export type CampaignDto = {
   id: string
   name: string
@@ -63,12 +140,19 @@ export type AssetVersionDto = {
 export type AssetVersionInputDto = {
   id: string
   asset_version_id: string
-  role: GenerationInputRole
+  role: string
   storage_key: string
   filename: string
   content_type: string
   size_bytes: number
   sha256: string
+  source: string
+  storage_ownership: string
+  brand_asset_id: string | null
+  campaign_brand_asset_id: string | null
+  brand_asset_type: string | null
+  brand_asset_name: string | null
+  usage_guidance: string | null
   created_at: string
 }
 
@@ -160,9 +244,18 @@ async function readErrorMessage(response: Response): Promise<string> {
   let message = `Request failed with status ${response.status}`
 
   try {
-    const body = (await response.json()) as { detail?: string }
-    if (body.detail) {
+    const body = (await response.json()) as {
+      detail?: string | Array<{ msg?: string }>
+    }
+    if (typeof body.detail === 'string') {
       message = body.detail
+    } else if (Array.isArray(body.detail)) {
+      const validationMessages = body.detail
+        .map((item) => item.msg)
+        .filter((item): item is string => Boolean(item))
+      if (validationMessages.length > 0) {
+        message = validationMessages.join(', ')
+      }
     }
   } catch {
     // Keep the status-based fallback when the response is not JSON.
@@ -284,6 +377,111 @@ export function deleteCampaign(campaignId: string): Promise<void> {
 
 export function exportCampaignPack(campaignId: string): Promise<DownloadedFile> {
   return downloadRequest(`/campaigns/${campaignId}/export`, 'campaign-export.zip')
+}
+
+export function fetchBrandAssets(
+  filters: BrandAssetFilters = {},
+): Promise<BrandAssetDto[]> {
+  const params = new URLSearchParams()
+
+  if (filters.assetType) {
+    params.set('asset_type', filters.assetType)
+  }
+
+  if (filters.isActive !== undefined) {
+    params.set('is_active', String(filters.isActive))
+  }
+
+  if (filters.search) {
+    params.set('search', filters.search)
+  }
+
+  if (filters.offset !== undefined) {
+    params.set('offset', String(filters.offset))
+  }
+
+  if (filters.limit !== undefined) {
+    params.set('limit', String(filters.limit))
+  }
+
+  const query = params.toString()
+  return request<BrandAssetDto[]>(
+    `/brand-assets${query ? `?${query}` : ''}`,
+  )
+}
+
+export function fetchBrandAsset(brandAssetId: string): Promise<BrandAssetDto> {
+  return request<BrandAssetDto>(`/brand-assets/${brandAssetId}`)
+}
+
+export function uploadBrandAsset(
+  brandAsset: BrandAssetCreateDto,
+  file: File,
+): Promise<BrandAssetDto> {
+  const formData = new FormData()
+  formData.append('payload', JSON.stringify(brandAsset))
+  formData.append('file', file)
+
+  return uploadRequest<BrandAssetDto>('/brand-assets', formData)
+}
+
+export function updateBrandAsset(
+  brandAssetId: string,
+  brandAsset: BrandAssetUpdateDto,
+): Promise<BrandAssetDto> {
+  return request<BrandAssetDto>(`/brand-assets/${brandAssetId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(brandAsset),
+  })
+}
+
+export function archiveBrandAsset(brandAssetId: string): Promise<void> {
+  return requestVoid(`/brand-assets/${brandAssetId}`, {
+    method: 'DELETE',
+  })
+}
+
+export function fetchBrandAssetDownloadUrl(
+  brandAssetId: string,
+  expiresSeconds = 3600,
+): Promise<BrandAssetDownloadUrlDto> {
+  const params = new URLSearchParams({
+    expires_seconds: String(expiresSeconds),
+  })
+
+  return request<BrandAssetDownloadUrlDto>(
+    `/brand-assets/${brandAssetId}/download-url?${params}`,
+  )
+}
+
+export function fetchCampaignBrandAssets(
+  campaignId: string,
+): Promise<CampaignBrandAssetDto[]> {
+  return request<CampaignBrandAssetDto[]>(
+    `/campaigns/${campaignId}/brand-assets`,
+  )
+}
+
+export function attachBrandAssetToCampaign(
+  campaignId: string,
+  attachment: CampaignBrandAssetCreateDto,
+): Promise<CampaignBrandAssetDto> {
+  return request<CampaignBrandAssetDto>(
+    `/campaigns/${campaignId}/brand-assets`,
+    {
+      method: 'POST',
+      body: JSON.stringify(attachment),
+    },
+  )
+}
+
+export function detachBrandAssetFromCampaign(
+  campaignId: string,
+  linkId: string,
+): Promise<void> {
+  return requestVoid(`/campaigns/${campaignId}/brand-assets/${linkId}`, {
+    method: 'DELETE',
+  })
 }
 
 export function fetchCampaignAssets(
