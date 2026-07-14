@@ -15,6 +15,7 @@ from app.db.base import Base, IdMixin, TimestampMixin
 
 if TYPE_CHECKING:
     from app.models.campaign import Campaign
+    from app.models.generation_job import GenerationJob
 
 
 class AssetFormat(str, Enum):
@@ -125,6 +126,13 @@ class AssetVersion(IdMixin, Base):
         back_populates="asset_version",
         cascade="all, delete-orphan",
         order_by="AssetVersionInput.created_at.asc()",
+    )
+    generation_job: Mapped["GenerationJob | None"] = relationship(
+        "GenerationJob",
+        back_populates="asset_version",
+        cascade="all, delete-orphan",
+        single_parent=True,
+        uselist=False,
     )
 
 

@@ -23,7 +23,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.session import get_db
-from app.models.asset import Asset, AssetVersion, AssetVersionInput, ReviewStatus
+from app.models.asset import (
+    Asset,
+    AssetFormat,
+    AssetVersion,
+    AssetVersionInput,
+    ReviewStatus,
+)
 from app.models.brand_asset import BrandAsset, CampaignBrandAsset
 from app.models.campaign import Campaign
 from app.schemas.asset import (
@@ -76,6 +82,16 @@ ALLOWED_GENERATION_INPUT_ROLES = {
     "source_creative",
     "style_reference",
 }
+
+
+def ensure_image_generation_format(asset_format: AssetFormat) -> None:
+    if asset_format != AssetFormat.image:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "Image generation routes only support assets with format 'image'"
+            ),
+        )
 
 
 @dataclass(frozen=True)
@@ -1477,6 +1493,7 @@ def generate_campaign_asset(
     storage: B2StorageService = Depends(get_storage_service),
     generation: GenblazeGenerationService = Depends(get_generation_service),
 ) -> Asset:
+    ensure_image_generation_format(asset_in.format)
     campaign = ensure_campaign_exists(campaign_id, db)
     brand_inputs = campaign_brand_asset_generation_inputs(
         campaign_id=campaign_id,
@@ -1580,6 +1597,7 @@ def generate_campaign_asset_with_inputs(
     generation: GenblazeGenerationService = Depends(get_generation_service),
 ) -> Asset:
     asset_in = parse_asset_generation_payload(payload)
+    ensure_image_generation_format(asset_in.format)
     generation_inputs = parse_multipart_generation_inputs(files=files, roles=roles)
     campaign = ensure_campaign_exists(campaign_id, db)
     brand_inputs = campaign_brand_asset_generation_inputs(
@@ -1693,6 +1711,7 @@ def generate_asset_version(
     generation: GenblazeGenerationService = Depends(get_generation_service),
 ) -> Asset:
     asset = get_asset_or_404(asset_id, db)
+    ensure_image_generation_format(asset.format)
     campaign = ensure_campaign_exists(asset.campaign_id, db)
     latest_version = max(
         asset.versions,
@@ -1817,8 +1836,9 @@ def generate_asset_version_with_inputs(
     generation: GenblazeGenerationService = Depends(get_generation_service),
 ) -> Asset:
     version_in = parse_asset_version_generation_payload(payload)
-    generation_inputs = parse_multipart_generation_inputs(files=files, roles=roles)
     asset = get_asset_or_404(asset_id, db)
+    ensure_image_generation_format(asset.format)
+    generation_inputs = parse_multipart_generation_inputs(files=files, roles=roles)
     campaign = ensure_campaign_exists(asset.campaign_id, db)
     latest_version = max(
         asset.versions,

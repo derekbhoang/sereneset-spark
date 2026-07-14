@@ -27,10 +27,24 @@ class Settings(BaseSettings):
         default="seedream-5.0-lite",
         alias="GENBLAZE_IMAGE_MODEL",
     )
+    genblaze_video_model: str = Field(
+        default="Veo3-Fast",
+        alias="GENBLAZE_VIDEO_MODEL",
+    )
     genblaze_timeout_seconds: int = Field(
         default=600,
         alias="GENBLAZE_TIMEOUT_SECONDS",
         ge=30,
+    )
+    genblaze_video_timeout_seconds: int = Field(
+        default=900,
+        alias="GENBLAZE_VIDEO_TIMEOUT_SECONDS",
+        ge=60,
+    )
+    max_generated_video_size_bytes: int = Field(
+        default=500 * 1024 * 1024,
+        alias="MAX_GENERATED_VIDEO_SIZE_BYTES",
+        ge=1,
     )
     genblaze_storage_prefix: str = Field(
         default="sereneset-spark/genblaze",
@@ -63,6 +77,15 @@ class Settings(BaseSettings):
             raise ValueError("B2_ENDPOINT_URL must start with https://")
 
         return value.rstrip("/")
+
+    @field_validator("genblaze_video_model")
+    @classmethod
+    def validate_genblaze_video_model(cls, value: str) -> str:
+        normalized_value = value.strip()
+        if not normalized_value:
+            raise ValueError("GENBLAZE_VIDEO_MODEL must not be empty")
+
+        return normalized_value
 
     @field_validator("genblaze_storage_prefix")
     @classmethod

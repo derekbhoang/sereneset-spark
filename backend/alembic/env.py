@@ -14,6 +14,7 @@ from app.models import (
     BrandAsset,
     Campaign,
     CampaignBrandAsset,
+    GenerationJob,
 )
 
 # this is the Alembic Config object, which provides
