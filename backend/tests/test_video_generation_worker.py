@@ -12,6 +12,7 @@ from app.services.generation import (
     GenerationProviderError,
     GenerationResult,
 )
+from app.services.storage import StoredObject
 from app.workers.video_generation import (
     DurableVideoArtifact,
     VideoJobSnapshot,
@@ -23,6 +24,7 @@ from app.workers.video_generation import (
     prepare_source_input_assets,
     recover_stale_video_jobs,
     select_durable_video_artifact,
+    store_video_artifact,
 )
 
 
@@ -239,6 +241,9 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         snapshot = VideoJobSnapshot(
             id=uuid.uuid4(),
             asset_version_id=uuid.uuid4(),
+            campaign_id=uuid.uuid4(),
+            asset_id=uuid.uuid4(),
+            version_number=1,
             provider="gmicloud",
             model="Veo3-Fast",
             prompt="Orbit around the product.",
@@ -278,7 +283,11 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         self.assertNotIn("url", metadata["input_assets"][0])
         self.assertEqual(
             metadata["artifact_flow"]["source"],
-            "genblaze_b2_sink",
+            "genblaze_b2_server_side_copy",
+        )
+        self.assertEqual(
+            metadata["artifact_flow"]["storage_strategy"],
+            "server_side_copy",
         )
         self.assertIn(
             "submission_provenance",
@@ -292,6 +301,9 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         snapshot = VideoJobSnapshot(
             id=job.id,
             asset_version_id=job.asset_version_id,
+            campaign_id=job.asset_version.asset.campaign_id,
+            asset_id=job.asset_version.asset.id,
+            version_number=job.asset_version.version_number,
             provider=job.provider,
             model=job.model,
             prompt=job.prompt,
@@ -331,6 +343,67 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             "succeeded",
         )
         db.commit.assert_called_once_with()
+
+    def test_stores_video_with_b2_server_side_copy(self) -> None:
+        campaign_id = uuid.uuid4()
+        asset_id = uuid.uuid4()
+        version_id = uuid.uuid4()
+        job_id = uuid.uuid4()
+        snapshot = VideoJobSnapshot(
+            id=job_id,
+            asset_version_id=version_id,
+            campaign_id=campaign_id,
+            asset_id=asset_id,
+            version_number=2,
+            provider="gmicloud",
+            model="Veo3-Fast",
+            prompt="Orbit around the product.",
+            parameters={},
+            attempt_count=1,
+            started_at=None,
+            version_generation_metadata={},
+        )
+        generated_artifact = DurableVideoArtifact(
+            storage_key="sereneset-spark/genblaze/run/generated.mp4",
+            filename="generated.mp4",
+            content_type="video/mp4",
+            size_bytes=500 * 1024 * 1024,
+            sha256="a" * 64,
+            source_storage_key=(
+                "sereneset-spark/genblaze/run/generated.mp4"
+            ),
+        )
+        destination_key = (
+            f"campaigns/{campaign_id}/assets/{asset_id}/versions/"
+            "v2/artifact/generated.mp4"
+        )
+        storage = MagicMock()
+        storage.copy_object.return_value = StoredObject(
+            bucket="test-bucket",
+            key=destination_key,
+            content_type="video/mp4",
+            size=500 * 1024 * 1024,
+            etag='"copy-etag"',
+        )
+
+        stored_artifact = store_video_artifact(
+            snapshot=snapshot,
+            artifact=generated_artifact,
+            storage=storage,
+            max_size_bytes=500 * 1024 * 1024,
+        )
+
+        self.assertEqual(stored_artifact.storage_key, destination_key)
+        self.assertEqual(
+            stored_artifact.source_storage_key,
+            generated_artifact.storage_key,
+        )
+        copy_args = storage.copy_object.call_args.kwargs
+        self.assertEqual(copy_args["source_key"], generated_artifact.storage_key)
+        self.assertEqual(copy_args["destination_key"], destination_key)
+        self.assertEqual(copy_args["max_size_bytes"], 500 * 1024 * 1024)
+        self.assertEqual(copy_args["metadata"]["generation_job_id"], str(job_id))
+        storage.download_bytes.assert_not_called()
 
     def test_failure_is_safely_persisted(self) -> None:
         failed_at = datetime(2026, 7, 15, 5, 0, tzinfo=UTC)

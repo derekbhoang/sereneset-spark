@@ -17,12 +17,21 @@ class StorageConfigurationError(RuntimeError):
     pass
 
 
+class StorageOperationError(RuntimeError):
+    pass
+
+
+class StorageObjectTooLargeError(StorageOperationError):
+    pass
+
+
 @dataclass(frozen=True)
 class StoredObject:
     bucket: str
     key: str
     content_type: str
     size: int
+    etag: str | None = None
 
 
 def normalize_storage_key(key: str) -> str:
@@ -274,6 +283,106 @@ class B2StorageService:
             "get_object",
             Params={"Bucket": self.bucket_name, "Key": storage_key},
             ExpiresIn=expires_seconds,
+        )
+
+    def get_object_info(self, *, key: str) -> StoredObject:
+        storage_key = normalize_storage_key(key)
+        response = self.client.head_object(
+            Bucket=self.bucket_name,
+            Key=storage_key,
+        )
+        size = response.get("ContentLength")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise StorageOperationError(
+                "B2 did not return a valid object size"
+            )
+
+        raw_content_type = response.get("ContentType")
+        content_type = (
+            raw_content_type.strip()
+            if isinstance(raw_content_type, str) and raw_content_type.strip()
+            else "application/octet-stream"
+        )
+        raw_etag = response.get("ETag")
+        etag = (
+            raw_etag.strip()
+            if isinstance(raw_etag, str) and raw_etag.strip()
+            else None
+        )
+
+        return StoredObject(
+            bucket=self.bucket_name,
+            key=storage_key,
+            content_type=content_type,
+            size=size,
+            etag=etag,
+        )
+
+    def copy_object(
+        self,
+        *,
+        source_key: str,
+        destination_key: str,
+        content_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        cache_control: str | None = None,
+        max_size_bytes: int | None = None,
+    ) -> StoredObject:
+        normalized_source_key = normalize_storage_key(source_key)
+        normalized_destination_key = normalize_storage_key(destination_key)
+        if max_size_bytes is not None and max_size_bytes < 1:
+            raise ValueError("Maximum object size must be greater than zero")
+
+        source_object = self.get_object_info(key=normalized_source_key)
+        if source_object.size == 0:
+            raise StorageOperationError("B2 source object is empty")
+
+        if (
+            max_size_bytes is not None
+            and source_object.size > max_size_bytes
+        ):
+            raise StorageObjectTooLargeError(
+                "B2 source object exceeds the configured size limit"
+            )
+
+        destination_content_type = (
+            content_type.strip()
+            if content_type is not None and content_type.strip()
+            else source_object.content_type
+        )
+        copy_args: dict[str, Any] = {
+            "Bucket": self.bucket_name,
+            "Key": normalized_destination_key,
+            "CopySource": {
+                "Bucket": self.bucket_name,
+                "Key": normalized_source_key,
+            },
+            "ContentType": destination_content_type,
+            "Metadata": stringify_metadata(metadata),
+            "MetadataDirective": "REPLACE",
+        }
+        if cache_control:
+            copy_args["CacheControl"] = cache_control
+
+        response = self.client.copy_object(**copy_args)
+        copy_result = response.get("CopyObjectResult")
+        raw_etag = (
+            copy_result.get("ETag")
+            if isinstance(copy_result, dict)
+            else None
+        )
+        etag = (
+            raw_etag.strip()
+            if isinstance(raw_etag, str) and raw_etag.strip()
+            else None
+        )
+
+        return StoredObject(
+            bucket=self.bucket_name,
+            key=normalized_destination_key,
+            content_type=destination_content_type,
+            size=source_object.size,
+            etag=etag,
         )
 
     def delete_object(self, *, key: str) -> None:

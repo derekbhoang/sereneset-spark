@@ -36,6 +36,9 @@ from app.services.generation import (
 from app.services.storage import (
     B2StorageService,
     StorageConfigurationError,
+    StorageOperationError,
+    StoredObject,
+    build_asset_version_artifact_storage_key,
     normalize_artifact_filename,
     normalize_storage_key,
 )
@@ -57,6 +60,19 @@ class DownloadUrlSigner(Protocol):
     ) -> str: ...
 
 
+class WorkerStorage(DownloadUrlSigner, Protocol):
+    def copy_object(
+        self,
+        *,
+        source_key: str,
+        destination_key: str,
+        content_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        cache_control: str | None = None,
+        max_size_bytes: int | None = None,
+    ) -> StoredObject: ...
+
+
 class VideoGenerator(Protocol):
     def generate_video(
         self,
@@ -68,6 +84,9 @@ class VideoGenerator(Protocol):
 class VideoJobSnapshot:
     id: uuid.UUID
     asset_version_id: uuid.UUID
+    campaign_id: uuid.UUID
+    asset_id: uuid.UUID
+    version_number: int
     provider: str
     model: str
     prompt: str
@@ -84,6 +103,7 @@ class DurableVideoArtifact:
     content_type: str
     size_bytes: int | None
     sha256: str | None
+    source_storage_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -243,9 +263,14 @@ def load_running_video_job(
     if job is None or job.status != GenerationJobStatus.running.value:
         return None
 
+    version = job.asset_version
+    asset = version.asset
     return VideoJobSnapshot(
         id=job.id,
         asset_version_id=job.asset_version_id,
+        campaign_id=asset.campaign_id,
+        asset_id=asset.id,
+        version_number=version.version_number,
         provider=job.provider,
         model=job.model,
         prompt=job.prompt,
@@ -253,7 +278,7 @@ def load_running_video_job(
         attempt_count=job.attempt_count,
         started_at=job.started_at,
         version_generation_metadata=copy.deepcopy(
-            job.asset_version.generation_metadata or {}
+            version.generation_metadata or {}
         ),
     )
 
@@ -364,6 +389,50 @@ def select_durable_video_artifact(
         content_type=video_content_type(artifact, filename),
         size_bytes=size_bytes,
         sha256=artifact.sha256,
+        source_storage_key=storage_key,
+    )
+
+
+def store_video_artifact(
+    *,
+    snapshot: VideoJobSnapshot,
+    artifact: DurableVideoArtifact,
+    storage: WorkerStorage,
+    max_size_bytes: int,
+) -> DurableVideoArtifact:
+    destination_key = build_asset_version_artifact_storage_key(
+        campaign_id=snapshot.campaign_id,
+        asset_id=snapshot.asset_id,
+        version_number=snapshot.version_number,
+        filename=artifact.filename,
+    )
+    source_storage_key = artifact.source_storage_key or artifact.storage_key
+    stored_object = storage.copy_object(
+        source_key=source_storage_key,
+        destination_key=destination_key,
+        content_type=artifact.content_type,
+        metadata={
+            "campaign_id": str(snapshot.campaign_id),
+            "asset_id": str(snapshot.asset_id),
+            "version_id": str(snapshot.asset_version_id),
+            "version_number": snapshot.version_number,
+            "generation_job_id": str(snapshot.id),
+            "content_kind": "asset-version-artifact",
+            "filename": artifact.filename,
+            "source": "genblaze",
+            "source_storage_key": source_storage_key,
+            "source_sha256": artifact.sha256,
+        },
+        max_size_bytes=max_size_bytes,
+    )
+
+    return DurableVideoArtifact(
+        storage_key=stored_object.key,
+        filename=artifact.filename,
+        content_type=stored_object.content_type,
+        size_bytes=stored_object.size,
+        sha256=artifact.sha256,
+        source_storage_key=source_storage_key,
     )
 
 
@@ -408,8 +477,11 @@ def build_completed_generation_metadata(
         "filename": artifact.filename,
         "content_type": artifact.content_type,
         "size_bytes": artifact.size_bytes,
-        "source": "genblaze_b2_sink",
-        "source_storage_key": artifact.storage_key,
+        "source": "genblaze_b2_server_side_copy",
+        "storage_strategy": "server_side_copy",
+        "source_storage_key": (
+            artifact.source_storage_key or artifact.storage_key
+        ),
         "source_sha256": artifact.sha256,
     }
     submission_provenance = snapshot.version_generation_metadata.get(
@@ -517,6 +589,7 @@ def safe_worker_error_message(exc: Exception) -> str:
         GenerationInputError,
         GenerationProviderError,
         StorageConfigurationError,
+        StorageOperationError,
         ValueError,
     )
     if isinstance(exc, expected_errors):
@@ -562,7 +635,7 @@ def execute_video_job(
     job_id: uuid.UUID,
     *,
     session_factory: SessionFactory,
-    storage: DownloadUrlSigner,
+    storage: WorkerStorage,
     generation: VideoGenerator,
     settings: Settings,
 ) -> bool:
@@ -596,8 +669,14 @@ def execute_video_job(
             context_assets=context_assets,
         )
     )
-    artifact = select_durable_video_artifact(
+    generated_artifact = select_durable_video_artifact(
         result,
+        max_size_bytes=settings.max_generated_video_size_bytes,
+    )
+    artifact = store_video_artifact(
+        snapshot=snapshot,
+        artifact=generated_artifact,
+        storage=storage,
         max_size_bytes=settings.max_generated_video_size_bytes,
     )
 
@@ -613,7 +692,7 @@ def execute_video_job(
 def run_worker_once(
     *,
     session_factory: SessionFactory = SessionLocal,
-    storage: DownloadUrlSigner | None = None,
+    storage: WorkerStorage | None = None,
     generation: VideoGenerator | None = None,
     settings: Settings | None = None,
 ) -> bool:
