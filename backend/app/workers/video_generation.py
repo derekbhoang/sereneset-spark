@@ -72,6 +72,16 @@ class WorkerStorage(DownloadUrlSigner, Protocol):
         max_size_bytes: int | None = None,
     ) -> StoredObject: ...
 
+    def upload_json(
+        self,
+        *,
+        key: str,
+        data: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+    ) -> StoredObject: ...
+
+    def delete_object(self, *, key: str) -> None: ...
+
 
 class VideoGenerator(Protocol):
     def generate_video(
@@ -104,6 +114,13 @@ class DurableVideoArtifact:
     size_bytes: int | None
     sha256: str | None
     source_storage_key: str | None = None
+
+
+@dataclass(frozen=True)
+class VideoProvenanceContext:
+    version_storage_key: str
+    campaign: dict[str, Any]
+    asset: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -283,6 +300,45 @@ def load_running_video_job(
     )
 
 
+def public_enum_value(value: object) -> object:
+    return getattr(value, "value", value)
+
+
+def load_video_provenance_context(
+    db: Session,
+    job_id: uuid.UUID,
+) -> VideoProvenanceContext | None:
+    job = db.get(GenerationJob, job_id)
+    if job is None or job.status != GenerationJobStatus.running.value:
+        return None
+
+    version = job.asset_version
+    asset = version.asset
+    campaign = asset.campaign
+    return VideoProvenanceContext(
+        version_storage_key=version.storage_key,
+        campaign={
+            "id": str(campaign.id),
+            "name": campaign.name,
+            "product": campaign.product,
+            "audience": campaign.audience,
+            "status": campaign.status,
+            "channels": list(campaign.channels),
+            "brand_inputs": list(campaign.brand_inputs),
+        },
+        asset={
+            "id": str(asset.id),
+            "title": asset.title,
+            "format": public_enum_value(asset.format),
+            "channel": asset.channel,
+            "status": public_enum_value(asset.status),
+            "reviewer": asset.reviewer,
+            "tags": list(asset.tags),
+            "summary": asset.summary,
+        },
+    )
+
+
 def job_asset_records(
     parameters: dict[str, Any],
     key: str,
@@ -453,6 +509,7 @@ def build_completed_generation_metadata(
     result: GenerationResult,
     artifact: DurableVideoArtifact,
     completed_at: datetime,
+    sidecar_storage_key: str | None = None,
 ) -> dict[str, Any]:
     source_inputs = job_asset_records(snapshot.parameters, "source_input_assets")
     context_assets = job_asset_records(snapshot.parameters, "context_assets")
@@ -482,12 +539,18 @@ def build_completed_generation_metadata(
         "source_storage_key": (
             artifact.source_storage_key or artifact.storage_key
         ),
+        "sha256": artifact.sha256,
         "source_sha256": artifact.sha256,
+    }
+    sidecar_record = {
+        "storage_key": sidecar_storage_key,
+        "content_type": "application/json",
     }
     submission_provenance = snapshot.version_generation_metadata.get(
         "provenance"
     )
     provenance: dict[str, Any] = {
+        "schema_version": 1,
         "provider": result.provider,
         "model": result.model,
         "prompt": result.prompt,
@@ -502,6 +565,7 @@ def build_completed_generation_metadata(
         "input_assets": input_assets,
         "assets": asset_records,
         "artifact_flow": artifact_flow,
+        "sidecar": sidecar_record,
         "job": job_record,
         "recorded_at": completed_at.isoformat(),
     }
@@ -511,6 +575,7 @@ def build_completed_generation_metadata(
     return {
         **snapshot.version_generation_metadata,
         **copy.deepcopy(result.generation_metadata),
+        "provenance_schema_version": 1,
         "provider": result.provider,
         "model": result.model,
         "prompt": result.prompt,
@@ -525,9 +590,116 @@ def build_completed_generation_metadata(
         "input_assets": input_assets,
         "assets": asset_records,
         "artifact_flow": artifact_flow,
+        "sidecar": sidecar_record,
         "job": job_record,
         "provenance": provenance,
     }
+
+
+def build_video_provenance_sidecar(
+    *,
+    context: VideoProvenanceContext,
+    snapshot: VideoJobSnapshot,
+    result: GenerationResult,
+    artifact: DurableVideoArtifact,
+    generation_metadata: dict[str, Any],
+    stored_at: datetime,
+) -> dict[str, object]:
+    input_assets = generation_metadata.get("input_assets")
+    if not isinstance(input_assets, list):
+        input_assets = []
+
+    return {
+        "campaign": copy.deepcopy(context.campaign),
+        "asset": copy.deepcopy(context.asset),
+        "version": {
+            "id": str(snapshot.asset_version_id),
+            "version_number": snapshot.version_number,
+            "label": f"Genblaze video {snapshot.version_number}",
+            "prompt": result.prompt,
+            "model": result.model,
+            "provider": result.provider,
+            "storage_key": context.version_storage_key,
+            "artifact_storage_key": artifact.storage_key,
+            "artifact_filename": artifact.filename,
+            "artifact_content_type": artifact.content_type,
+            "artifact_size_bytes": artifact.size_bytes,
+            "input_assets": copy.deepcopy(input_assets),
+            "generation_metadata": copy.deepcopy(generation_metadata),
+        },
+        "stored_at": stored_at.isoformat(),
+    }
+
+
+def upload_video_provenance_sidecar(
+    *,
+    storage: WorkerStorage,
+    context: VideoProvenanceContext,
+    snapshot: VideoJobSnapshot,
+    result: GenerationResult,
+    artifact: DurableVideoArtifact,
+    generation_metadata: dict[str, Any],
+    stored_at: datetime,
+) -> StoredObject:
+    expected_storage_key = normalize_storage_key(context.version_storage_key)
+    stored_object = storage.upload_json(
+        key=expected_storage_key,
+        data=build_video_provenance_sidecar(
+            context=context,
+            snapshot=snapshot,
+            result=result,
+            artifact=artifact,
+            generation_metadata=generation_metadata,
+            stored_at=stored_at,
+        ),
+        metadata={
+            "campaign_id": str(snapshot.campaign_id),
+            "asset_id": str(snapshot.asset_id),
+            "version_id": str(snapshot.asset_version_id),
+            "version_number": snapshot.version_number,
+            "generation_job_id": str(snapshot.id),
+            "provider": result.provider,
+            "model": result.model,
+            "manifest_hash": result.manifest_hash,
+            "content_kind": "asset-version-sidecar",
+        },
+    )
+    if stored_object.key != expected_storage_key:
+        raise StorageOperationError(
+            "B2 stored the provenance sidecar at an unexpected key"
+        )
+
+    return stored_object
+
+
+def cleanup_video_outputs(
+    *,
+    storage: WorkerStorage,
+    storage_keys: list[str | None],
+    protected_storage_keys: list[str | None] | None = None,
+) -> None:
+    protected_keys = {
+        normalize_storage_key(storage_key)
+        for storage_key in (protected_storage_keys or [])
+        if storage_key is not None
+    }
+    deleted_keys: set[str] = set()
+    for raw_storage_key in storage_keys:
+        if raw_storage_key is None:
+            continue
+
+        storage_key = normalize_storage_key(raw_storage_key)
+        if storage_key in deleted_keys or storage_key in protected_keys:
+            continue
+
+        try:
+            storage.delete_object(key=storage_key)
+            deleted_keys.add(storage_key)
+        except Exception:
+            logger.exception(
+                "Could not clean up incomplete video output %s",
+                storage_key,
+            )
 
 
 def finalize_video_job_success(
@@ -536,6 +708,8 @@ def finalize_video_job_success(
     snapshot: VideoJobSnapshot,
     result: GenerationResult,
     artifact: DurableVideoArtifact,
+    generation_metadata: dict[str, Any] | None = None,
+    sidecar_storage_key: str | None = None,
     completed_at: datetime | None = None,
 ) -> bool:
     finished_at = completed_at or utc_now()
@@ -560,11 +734,18 @@ def finalize_video_job_success(
         version.artifact_filename = artifact.filename
         version.artifact_content_type = artifact.content_type
         version.artifact_size_bytes = artifact.size_bytes
-        version.generation_metadata = build_completed_generation_metadata(
-            snapshot=snapshot,
-            result=result,
-            artifact=artifact,
-            completed_at=finished_at,
+        if sidecar_storage_key is not None:
+            version.storage_key = normalize_storage_key(sidecar_storage_key)
+        version.generation_metadata = copy.deepcopy(
+            generation_metadata
+            if generation_metadata is not None
+            else build_completed_generation_metadata(
+                snapshot=snapshot,
+                result=result,
+                artifact=artifact,
+                completed_at=finished_at,
+                sidecar_storage_key=sidecar_storage_key,
+            )
         )
         version.asset.updated_at = finished_at
 
@@ -681,12 +862,64 @@ def execute_video_job(
     )
 
     with session_factory() as db:
-        return finalize_video_job_success(
-            db,
+        provenance_context = load_video_provenance_context(db, job_id)
+
+    if provenance_context is None:
+        cleanup_video_outputs(
+            storage=storage,
+            storage_keys=[artifact.storage_key],
+            protected_storage_keys=[artifact.source_storage_key],
+        )
+        return False
+
+    completed_at = utc_now()
+    generation_metadata = build_completed_generation_metadata(
+        snapshot=snapshot,
+        result=result,
+        artifact=artifact,
+        completed_at=completed_at,
+        sidecar_storage_key=provenance_context.version_storage_key,
+    )
+
+    try:
+        sidecar = upload_video_provenance_sidecar(
+            storage=storage,
+            context=provenance_context,
             snapshot=snapshot,
             result=result,
             artifact=artifact,
+            generation_metadata=generation_metadata,
+            stored_at=completed_at,
         )
+        with session_factory() as db:
+            finalized = finalize_video_job_success(
+                db,
+                snapshot=snapshot,
+                result=result,
+                artifact=artifact,
+                generation_metadata=generation_metadata,
+                sidecar_storage_key=sidecar.key,
+                completed_at=completed_at,
+            )
+    except Exception:
+        cleanup_video_outputs(
+            storage=storage,
+            storage_keys=[
+                artifact.storage_key,
+                provenance_context.version_storage_key,
+            ],
+            protected_storage_keys=[artifact.source_storage_key],
+        )
+        raise
+
+    if not finalized:
+        cleanup_video_outputs(
+            storage=storage,
+            storage_keys=[artifact.storage_key, sidecar.key],
+            protected_storage_keys=[artifact.source_storage_key],
+        )
+
+    return finalized
 
 
 def run_worker_once(

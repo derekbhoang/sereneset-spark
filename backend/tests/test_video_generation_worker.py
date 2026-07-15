@@ -16,15 +16,19 @@ from app.services.storage import StoredObject
 from app.workers.video_generation import (
     DurableVideoArtifact,
     VideoJobSnapshot,
+    VideoProvenanceContext,
     build_completed_generation_metadata,
+    build_video_provenance_sidecar,
     build_video_job_claim_statement,
     claim_next_video_job,
+    cleanup_video_outputs,
     finalize_video_job_success,
     mark_video_job_failed,
     prepare_source_input_assets,
     recover_stale_video_jobs,
     select_durable_video_artifact,
     store_video_artifact,
+    upload_video_provenance_sidecar,
 )
 
 
@@ -263,21 +267,25 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             },
         )
         artifact = DurableVideoArtifact(
-            storage_key="sereneset-spark/genblaze/generated.mp4",
+            storage_key="campaigns/video/artifact/generated.mp4",
             filename="generated.mp4",
             content_type="video/mp4",
             size_bytes=4096,
             sha256="a" * 64,
+            source_storage_key="sereneset-spark/genblaze/generated.mp4",
         )
+        sidecar_storage_key = "campaigns/video/metadata.json"
 
         metadata = build_completed_generation_metadata(
             snapshot=snapshot,
             result=make_result(),
             artifact=artifact,
             completed_at=completed_at,
+            sidecar_storage_key=sidecar_storage_key,
         )
 
         self.assertEqual(metadata["job"]["status"], "succeeded")
+        self.assertEqual(metadata["provenance_schema_version"], 1)
         self.assertEqual(metadata["input_mode"], "image_to_video")
         self.assertEqual(metadata["input_assets"], [source_record])
         self.assertNotIn("url", metadata["input_assets"][0])
@@ -289,9 +297,90 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             metadata["artifact_flow"]["storage_strategy"],
             "server_side_copy",
         )
+        self.assertEqual(
+            metadata["artifact_flow"]["source_storage_key"],
+            artifact.source_storage_key,
+        )
+        self.assertEqual(
+            metadata["artifact_flow"]["sha256"],
+            artifact.sha256,
+        )
+        self.assertEqual(
+            metadata["sidecar"]["storage_key"],
+            sidecar_storage_key,
+        )
+        self.assertEqual(metadata["provenance"]["schema_version"], 1)
         self.assertIn(
             "submission_provenance",
             metadata["provenance"],
+        )
+
+        context = VideoProvenanceContext(
+            version_storage_key=sidecar_storage_key,
+            campaign={
+                "id": str(snapshot.campaign_id),
+                "name": "Launch",
+                "product": "Product",
+                "audience": "Audience",
+                "status": "drafting",
+                "channels": ["Paid social"],
+                "brand_inputs": [],
+            },
+            asset={
+                "id": str(snapshot.asset_id),
+                "title": "Launch video",
+                "format": "video_concept",
+                "channel": "Paid social",
+                "status": "draft",
+                "reviewer": None,
+                "tags": ["video"],
+                "summary": "Video draft",
+            },
+        )
+        sidecar = build_video_provenance_sidecar(
+            context=context,
+            snapshot=snapshot,
+            result=make_result(),
+            artifact=artifact,
+            generation_metadata=metadata,
+            stored_at=completed_at,
+        )
+
+        self.assertEqual(sidecar["campaign"], context.campaign)
+        self.assertEqual(sidecar["asset"], context.asset)
+        self.assertEqual(
+            sidecar["version"]["generation_metadata"],
+            metadata,
+        )
+        self.assertEqual(
+            sidecar["version"]["artifact_storage_key"],
+            artifact.storage_key,
+        )
+        self.assertEqual(sidecar["stored_at"], completed_at.isoformat())
+
+        storage = MagicMock()
+        storage.upload_json.return_value = StoredObject(
+            bucket="test-bucket",
+            key=sidecar_storage_key,
+            content_type="application/json",
+            size=2048,
+        )
+        stored_sidecar = upload_video_provenance_sidecar(
+            storage=storage,
+            context=context,
+            snapshot=snapshot,
+            result=make_result(),
+            artifact=artifact,
+            generation_metadata=metadata,
+            stored_at=completed_at,
+        )
+
+        self.assertEqual(stored_sidecar.key, sidecar_storage_key)
+        upload_args = storage.upload_json.call_args.kwargs
+        self.assertEqual(upload_args["data"], sidecar)
+        self.assertEqual(
+            upload_args["metadata"]["manifest_hash"],
+            "manifest-hash",
         )
 
     def test_finalizes_version_and_job_in_one_commit(self) -> None:
@@ -321,12 +410,16 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         )
         db = MagicMock()
         db.scalar.return_value = job
+        final_metadata = {"finalized": True}
+        sidecar_storage_key = "campaigns/test/final-metadata.json"
 
         finalized = finalize_video_job_success(
             db,
             snapshot=snapshot,
             result=make_result(),
             artifact=artifact,
+            generation_metadata=final_metadata,
+            sidecar_storage_key=sidecar_storage_key,
             completed_at=completed_at,
         )
 
@@ -339,9 +432,10 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             artifact.storage_key,
         )
         self.assertEqual(
-            job.asset_version.generation_metadata["job"]["status"],
-            "succeeded",
+            job.asset_version.generation_metadata,
+            final_metadata,
         )
+        self.assertEqual(job.asset_version.storage_key, sidecar_storage_key)
         db.commit.assert_called_once_with()
 
     def test_stores_video_with_b2_server_side_copy(self) -> None:
@@ -404,6 +498,29 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         self.assertEqual(copy_args["max_size_bytes"], 500 * 1024 * 1024)
         self.assertEqual(copy_args["metadata"]["generation_job_id"], str(job_id))
         storage.download_bytes.assert_not_called()
+
+    def test_cleanup_deletes_only_campaign_owned_keys_once(self) -> None:
+        storage = MagicMock()
+
+        cleanup_video_outputs(
+            storage=storage,
+            storage_keys=[
+                "campaigns/video/artifact.mp4",
+                "campaigns/video/metadata.json",
+                "campaigns/video/artifact.mp4",
+                "genblaze/source.mp4",
+                None,
+            ],
+            protected_storage_keys=["genblaze/source.mp4"],
+        )
+
+        self.assertEqual(storage.delete_object.call_count, 2)
+        storage.delete_object.assert_any_call(
+            key="campaigns/video/artifact.mp4"
+        )
+        storage.delete_object.assert_any_call(
+            key="campaigns/video/metadata.json"
+        )
 
     def test_failure_is_safely_persisted(self) -> None:
         failed_at = datetime(2026, 7, 15, 5, 0, tzinfo=UTC)
