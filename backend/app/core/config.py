@@ -46,6 +46,23 @@ class Settings(BaseSettings):
         alias="MAX_GENERATED_VIDEO_SIZE_BYTES",
         ge=1,
     )
+    generation_worker_poll_seconds: float = Field(
+        default=2.0,
+        alias="GENERATION_WORKER_POLL_SECONDS",
+        ge=0.1,
+        le=60,
+    )
+    generation_job_stale_after_seconds: int = Field(
+        default=1800,
+        alias="GENERATION_JOB_STALE_AFTER_SECONDS",
+        ge=60,
+    )
+    generation_job_max_attempts: int = Field(
+        default=2,
+        alias="GENERATION_JOB_MAX_ATTEMPTS",
+        ge=1,
+        le=10,
+    )
     genblaze_storage_prefix: str = Field(
         default="sereneset-spark/genblaze",
         alias="GENBLAZE_STORAGE_PREFIX",
