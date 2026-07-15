@@ -4,22 +4,39 @@ import unittest
 import uuid
 from datetime import UTC, datetime
 from io import BytesIO
-from zipfile import ZipFile
+from zipfile import ZIP_STORED, ZipFile
 
 from app.api.v1.routes.campaigns import make_campaign_export_zip
+from app.models.asset import Asset, AssetFormat, AssetVersion, ReviewStatus
 from app.models.brand_asset import BrandAsset, BrandAssetType, CampaignBrandAsset
 from app.models.campaign import Campaign
-from app.services.storage import B2StorageService
+from app.services.storage import B2StorageService, StorageObjectTooLargeError
 
 
 class StubStorage(B2StorageService):
     def __init__(self, objects: dict[str, bytes]) -> None:
         self.objects = objects
         self.downloads: list[str] = []
+        self.streams: list[str] = []
 
     def download_bytes(self, *, key: str) -> bytes:
         self.downloads.append(key)
         return self.objects[key]
+
+    def iter_download_chunks(
+        self,
+        *,
+        key: str,
+        chunk_size_bytes: int,
+        max_size_bytes: int | None = None,
+    ):
+        self.streams.append(key)
+        body = self.objects[key]
+        if max_size_bytes is not None and len(body) > max_size_bytes:
+            raise StorageObjectTooLargeError("configured size limit")
+
+        for offset in range(0, len(body), chunk_size_bytes):
+            yield body[offset : offset + chunk_size_bytes]
 
 
 def make_campaign() -> Campaign:
@@ -78,6 +95,49 @@ def attach(
         created_at=datetime.now(UTC),
         brand_asset=brand_asset,
     )
+
+
+def add_approved_video(
+    *,
+    campaign: Campaign,
+    body: bytes,
+) -> AssetVersion:
+    now = datetime.now(UTC)
+    asset_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    version = AssetVersion(
+        id=version_id,
+        asset_id=asset_id,
+        version_number=1,
+        label="Genblaze video 1",
+        prompt="Show the product in motion",
+        model="Veo3-Fast",
+        provider="gmicloud",
+        storage_key=f"campaigns/{campaign.id}/metadata.json",
+        artifact_storage_key=f"campaigns/{campaign.id}/video.mp4",
+        artifact_filename="launch-video.mp4",
+        artifact_content_type="video/mp4",
+        artifact_size_bytes=len(body),
+        generation_metadata={"source": "backend_genblaze_video_worker"},
+    )
+    version.inputs = []
+    asset = Asset(
+        id=asset_id,
+        campaign_id=campaign.id,
+        created_at=now,
+        updated_at=now,
+        title="Launch video",
+        format=AssetFormat.video_concept,
+        channel="Paid social",
+        status=ReviewStatus.approved,
+        reviewer=None,
+        tags=["video"],
+        summary="Approved generated video",
+    )
+    asset.versions = [version]
+    campaign.assets = [asset]
+    campaign.brand_asset_links = []
+    return version
 
 
 class CampaignBrandAssetExportTests(unittest.TestCase):
@@ -157,6 +217,38 @@ class CampaignBrandAssetExportTests(unittest.TestCase):
         self.assertIsNone(brand_record["zip_path"])
         self.assertFalse(brand_record["integrity_verified"])
         self.assertIsNotNone(brand_record["export_error"])
+
+
+class CampaignVideoExportTests(unittest.TestCase):
+    def test_streams_video_into_an_uncompressed_zip_entry(self) -> None:
+        video_body = b"video-data" * 220_000
+        campaign = make_campaign()
+        version = add_approved_video(campaign=campaign, body=video_body)
+        storage = StubStorage(
+            {
+                version.storage_key: b'{"stored":true}',
+                version.artifact_storage_key: video_body,
+            }
+        )
+
+        archive = make_campaign_export_zip(
+            campaign=campaign,
+            storage=storage,
+            max_video_artifact_size_bytes=len(video_body),
+        )
+
+        with ZipFile(BytesIO(archive)) as export_zip:
+            manifest = json.loads(export_zip.read("manifest.json"))
+            artifact_path = manifest["assets"][0]["versions"][0][
+                "artifact_zip_path"
+            ]
+            artifact_info = export_zip.getinfo(artifact_path)
+            exported_video = export_zip.read(artifact_path)
+
+        self.assertEqual(exported_video, video_body)
+        self.assertEqual(artifact_info.compress_type, ZIP_STORED)
+        self.assertEqual(storage.streams, [version.artifact_storage_key])
+        self.assertNotIn(version.artifact_storage_key, storage.downloads)
 
 
 if __name__ == "__main__":

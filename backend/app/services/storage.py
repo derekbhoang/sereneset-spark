@@ -1,6 +1,7 @@
 import json
 import re
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import PurePosixPath
@@ -23,6 +24,9 @@ class StorageOperationError(RuntimeError):
 
 class StorageObjectTooLargeError(StorageOperationError):
     pass
+
+
+DEFAULT_DOWNLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -396,6 +400,74 @@ class B2StorageService:
 
         try:
             return body.read()
+        finally:
+            body.close()
+
+    def iter_download_chunks(
+        self,
+        *,
+        key: str,
+        chunk_size_bytes: int = DEFAULT_DOWNLOAD_CHUNK_SIZE_BYTES,
+        max_size_bytes: int | None = None,
+    ) -> Iterator[bytes]:
+        if chunk_size_bytes < 1:
+            raise ValueError("Download chunk size must be greater than zero")
+
+        if max_size_bytes is not None and max_size_bytes < 1:
+            raise ValueError("Maximum object size must be greater than zero")
+
+        storage_key = normalize_storage_key(key)
+        response = self.client.get_object(Bucket=self.bucket_name, Key=storage_key)
+        body = response["Body"]
+
+        try:
+            content_length = response.get("ContentLength")
+            if (
+                not isinstance(content_length, int)
+                or isinstance(content_length, bool)
+                or content_length < 0
+            ):
+                raise StorageOperationError(
+                    "B2 did not return a valid object size"
+                )
+
+            if content_length == 0:
+                raise StorageOperationError("B2 object is empty")
+
+            if (
+                max_size_bytes is not None
+                and content_length > max_size_bytes
+            ):
+                raise StorageObjectTooLargeError(
+                    "B2 object exceeds the configured size limit"
+                )
+
+            downloaded_bytes = 0
+            while True:
+                chunk = body.read(chunk_size_bytes)
+                if not chunk:
+                    break
+
+                if not isinstance(chunk, bytes):
+                    raise StorageOperationError(
+                        "B2 returned a non-binary response body"
+                    )
+
+                downloaded_bytes += len(chunk)
+                if (
+                    max_size_bytes is not None
+                    and downloaded_bytes > max_size_bytes
+                ):
+                    raise StorageObjectTooLargeError(
+                        "B2 object exceeds the configured size limit"
+                    )
+
+                yield chunk
+
+            if downloaded_bytes != content_length:
+                raise StorageOperationError(
+                    "B2 response size did not match its content length"
+                )
         finally:
             body.close()
 

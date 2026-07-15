@@ -7,10 +7,10 @@ import {
 } from 'react'
 import {
   attachBrandAssetToCampaign,
+  cancelCampaignGenerationJob,
   createCampaign,
   deleteCampaign,
   detachBrandAssetFromCampaign,
-  exportCampaignPack,
   fetchBrandAssetDownloadUrl,
   fetchBrandAssets,
   fetchAsset,
@@ -18,11 +18,15 @@ import {
   fetchAssetVersionDownloadUrl,
   fetchCampaignAssets,
   fetchCampaignBrandAssets,
+  fetchCampaignGenerationJobs,
   fetchCampaigns,
   generateAssetVersion,
   generateAssetVersionWithInputs,
   generateCampaignAsset,
   generateCampaignAssetWithInputs,
+  getCampaignExportUrl,
+  retryCampaignGenerationJob,
+  submitVideoGeneration,
   updateAssetStatus as patchAssetStatus,
   uploadBrandAsset,
   uploadAssetVersionArtifact,
@@ -36,9 +40,14 @@ import {
   type BrandAssetType,
   type CampaignDto,
   type CampaignBrandAssetDto,
+  type GenerationJobDto,
+  type GenerationJobStatus,
   type GenerationInputFile,
   type GenerationInputRole,
   type ReviewStatus,
+  type VideoAspectRatio,
+  type VideoGenerationCreateDto,
+  type VideoResolution,
 } from './api'
 import './App.css'
 
@@ -151,6 +160,11 @@ type BrandAssetFormState = {
   sourceUrl: string
 }
 
+type VideoSourceOption = {
+  versionId: string
+  label: string
+}
+
 const defaultPrompt =
   'Generate a composed launch asset that keeps the product central and uses calm, benefit-led messaging.'
 
@@ -240,9 +254,27 @@ const referenceRoleLabels: Record<GenerationInputRole, string> = {
   avoid_reference: 'Avoid reference',
 }
 
+const videoAspectRatios: VideoAspectRatio[] = ['16:9', '9:16', '1:1']
+const videoResolutions: VideoResolution[] = ['720p', '1080p']
+const generationJobStatusLabels: Record<GenerationJobStatus, string> = {
+  queued: 'Queued',
+  running: 'Generating',
+  succeeded: 'Ready',
+  failed: 'Failed',
+  canceled: 'Canceled',
+}
+
 const maxReferenceImageCount = 5
 const maxReferenceImageSizeBytes = 25 * 1024 * 1024
 const allowedReferenceImageTypes = ['image/png', 'image/jpeg', 'image/webp']
+
+function isActiveGenerationJobStatus(status: GenerationJobStatus): boolean {
+  return status === 'queued' || status === 'running'
+}
+
+function isRetryableGenerationJobStatus(status: GenerationJobStatus): boolean {
+  return status === 'failed' || status === 'canceled'
+}
 
 function formatDueDate(value: string | null): string {
   if (!value) {
@@ -312,6 +344,29 @@ function getFileExtension(filename: string | null): string {
   }
 
   return extension.slice(0, 5).toLowerCase()
+}
+
+function isEligibleVideoSourceVersion(version: AssetVersion): boolean {
+  if (
+    !version.artifactStorageKey ||
+    !version.artifactFilename ||
+    !version.artifactSizeBytes ||
+    version.artifactSizeBytes > maxReferenceImageSizeBytes
+  ) {
+    return false
+  }
+
+  const contentType = version.artifactContentType
+    ?.split(';', 1)[0]
+    .trim()
+    .toLowerCase()
+
+  return (
+    (contentType ? allowedReferenceImageTypes.includes(contentType) : false) ||
+    ['jpg', 'jpeg', 'png', 'webp'].includes(
+      getFileExtension(version.artifactFilename),
+    )
+  )
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -400,6 +455,40 @@ function isImageDescriptor(
   }
 
   return /\.(avif|gif|jpe?g|png|webp)$/i.test(filename ?? url ?? '')
+}
+
+function getVideoContentType(
+  contentType: string | null,
+  filename: string | null,
+): string | null {
+  const normalizedContentType = contentType
+    ?.split(';', 1)[0]
+    .trim()
+    .toLowerCase()
+
+  if (
+    normalizedContentType &&
+    ['video/mp4', 'video/quicktime', 'video/webm'].includes(
+      normalizedContentType,
+    )
+  ) {
+    return normalizedContentType
+  }
+
+  const extension = getFileExtension(filename)
+  if (extension === 'webm') {
+    return 'video/webm'
+  }
+
+  if (extension === 'mov') {
+    return 'video/quicktime'
+  }
+
+  if (extension === 'mp4' || extension === 'm4v') {
+    return 'video/mp4'
+  }
+
+  return null
 }
 
 function getGeneratedPreview(
@@ -516,7 +605,17 @@ function hasImageArtifact(version: AssetVersion): boolean {
     return true
   }
 
-  return Boolean(version.artifactStorageKey && generatedPreview)
+  return false
+}
+
+function hasVideoArtifact(version: AssetVersion): boolean {
+  return Boolean(
+    version.artifactStorageKey &&
+      getVideoContentType(
+        version.artifactContentType,
+        version.artifactFilename,
+      ),
+  )
 }
 
 function getAssetCardPreviewVersion(asset: Asset): AssetVersion | null {
@@ -538,6 +637,21 @@ function sortVersionsNewestFirst(versions: AssetVersion[]): AssetVersion[] {
     (firstVersion, secondVersion) =>
       secondVersion.versionNumber - firstVersion.versionNumber,
   )
+}
+
+function getAssetGenerationJob(
+  asset: Asset,
+  jobsByVersionId: Map<string, GenerationJobDto>,
+): GenerationJobDto | null {
+  for (const version of sortVersionsNewestFirst(asset.versions)) {
+    const job = jobsByVersionId.get(version.versionId)
+
+    if (job) {
+      return job
+    }
+  }
+
+  return null
 }
 
 function getImagePreviewUrl(
@@ -603,6 +717,10 @@ function previewForAsset(format: AssetFormat, channel: string): PreviewName {
 
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong'
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError'
 }
 
 function splitCommaList(value: string): string[] {
@@ -776,17 +894,26 @@ function App() {
   const [requestFormat, setRequestFormat] = useState<AssetFormat>('Image')
   const [requestChannel, setRequestChannel] = useState('')
   const [requestPrompt, setRequestPrompt] = useState(defaultPrompt)
+  const [videoDurationSeconds, setVideoDurationSeconds] = useState(4)
+  const [videoAspectRatio, setVideoAspectRatio] =
+    useState<VideoAspectRatio>('16:9')
+  const [videoResolution, setVideoResolution] =
+    useState<VideoResolution>('720p')
+  const [videoSourceVersionId, setVideoSourceVersionId] = useState('')
   const [isLoadingCampaigns, setIsLoadingCampaigns] = useState(true)
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
+  const [isLoadingGenerationJobs, setIsLoadingGenerationJobs] = useState(false)
   const [isCreateCampaignOpen, setIsCreateCampaignOpen] = useState(false)
   const [isBrandAssetModalOpen, setIsBrandAssetModalOpen] = useState(false)
   const [isCreatingCampaign, setIsCreatingCampaign] = useState(false)
   const [isLoadingBrandAssets, setIsLoadingBrandAssets] = useState(false)
   const [isUploadingBrandAsset, setIsUploadingBrandAsset] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
-  const [isExporting, setIsExporting] = useState(false)
   const [isSavingStatus, setIsSavingStatus] = useState(false)
   const [isRefining, setIsRefining] = useState(false)
+  const [generationJobActionId, setGenerationJobActionId] = useState<
+    string | null
+  >(null)
   const [deletingCampaignId, setDeletingCampaignId] = useState<string | null>(
     null,
   )
@@ -844,7 +971,13 @@ function App() {
   const [refineReferenceImages, setRefineReferenceImages] = useState<
     Record<string, ReferenceImage[]>
   >({})
+  const [generationJobs, setGenerationJobs] = useState<GenerationJobDto[]>([])
+  const [generationJobsCampaignId, setGenerationJobsCampaignId] = useState('')
+  const [generationJobsError, setGenerationJobsError] = useState<string | null>(
+    null,
+  )
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const generationJobsRef = useRef<GenerationJobDto[]>([])
   const generationReferenceImagesRef = useRef<ReferenceImage[]>([])
   const refineReferenceImagesRef = useRef<Record<string, ReferenceImage[]>>({})
   const brandAssetFileInputRef = useRef<HTMLInputElement>(null)
@@ -993,6 +1126,57 @@ function App() {
   }, [selectedCampaignId])
 
   useEffect(() => {
+    const controller = new AbortController()
+    let isCancelled = false
+
+    generationJobsRef.current = []
+    setGenerationJobs([])
+    setGenerationJobsCampaignId(selectedCampaignId)
+    setGenerationJobsError(null)
+    setVideoSourceVersionId('')
+
+    async function loadGenerationJobs(campaignId: string) {
+      setIsLoadingGenerationJobs(true)
+
+      try {
+        const jobs = await fetchCampaignGenerationJobs(
+          campaignId,
+          { limit: 200 },
+          controller.signal,
+        )
+
+        if (isCancelled) {
+          return
+        }
+
+        generationJobsRef.current = jobs
+        setGenerationJobs(jobs)
+      } catch (error) {
+        if (!isCancelled && !isAbortError(error)) {
+          setGenerationJobsError(
+            `Could not load video jobs: ${getErrorMessage(error)}`,
+          )
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingGenerationJobs(false)
+        }
+      }
+    }
+
+    if (selectedCampaignId) {
+      void loadGenerationJobs(selectedCampaignId)
+    } else {
+      setIsLoadingGenerationJobs(false)
+    }
+
+    return () => {
+      isCancelled = true
+      controller.abort()
+    }
+  }, [selectedCampaignId])
+
+  useEffect(() => {
     let isCancelled = false
 
     async function loadBrandAssets(campaignId: string) {
@@ -1092,6 +1276,46 @@ function App() {
 
   const campaignAssets = assets
 
+  const currentGenerationJobs = useMemo(
+    () =>
+      generationJobsCampaignId === selectedCampaignId ? generationJobs : [],
+    [generationJobs, generationJobsCampaignId, selectedCampaignId],
+  )
+  const generationJobsByVersionId = useMemo(
+    () =>
+      new Map(
+        currentGenerationJobs.map((job) => [job.asset_version_id, job]),
+      ),
+    [currentGenerationJobs],
+  )
+  const hasActiveGenerationJobs = currentGenerationJobs.some((job) =>
+    isActiveGenerationJobStatus(job.status),
+  )
+  const videoSourceOptions = useMemo<VideoSourceOption[]>(() => {
+    const options: VideoSourceOption[] = []
+
+    for (const asset of campaignAssets) {
+      if (asset.format !== 'Image') {
+        continue
+      }
+
+      for (const version of sortVersionsNewestFirst(asset.versions)) {
+        if (!isEligibleVideoSourceVersion(version)) {
+          continue
+        }
+
+        options.push({
+          versionId: version.versionId,
+          label: `${asset.title} / v${version.versionNumber} / ${
+            version.artifactFilename ?? 'image'
+          }`,
+        })
+      }
+    }
+
+    return options
+  }, [campaignAssets])
+
   const channels = useMemo(
     () => ['All', ...(selectedCampaign?.channels ?? [])],
     [selectedCampaign],
@@ -1121,6 +1345,9 @@ function App() {
   )
   const latestSelectedVersion = selectedVersions[0] ?? null
   const previousSelectedVersions = selectedVersions.slice(1)
+  const selectedGenerationJob = latestSelectedVersion
+    ? (generationJobsByVersionId.get(latestSelectedVersion.versionId) ?? null)
+    : null
   const selectedRefineReferenceImages = selectedAsset
     ? (refineReferenceImages[selectedAsset.id] ?? [])
     : []
@@ -1134,13 +1361,130 @@ function App() {
   ).length
 
   useEffect(() => {
+    setVideoSourceVersionId((currentVersionId) =>
+      currentVersionId &&
+      !videoSourceOptions.some(
+        (option) => option.versionId === currentVersionId,
+      )
+        ? ''
+        : currentVersionId,
+    )
+  }, [videoSourceOptions])
+
+  useEffect(() => {
+    if (
+      !selectedCampaignId ||
+      generationJobsCampaignId !== selectedCampaignId ||
+      !hasActiveGenerationJobs
+    ) {
+      return
+    }
+
+    const campaignId = selectedCampaignId
+    let isCancelled = false
+    let pollTimer: number | null = null
+    let requestController: AbortController | null = null
+
+    async function pollGenerationJobs() {
+      let shouldContinuePolling = true
+      const controller = new AbortController()
+      requestController = controller
+
+      try {
+        const nextJobs = await fetchCampaignGenerationJobs(
+          campaignId,
+          { limit: 200 },
+          controller.signal,
+        )
+
+        if (isCancelled) {
+          return
+        }
+
+        const previousStatuses = new Map(
+          generationJobsRef.current.map((job) => [job.id, job.status]),
+        )
+        const hasTerminalTransition = nextJobs.some((job) => {
+          const previousStatus = previousStatuses.get(job.id)
+
+          return (
+            previousStatus !== undefined &&
+            isActiveGenerationJobStatus(previousStatus) &&
+            !isActiveGenerationJobStatus(job.status)
+          )
+        })
+
+        generationJobsRef.current = nextJobs
+        setGenerationJobs(nextJobs)
+        setGenerationJobsError(null)
+        shouldContinuePolling = nextJobs.some((job) =>
+          isActiveGenerationJobStatus(job.status),
+        )
+
+        if (hasTerminalTransition) {
+          const assetDtos = await fetchCampaignAssets(campaignId)
+
+          if (isCancelled) {
+            return
+          }
+
+          const nextAssets = assetDtos.map(mapAsset)
+          setAssets(nextAssets)
+          setSelectedAssetId((currentAssetId) =>
+            currentAssetId &&
+            nextAssets.some((asset) => asset.id === currentAssetId)
+              ? currentAssetId
+              : (nextAssets[0]?.id ?? ''),
+          )
+        }
+      } catch (error) {
+        if (!isCancelled && !isAbortError(error)) {
+          setGenerationJobsError(
+            `Could not refresh video jobs: ${getErrorMessage(error)}`,
+          )
+        }
+      } finally {
+        if (requestController === controller) {
+          requestController = null
+        }
+
+        if (!isCancelled && shouldContinuePolling) {
+          const delay = document.visibilityState === 'hidden' ? 10000 : 2500
+          pollTimer = window.setTimeout(() => {
+            void pollGenerationJobs()
+          }, delay)
+        }
+      }
+    }
+
+    pollTimer = window.setTimeout(() => {
+      void pollGenerationJobs()
+    }, 1000)
+
+    return () => {
+      isCancelled = true
+      requestController?.abort()
+
+      if (pollTimer !== null) {
+        window.clearTimeout(pollTimer)
+      }
+    }
+  }, [
+    generationJobsCampaignId,
+    hasActiveGenerationJobs,
+    selectedCampaignId,
+  ])
+
+  useEffect(() => {
     let isCancelled = false
 
     async function loadArtifactPreviews(asset: Asset) {
-      const imageVersions = asset.versions.filter(hasImageArtifact)
+      const previewableVersions = asset.versions.filter(
+        (version) => hasImageArtifact(version) || hasVideoArtifact(version),
+      )
 
       await Promise.all(
-        imageVersions.map(async (version) => {
+        previewableVersions.map(async (version) => {
           if (!version.artifactStorageKey) {
             return
           }
@@ -1746,31 +2090,21 @@ function App() {
     }
   }
 
-  async function downloadCampaignExport() {
+  function downloadCampaignExport() {
     if (!selectedCampaign) {
       return
     }
 
-    setIsExporting(true)
     setErrorMessage(null)
+    const link = document.createElement('a')
 
-    try {
-      const download = await exportCampaignPack(selectedCampaign.id)
-      const url = URL.createObjectURL(download.blob)
-      const link = document.createElement('a')
-
-      link.href = url
-      link.download = download.filename
-      link.style.display = 'none'
-      document.body.append(link)
-      link.click()
-      link.remove()
-      window.setTimeout(() => URL.revokeObjectURL(url), 0)
-    } catch (error) {
-      setErrorMessage(getErrorMessage(error))
-    } finally {
-      setIsExporting(false)
-    }
+    link.href = getCampaignExportUrl(selectedCampaign.id)
+    link.download = ''
+    link.rel = 'noopener'
+    link.style.display = 'none'
+    document.body.append(link)
+    link.click()
+    link.remove()
   }
 
   async function refreshAsset(assetId: string): Promise<Asset> {
@@ -1810,7 +2144,9 @@ function App() {
   }
 
   async function generateAsset() {
-    if (!selectedCampaign || !requestChannel) {
+    const trimmedPrompt = requestPrompt.trim()
+
+    if (!selectedCampaign || !requestChannel || !trimmedPrompt) {
       return
     }
 
@@ -1820,34 +2156,73 @@ function App() {
     setErrorMessage(null)
 
     try {
-      const assetPayload: AssetGenerationCreateDto = {
-        title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
-        format: formatValue,
-        channel: requestChannel,
-        prompt: requestPrompt,
-        status: 'draft',
-        reviewer: null,
-        tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
-        summary:
-          'A Genblaze-generated creative direction with durable B2 storage and provenance metadata.',
-        generation_parameters: {
-          campaign_name: selectedCampaign.name,
-          product: selectedCampaign.product,
-          audience: selectedCampaign.audience,
+      let createdAssetDto: AssetDto
+
+      if (requestFormat === 'Video concept') {
+        const videoPayload: VideoGenerationCreateDto = {
+          title: `${requestChannel} video draft`,
+          channel: requestChannel,
+          prompt: trimmedPrompt,
+          status: 'draft',
+          reviewer: null,
+          tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
+          summary:
+            'A queued Genblaze video with durable B2 storage and provenance metadata.',
+          duration_seconds: Math.min(
+            20,
+            Math.max(2, Math.round(videoDurationSeconds)),
+          ),
+          aspect_ratio: videoAspectRatio,
+          resolution: videoResolution,
+          source_version_id: videoSourceVersionId || null,
+        }
+        const submission = await submitVideoGeneration(
+          selectedCampaign.id,
+          videoPayload,
+        )
+        const existingJobs =
+          generationJobsCampaignId === selectedCampaign.id
+            ? generationJobsRef.current
+            : []
+        const nextJobs = [
+          submission.job,
+          ...existingJobs.filter((job) => job.id !== submission.job.id),
+        ]
+
+        createdAssetDto = submission.asset
+        generationJobsRef.current = nextJobs
+        setGenerationJobsCampaignId(selectedCampaign.id)
+        setGenerationJobs(nextJobs)
+        setGenerationJobsError(null)
+      } else {
+        const assetPayload: AssetGenerationCreateDto = {
+          title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
           format: formatValue,
           channel: requestChannel,
-        },
+          prompt: trimmedPrompt,
+          status: 'draft',
+          reviewer: null,
+          tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
+          summary:
+            'A Genblaze-generated creative direction with durable B2 storage and provenance metadata.',
+          generation_parameters: {
+            campaign_name: selectedCampaign.name,
+            product: selectedCampaign.product,
+            audience: selectedCampaign.audience,
+            format: formatValue,
+            channel: requestChannel,
+          },
+        }
+        createdAssetDto = generationReferenceImages.length
+          ? await generateCampaignAssetWithInputs(
+              selectedCampaign.id,
+              assetPayload,
+              referenceImagesToGenerationInputs(generationReferenceImages),
+            )
+          : await generateCampaignAsset(selectedCampaign.id, assetPayload)
       }
-      const createdAssetDto = generationReferenceImages.length
-        ? await generateCampaignAssetWithInputs(
-            selectedCampaign.id,
-            assetPayload,
-            referenceImagesToGenerationInputs(generationReferenceImages),
-          )
-        : await generateCampaignAsset(selectedCampaign.id, assetPayload)
-      const createdAsset = mapAsset(
-        createdAssetDto,
-      )
+
+      const createdAsset = mapAsset(createdAssetDto)
       setAssets((currentAssets) => [
         createdAsset,
         ...currentAssets.filter((asset) => asset.id !== createdAsset.id),
@@ -1855,11 +2230,92 @@ function App() {
       setSelectedAssetId(createdAsset.id)
       setStatusFilter('all')
       setChannelFilter('All')
-      clearGenerationReferenceImages()
+
+      if (requestFormat !== 'Video concept') {
+        clearGenerationReferenceImages()
+      }
     } catch (error) {
       setErrorMessage(getErrorMessage(error))
     } finally {
       setIsGenerating(false)
+    }
+  }
+
+  function storeGenerationJob(job: GenerationJobDto) {
+    const nextJobs = [
+      job,
+      ...generationJobsRef.current.filter(
+        (currentJob) => currentJob.id !== job.id,
+      ),
+    ]
+
+    generationJobsRef.current = nextJobs
+    setGenerationJobs(nextJobs)
+  }
+
+  async function refreshGenerationJobAsset(job: GenerationJobDto) {
+    const targetAsset = assets.find((asset) =>
+      asset.versions.some(
+        (version) => version.versionId === job.asset_version_id,
+      ),
+    )
+
+    if (!targetAsset) {
+      return
+    }
+
+    const refreshedAsset = mapAsset(await fetchAsset(targetAsset.id))
+    setAssets((currentAssets) =>
+      currentAssets.some((asset) => asset.id === refreshedAsset.id)
+        ? currentAssets.map((asset) =>
+            asset.id === refreshedAsset.id ? refreshedAsset : asset,
+          )
+        : currentAssets,
+    )
+  }
+
+  async function cancelVideoGeneration(job: GenerationJobDto) {
+    if (!selectedCampaign) {
+      return
+    }
+
+    setGenerationJobActionId(job.id)
+    setErrorMessage(null)
+
+    try {
+      const updatedJob = await cancelCampaignGenerationJob(
+        selectedCampaign.id,
+        job.id,
+      )
+      storeGenerationJob(updatedJob)
+      await refreshGenerationJobAsset(updatedJob)
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setGenerationJobActionId(null)
+    }
+  }
+
+  async function retryVideoGeneration(job: GenerationJobDto) {
+    if (!selectedCampaign) {
+      return
+    }
+
+    setGenerationJobActionId(job.id)
+    setErrorMessage(null)
+
+    try {
+      const updatedJob = await retryCampaignGenerationJob(
+        selectedCampaign.id,
+        job.id,
+      )
+      storeGenerationJob(updatedJob)
+      setGenerationJobsError(null)
+      await refreshGenerationJobAsset(updatedJob)
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setGenerationJobActionId(null)
     }
   }
 
@@ -2022,6 +2478,62 @@ function App() {
       )
     }
 
+    if (hasVideoArtifact(version)) {
+      const previewUrl = artifactPreviewUrls[version.versionId]
+      const videoPreviewUrl =
+        previewUrl?.storageKey === version.artifactStorageKey
+          ? previewUrl.url
+          : null
+      const videoContentType = getVideoContentType(
+        version.artifactContentType,
+        version.artifactFilename,
+      )
+
+      if (
+        videoPreviewUrl &&
+        videoContentType &&
+        !artifactPreviewErrors[version.versionId]
+      ) {
+        return (
+          <div className="artifact-video-preview">
+            <video
+              controls
+              controlsList="nodownload"
+              key={videoPreviewUrl}
+              onError={() =>
+                setArtifactPreviewErrors((currentPreviewErrors) => ({
+                  ...currentPreviewErrors,
+                  [version.versionId]: 'Video preview could not be played',
+                }))
+              }
+              playsInline
+              preload="metadata"
+            >
+              <source src={videoPreviewUrl} type={videoContentType} />
+            </video>
+            <span className="artifact-video-caption">
+              <strong>{getVersionFilename(version) ?? 'Generated video'}</strong>
+              <small>{formatArtifactDetails(version)}</small>
+            </span>
+          </div>
+        )
+      }
+
+      if (artifactPreviewErrors[version.versionId]) {
+        return (
+          <span className="artifact-preview-state">Preview unavailable</span>
+        )
+      }
+
+      return (
+        <span className="artifact-preview-state">
+          {artifactPreviewLoadingIds[version.versionId]
+            ? 'Loading video...'
+            : 'Video preview pending'}
+        </span>
+      )
+    }
+
     if (!hasImageArtifact(version)) {
       return (
         <button
@@ -2074,6 +2586,77 @@ function App() {
           : 'Preview pending'}
       </span>
     )
+  }
+
+  function renderGenerationJob(job: GenerationJobDto) {
+    const duration = readNumber(job.parameters.duration)
+    const aspectRatio = readString(job.parameters.aspect_ratio)
+    const resolution = readString(job.parameters.resolution)
+    const inputMode = readString(job.parameters.input_mode)
+    const isActionPending = generationJobActionId === job.id
+
+    return (
+      <section
+        aria-label="Video generation status"
+        aria-live="polite"
+        className={`generation-job-panel ${job.status}`}
+      >
+        <div className="generation-job-heading">
+          <div>
+            <span>Video generation</span>
+            <strong>{generationJobStatusLabels[job.status]}</strong>
+          </div>
+          <span>{job.progress_percent}%</span>
+        </div>
+
+        <progress max={100} value={job.progress_percent}>
+          {job.progress_percent}%
+        </progress>
+
+        <div className="generation-job-facts">
+          {duration !== null && <span>{duration}s</span>}
+          {aspectRatio && <span>{aspectRatio}</span>}
+          {resolution && <span>{resolution}</span>}
+          {inputMode && (
+            <span>
+              {inputMode === 'image_to_video' ? 'Image to video' : 'Text to video'}
+            </span>
+          )}
+          {job.attempt_count > 0 && <span>Attempt {job.attempt_count}</span>}
+        </div>
+
+        {job.error_message && (
+          <p className="generation-job-error">{job.error_message}</p>
+        )}
+
+        {job.status === 'queued' && (
+          <button
+            className="metadata-button generation-job-action"
+            disabled={isActionPending}
+            onClick={() => void cancelVideoGeneration(job)}
+            type="button"
+          >
+            {isActionPending ? 'Canceling...' : 'Cancel job'}
+          </button>
+        )}
+
+        {isRetryableGenerationJobStatus(job.status) && (
+          <button
+            className="metadata-button generation-job-action"
+            disabled={isActionPending}
+            onClick={() => void retryVideoGeneration(job)}
+            type="button"
+          >
+            {isActionPending ? 'Queueing...' : 'Retry job'}
+          </button>
+        )}
+      </section>
+    )
+  }
+
+  function renderVersionGenerationJob(version: AssetVersion) {
+    const job = generationJobsByVersionId.get(version.versionId)
+    return job ? renderGenerationJob(job) : null
   }
 
   function getVersionProvenance(version: AssetVersion) {
@@ -2299,11 +2882,11 @@ function App() {
           </label>
           <button
             className="button button-secondary"
-            disabled={!selectedCampaign || isExporting}
+            disabled={!selectedCampaign}
             onClick={downloadCampaignExport}
             type="button"
           >
-            {isExporting ? 'Exporting...' : 'Export pack'}
+            Export pack
           </button>
         </div>
       </header>
@@ -3091,22 +3674,135 @@ function App() {
                     />
                   </label>
 
-                  {renderReferenceImagePicker({
-                    images: generationReferenceImages,
-                    inputId: 'generation-reference-images',
-                    disabled: isGenerating,
-                    onAdd: addGenerationReferenceImages,
-                    onRemove: removeGenerationReferenceImage,
-                    onRoleChange: updateGenerationReferenceRole,
-                  })}
+                  {requestFormat === 'Video concept' ? (
+                    <div className="video-generation-controls">
+                      <label className="field">
+                        <span>Duration (seconds)</span>
+                        <input
+                          disabled={isGenerating}
+                          max={20}
+                          min={2}
+                          onChange={(event) =>
+                            setVideoDurationSeconds(
+                              Number.isFinite(event.currentTarget.valueAsNumber)
+                                ? event.currentTarget.valueAsNumber
+                                : 2,
+                            )
+                          }
+                          step={1}
+                          type="number"
+                          value={videoDurationSeconds}
+                        />
+                      </label>
+
+                      <div className="video-control">
+                        <span>Aspect ratio</span>
+                        <div className="segmented" aria-label="Aspect ratio">
+                          {videoAspectRatios.map((aspectRatio) => (
+                            <button
+                              aria-pressed={
+                                videoAspectRatio === aspectRatio
+                              }
+                              className={
+                                videoAspectRatio === aspectRatio
+                                  ? 'is-selected'
+                                  : ''
+                              }
+                              disabled={isGenerating}
+                              key={aspectRatio}
+                              onClick={() =>
+                                setVideoAspectRatio(aspectRatio)
+                              }
+                              type="button"
+                            >
+                              {aspectRatio}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <div className="video-control">
+                        <span>Resolution</span>
+                        <div
+                          className="segmented video-resolution-control"
+                          aria-label="Resolution"
+                        >
+                          {videoResolutions.map((resolution) => (
+                            <button
+                              aria-pressed={videoResolution === resolution}
+                              className={
+                                videoResolution === resolution
+                                  ? 'is-selected'
+                                  : ''
+                              }
+                              disabled={isGenerating}
+                              key={resolution}
+                              onClick={() => setVideoResolution(resolution)}
+                              type="button"
+                            >
+                              {resolution}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <label className="field video-source-field">
+                        <span>Source image</span>
+                        <select
+                          disabled={isGenerating}
+                          onChange={(event) =>
+                            setVideoSourceVersionId(event.target.value)
+                          }
+                          value={videoSourceVersionId}
+                        >
+                          <option value="">No source image</option>
+                          {videoSourceOptions.map((option) => (
+                            <option key={option.versionId} value={option.versionId}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  ) : (
+                    renderReferenceImagePicker({
+                      images: generationReferenceImages,
+                      inputId: 'generation-reference-images',
+                      disabled: isGenerating,
+                      onAdd: addGenerationReferenceImages,
+                      onRemove: removeGenerationReferenceImage,
+                      onRoleChange: updateGenerationReferenceRole,
+                    })
+                  )}
+
+                  {generationJobsError && (
+                    <div className="generation-jobs-error" role="alert">
+                      {generationJobsError}
+                    </div>
+                  )}
+
+                  {requestFormat === 'Video concept' &&
+                    isLoadingGenerationJobs && (
+                      <span className="generation-jobs-loading">
+                        Loading video jobs...
+                      </span>
+                    )}
 
                   <button
                     className="button button-primary"
-                    disabled={isGenerating || !requestChannel}
+                    disabled={
+                      isGenerating || !requestChannel || !requestPrompt.trim()
+                    }
                     onClick={generateAsset}
                     type="button"
                   >
-                    {isGenerating ? 'Generating...' : 'Generate asset'}
+                    {isGenerating
+                      ? requestFormat === 'Video concept'
+                        ? 'Queueing...'
+                        : 'Generating...'
+                      : requestFormat === 'Video concept'
+                        ? 'Queue video'
+                        : 'Generate asset'}
                   </button>
                 </div>
               </section>
@@ -3166,6 +3862,10 @@ function App() {
                               artifactPreviewUrls,
                             )
                           : null
+                        const cardGenerationJob = getAssetGenerationJob(
+                          asset,
+                          generationJobsByVersionId,
+                        )
 
                         return (
                           <button
@@ -3203,6 +3903,25 @@ function App() {
                                 </span>
                               </span>
                               <span className="asset-copy">{asset.copy}</span>
+                              {cardGenerationJob && (
+                                <span
+                                  className={`asset-generation-status ${cardGenerationJob.status}`}
+                                >
+                                  <span>Video generation</span>
+                                  <strong>
+                                    {
+                                      generationJobStatusLabels[
+                                        cardGenerationJob.status
+                                      ]
+                                    }
+                                    {isActiveGenerationJobStatus(
+                                      cardGenerationJob.status,
+                                    )
+                                      ? ` ${cardGenerationJob.progress_percent}%`
+                                      : ''}
+                                  </strong>
+                                </span>
+                              )}
                               <span className="asset-foot">
                                 <span>{asset.format}</span>
                                 <span>{asset.channel}</span>
@@ -3243,11 +3962,28 @@ function App() {
                           <strong>{latestSelectedVersion.id.toUpperCase()}</strong>
                         </div>
                         {renderArtifactPreview(latestSelectedVersion)}
+                        {selectedGenerationJob &&
+                          renderGenerationJob(selectedGenerationJob)}
                         <div
                           className="version-actions latest-version-actions"
                           aria-label={`${latestSelectedVersion.id} actions`}
                         >
                           {renderProvenanceButton(latestSelectedVersion)}
+                          <button
+                            className="metadata-button"
+                            disabled={
+                              !latestSelectedVersion.artifactStorageKey ||
+                              openingArtifactVersionId ===
+                                latestSelectedVersion.versionId
+                            }
+                            onClick={() => openArtifact(latestSelectedVersion)}
+                            type="button"
+                          >
+                            {openingArtifactVersionId ===
+                            latestSelectedVersion.versionId
+                              ? 'Opening...'
+                              : 'Open artifact'}
+                          </button>
                           <button
                             className="metadata-button"
                             disabled={
@@ -3310,54 +4046,59 @@ function App() {
                       </div>
                     </dl>
 
-                    <div className="refine-panel">
-                      <div className="panel-heading">
-                        <div>
-                          <span className="eyebrow">Refine</span>
-                          <h3>Next version</h3>
+                    {selectedAsset.format !== 'Video concept' && (
+                      <div className="refine-panel">
+                        <div className="panel-heading">
+                          <div>
+                            <span className="eyebrow">Refine</span>
+                            <h3>Next version</h3>
+                          </div>
+                          <span>{`v${getNextVersionNumber(selectedAsset)}`}</span>
                         </div>
-                        <span>{`v${getNextVersionNumber(selectedAsset)}`}</span>
+
+                        <label className="field">
+                          <span>Prompt</span>
+                          <textarea
+                            onChange={(event) =>
+                              setRefinePrompts((currentPrompts) => ({
+                                ...currentPrompts,
+                                [selectedAsset.id]: event.target.value,
+                              }))
+                            }
+                            rows={4}
+                            value={refinePrompt}
+                          />
+                        </label>
+
+                        {renderReferenceImagePicker({
+                          images: selectedRefineReferenceImages,
+                          inputId: `refine-reference-images-${selectedAsset.id}`,
+                          disabled: isRefining,
+                          onAdd: (files) =>
+                            addRefineReferenceImages(selectedAsset.id, files),
+                          onRemove: (imageId) =>
+                            removeRefineReferenceImage(
+                              selectedAsset.id,
+                              imageId,
+                            ),
+                          onRoleChange: (imageId, role) =>
+                            updateRefineReferenceRole(
+                              selectedAsset.id,
+                              imageId,
+                              role,
+                            ),
+                        })}
+
+                        <button
+                          className="button button-primary"
+                          disabled={isRefining || !refinePrompt.trim()}
+                          onClick={refineAsset}
+                          type="button"
+                        >
+                          {isRefining ? 'Refining...' : 'Create refinement'}
+                        </button>
                       </div>
-
-                      <label className="field">
-                        <span>Prompt</span>
-                        <textarea
-                          onChange={(event) =>
-                            setRefinePrompts((currentPrompts) => ({
-                              ...currentPrompts,
-                              [selectedAsset.id]: event.target.value,
-                            }))
-                          }
-                          rows={4}
-                          value={refinePrompt}
-                        />
-                      </label>
-
-                      {renderReferenceImagePicker({
-                        images: selectedRefineReferenceImages,
-                        inputId: `refine-reference-images-${selectedAsset.id}`,
-                        disabled: isRefining,
-                        onAdd: (files) =>
-                          addRefineReferenceImages(selectedAsset.id, files),
-                        onRemove: (imageId) =>
-                          removeRefineReferenceImage(selectedAsset.id, imageId),
-                        onRoleChange: (imageId, role) =>
-                          updateRefineReferenceRole(
-                            selectedAsset.id,
-                            imageId,
-                            role,
-                          ),
-                      })}
-
-                      <button
-                        className="button button-primary"
-                        disabled={isRefining || !refinePrompt.trim()}
-                        onClick={refineAsset}
-                        type="button"
-                      >
-                        {isRefining ? 'Refining...' : 'Create refinement'}
-                      </button>
-                    </div>
+                    )}
 
                     <div className="version-list">
                       <h3>Previous Version</h3>
@@ -3373,6 +4114,7 @@ function App() {
                             </span>
                             <code>{version.storageKey}</code>
                             {renderArtifactPreview(version)}
+                            {renderVersionGenerationJob(version)}
                             <div
                               className="version-actions"
                               aria-label={`${version.id} actions`}

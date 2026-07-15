@@ -213,6 +213,61 @@ export type AssetVersionGenerationCreateDto = {
   timeout_seconds?: number | null
 }
 
+export type VideoAspectRatio = '16:9' | '9:16' | '1:1'
+export type VideoResolution = '720p' | '1080p'
+export type GenerationJobKind = 'video'
+export type GenerationJobStatus =
+  | 'queued'
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'canceled'
+
+export type VideoGenerationCreateDto = {
+  title?: string | null
+  channel: string
+  prompt: string
+  status?: 'draft'
+  reviewer?: string | null
+  tags?: string[]
+  summary?: string | null
+  model?: string | null
+  duration_seconds?: number
+  aspect_ratio?: VideoAspectRatio
+  resolution?: VideoResolution
+  source_version_id?: string | null
+}
+
+export type GenerationJobDto = {
+  id: string
+  asset_version_id: string
+  kind: GenerationJobKind
+  status: GenerationJobStatus
+  provider: string
+  model: string
+  prompt: string
+  parameters: Record<string, unknown>
+  progress_percent: number
+  provider_job_id: string | null
+  attempt_count: number
+  error_message: string | null
+  started_at: string | null
+  completed_at: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type VideoGenerationSubmissionDto = {
+  asset: AssetDto
+  job: GenerationJobDto
+}
+
+export type GenerationJobFilters = {
+  status?: GenerationJobStatus
+  offset?: number
+  limit?: number
+}
+
 export type AssetVersionDownloadUrlDto = {
   asset_id: string
   version_id: string
@@ -230,11 +285,6 @@ export type AssetVersionArtifactDownloadUrlDto = {
   artifact_size_bytes: number | null
   download_url: string
   expires_seconds: number
-}
-
-export type DownloadedFile = {
-  blob: Blob
-  filename: string
 }
 
 const API_BASE_URL =
@@ -326,36 +376,6 @@ function buildGenerationInputFormData(
   return formData
 }
 
-function getFilenameFromContentDisposition(value: string | null): string | null {
-  if (!value) {
-    return null
-  }
-
-  const match = value.match(/filename="?([^"]+)"?/i)
-  return match?.[1] ?? null
-}
-
-async function downloadRequest(
-  path: string,
-  fallbackFilename: string,
-): Promise<DownloadedFile> {
-  const response = await fetch(`${API_BASE_URL}${path}`)
-
-  if (!response.ok) {
-    throw new Error(await readErrorMessage(response))
-  }
-
-  const filename =
-    getFilenameFromContentDisposition(
-      response.headers.get('Content-Disposition'),
-    ) ?? fallbackFilename
-
-  return {
-    blob: await response.blob(),
-    filename,
-  }
-}
-
 export function fetchCampaigns(): Promise<CampaignDto[]> {
   return request<CampaignDto[]>('/campaigns')
 }
@@ -375,8 +395,8 @@ export function deleteCampaign(campaignId: string): Promise<void> {
   })
 }
 
-export function exportCampaignPack(campaignId: string): Promise<DownloadedFile> {
-  return downloadRequest(`/campaigns/${campaignId}/export`, 'campaign-export.zip')
+export function getCampaignExportUrl(campaignId: string): string {
+  return `${API_BASE_URL}/campaigns/${encodeURIComponent(campaignId)}/export`
 }
 
 export function fetchBrandAssets(
@@ -536,6 +556,76 @@ export function generateCampaignAssetWithInputs(
   return uploadRequest<AssetDto>(
     `/campaigns/${campaignId}/assets/generate-with-inputs`,
     buildGenerationInputFormData(asset, inputs),
+  )
+}
+
+export function submitVideoGeneration(
+  campaignId: string,
+  video: VideoGenerationCreateDto,
+): Promise<VideoGenerationSubmissionDto> {
+  return request<VideoGenerationSubmissionDto>(
+    `/campaigns/${campaignId}/assets/generate-video`,
+    {
+      method: 'POST',
+      body: JSON.stringify(video),
+    },
+  )
+}
+
+export function fetchCampaignGenerationJobs(
+  campaignId: string,
+  filters: GenerationJobFilters = {},
+  signal?: AbortSignal,
+): Promise<GenerationJobDto[]> {
+  const params = new URLSearchParams()
+
+  if (filters.status) {
+    params.set('status', filters.status)
+  }
+
+  if (filters.offset !== undefined) {
+    params.set('offset', String(filters.offset))
+  }
+
+  if (filters.limit !== undefined) {
+    params.set('limit', String(filters.limit))
+  }
+
+  const query = params.toString()
+  return request<GenerationJobDto[]>(
+    `/campaigns/${campaignId}/generation-jobs${query ? `?${query}` : ''}`,
+    { signal },
+  )
+}
+
+export function fetchCampaignGenerationJob(
+  campaignId: string,
+  jobId: string,
+  signal?: AbortSignal,
+): Promise<GenerationJobDto> {
+  return request<GenerationJobDto>(
+    `/campaigns/${campaignId}/generation-jobs/${jobId}`,
+    { signal },
+  )
+}
+
+export function cancelCampaignGenerationJob(
+  campaignId: string,
+  jobId: string,
+): Promise<GenerationJobDto> {
+  return request<GenerationJobDto>(
+    `/campaigns/${campaignId}/generation-jobs/${jobId}/cancel`,
+    { method: 'POST' },
+  )
+}
+
+export function retryCampaignGenerationJob(
+  campaignId: string,
+  jobId: string,
+): Promise<GenerationJobDto> {
+  return request<GenerationJobDto>(
+    `/campaigns/${campaignId}/generation-jobs/${jobId}/retry`,
+    { method: 'POST' },
   )
 }
 

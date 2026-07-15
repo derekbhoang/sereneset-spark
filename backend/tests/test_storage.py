@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 from app.core.config import Settings
 from app.services.storage import (
@@ -81,6 +81,51 @@ class B2ServerSideCopyTests(unittest.TestCase):
         client.copy_object.assert_not_called()
         client.get_object.assert_not_called()
 
+
+class B2ChunkedDownloadTests(unittest.TestCase):
+    def test_streams_bounded_chunks_and_closes_the_response(self) -> None:
+        storage, client = make_storage()
+        body = MagicMock()
+        body.read.side_effect = [b"ab", b"cd", b""]
+        client.get_object.return_value = {
+            "Body": body,
+            "ContentLength": 4,
+        }
+
+        chunks = list(
+            storage.iter_download_chunks(
+                key="campaigns/video.mp4",
+                chunk_size_bytes=2,
+                max_size_bytes=4,
+            )
+        )
+
+        self.assertEqual(chunks, [b"ab", b"cd"])
+        self.assertEqual(body.read.call_args_list, [call(2), call(2), call(2)])
+        body.close.assert_called_once_with()
+
+    def test_rejects_oversized_object_before_reading_the_body(self) -> None:
+        storage, client = make_storage()
+        body = MagicMock()
+        client.get_object.return_value = {
+            "Body": body,
+            "ContentLength": 5,
+        }
+
+        with self.assertRaisesRegex(
+            StorageObjectTooLargeError,
+            "configured size limit",
+        ):
+            list(
+                storage.iter_download_chunks(
+                    key="campaigns/video.mp4",
+                    chunk_size_bytes=2,
+                    max_size_bytes=4,
+                )
+            )
+
+        body.read.assert_not_called()
+        body.close.assert_called_once_with()
 
 if __name__ == "__main__":
     unittest.main()

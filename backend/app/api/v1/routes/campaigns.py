@@ -2,20 +2,27 @@ import hashlib
 import json
 import re
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from io import BytesIO
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
+from shutil import copyfileobj
+from tempfile import NamedTemporaryFile, SpooledTemporaryFile
+from typing import BinaryIO
 from urllib.error import URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
 from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
+from starlette.background import BackgroundTask
 
+from app.core.config import Settings, get_settings
 from app.db.session import get_db
 from app.models.asset import Asset, AssetVersion, AssetVersionInput, ReviewStatus
 from app.models.brand_asset import BrandAsset, CampaignBrandAsset
@@ -24,6 +31,8 @@ from app.schemas.campaign import CampaignCreate, CampaignRead, CampaignUpdate
 from app.services.storage import (
     B2StorageService,
     StorageConfigurationError,
+    StorageObjectTooLargeError,
+    StorageOperationError,
     get_storage_service,
     normalize_artifact_filename,
 )
@@ -31,6 +40,10 @@ from app.services.storage import (
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 MAX_EXPORT_ARTIFACT_SIZE_BYTES = 25 * 1024 * 1024
+DEFAULT_MAX_EXPORTED_VIDEO_SIZE_BYTES = 500 * 1024 * 1024
+EXPORT_STREAM_CHUNK_SIZE_BYTES = 1024 * 1024
+EXPORT_SPOOL_MEMORY_LIMIT_BYTES = 1024 * 1024
+VIDEO_ARTIFACT_SUFFIXES = {".m4v", ".mov", ".mp4", ".webm"}
 
 
 @dataclass(frozen=True)
@@ -729,18 +742,165 @@ def download_url_bytes(url: str) -> bytes:
     return body
 
 
-def download_artifact_bytes(
+def iter_download_url_chunks(
+    *,
+    url: str,
+    max_size_bytes: int,
+) -> Iterator[bytes]:
+    parsed_url = urlparse(url)
+    if parsed_url.scheme.lower() != "https" or not parsed_url.hostname:
+        raise ValueError("Generated artifact URL must use HTTPS")
+
+    request = Request(
+        url,
+        headers={"User-Agent": "SereneSet-Spark/1.0"},
+    )
+
+    with urlopen(request, timeout=60) as response:
+        raw_content_length = response.headers.get("Content-Length")
+        content_length = (
+            int(raw_content_length)
+            if raw_content_length is not None and raw_content_length.isdigit()
+            else None
+        )
+        if content_length is not None and content_length > max_size_bytes:
+            raise StorageObjectTooLargeError(
+                "Generated artifact exceeds the configured export size limit"
+            )
+
+        downloaded_bytes = 0
+        while True:
+            chunk = response.read(EXPORT_STREAM_CHUNK_SIZE_BYTES)
+            if not chunk:
+                break
+
+            downloaded_bytes += len(chunk)
+            if downloaded_bytes > max_size_bytes:
+                raise StorageObjectTooLargeError(
+                    "Generated artifact exceeds the configured export size limit"
+                )
+
+            yield chunk
+
+    if downloaded_bytes == 0:
+        raise ValueError("Generated artifact URL returned an empty body")
+
+    if content_length is not None and downloaded_bytes != content_length:
+        raise ValueError(
+            "Generated artifact response size did not match its content length"
+        )
+
+
+def is_video_export_artifact(
+    *,
+    version: AssetVersion,
+    reference: ExportArtifactReference,
+) -> bool:
+    content_type = (
+        reference.content_type
+        or version.artifact_content_type
+        or ""
+    ).split(";", maxsplit=1)[0].strip().lower()
+    if content_type.startswith("video/"):
+        return True
+
+    filename = (
+        reference.filename
+        or version.artifact_filename
+        or reference.storage_key
+        or filename_from_url(reference.url)
+        or ""
+    )
+    return PurePosixPath(filename.lower()).suffix in VIDEO_ARTIFACT_SUFFIXES
+
+
+def iter_artifact_chunks(
     *,
     storage: B2StorageService,
     reference: ExportArtifactReference,
-) -> bytes:
+    max_size_bytes: int,
+) -> Iterator[bytes]:
     if reference.storage_key:
-        return storage.download_bytes(key=reference.storage_key)
+        yield from storage.iter_download_chunks(
+            key=reference.storage_key,
+            chunk_size_bytes=EXPORT_STREAM_CHUNK_SIZE_BYTES,
+            max_size_bytes=max_size_bytes,
+        )
+        return
 
     if reference.url:
-        return download_url_bytes(reference.url)
+        yield from iter_download_url_chunks(
+            url=reference.url,
+            max_size_bytes=max_size_bytes,
+        )
+        return
 
     raise ValueError("Artifact reference did not include a B2 key or URL")
+
+
+def write_artifact_to_zip(
+    *,
+    export_zip: ZipFile,
+    zip_path: str,
+    storage: B2StorageService,
+    version: AssetVersion,
+    reference: ExportArtifactReference,
+    max_size_bytes: int,
+) -> None:
+    if (
+        reference.size_bytes is not None
+        and reference.size_bytes > max_size_bytes
+    ):
+        raise StorageObjectTooLargeError(
+            "Generated artifact exceeds the configured export size limit"
+        )
+
+    with SpooledTemporaryFile(
+        max_size=EXPORT_SPOOL_MEMORY_LIMIT_BYTES,
+        mode="w+b",
+    ) as staged_artifact:
+        downloaded_bytes = 0
+        for chunk in iter_artifact_chunks(
+            storage=storage,
+            reference=reference,
+            max_size_bytes=max_size_bytes,
+        ):
+            staged_artifact.write(chunk)
+            downloaded_bytes += len(chunk)
+
+        if downloaded_bytes == 0:
+            raise ValueError("Generated artifact was empty")
+
+        if (
+            reference.size_bytes is not None
+            and downloaded_bytes != reference.size_bytes
+        ):
+            raise ValueError(
+                "Generated artifact size did not match stored metadata"
+            )
+
+        staged_artifact.seek(0)
+        zip_info = ZipInfo(
+            filename=zip_path,
+            date_time=datetime.now(UTC).timetuple()[:6],
+        )
+        zip_info.compress_type = (
+            ZIP_STORED
+            if is_video_export_artifact(
+                version=version,
+                reference=reference,
+            )
+            else ZIP_DEFLATED
+        )
+        zip_info.external_attr = 0o600 << 16
+        zip_info.file_size = downloaded_bytes
+
+        with export_zip.open(zip_info, mode="w") as zip_entry:
+            copyfileobj(
+                staged_artifact,
+                zip_entry,
+                length=EXPORT_STREAM_CHUNK_SIZE_BYTES,
+            )
 
 
 def download_input_bytes(
@@ -776,11 +936,16 @@ def make_input_zip_path(
     )
 
 
-def make_campaign_export_zip(
+def write_campaign_export_zip(
     *,
     campaign: Campaign,
     storage: B2StorageService,
-) -> bytes:
+    destination: BinaryIO | str,
+    max_video_artifact_size_bytes: int,
+) -> None:
+    if max_video_artifact_size_bytes < 1:
+        raise ValueError("Maximum exported video size must be greater than zero")
+
     approved_assets = sorted(
         (
             asset
@@ -798,9 +963,8 @@ def make_campaign_export_zip(
     input_exports: dict[uuid.UUID, list[dict[str, object]]] = {}
     used_input_paths: set[str] = set()
     brand_asset_export_results: dict[uuid.UUID, ExportBrandAssetResult] = {}
-    zip_buffer = BytesIO()
 
-    with ZipFile(zip_buffer, mode="w", compression=ZIP_DEFLATED) as export_zip:
+    with ZipFile(destination, mode="w", compression=ZIP_DEFLATED) as export_zip:
         for brand_asset in unique_campaign_brand_assets(campaign):
             zip_path = brand_asset_zip_path(brand_asset)
             try:
@@ -883,12 +1047,21 @@ def make_campaign_export_zip(
                     )
                     artifact_path = f"artifacts/{base_path}/{artifact_filename}"
                     try:
-                        export_zip.writestr(
-                            artifact_path,
-                            download_artifact_bytes(
-                                storage=storage,
+                        max_artifact_size_bytes = (
+                            max_video_artifact_size_bytes
+                            if is_video_export_artifact(
+                                version=version,
                                 reference=artifact_reference,
-                            ),
+                            )
+                            else MAX_EXPORT_ARTIFACT_SIZE_BYTES
+                        )
+                        write_artifact_to_zip(
+                            export_zip=export_zip,
+                            zip_path=artifact_path,
+                            storage=storage,
+                            version=version,
+                            reference=artifact_reference,
+                            max_size_bytes=max_artifact_size_bytes,
                         )
                         artifact_paths[version.id] = artifact_path
                         artifact_sources[version.id] = artifact_reference.source
@@ -897,6 +1070,8 @@ def make_campaign_export_zip(
                         BotoCoreError,
                         ClientError,
                         OSError,
+                        StorageObjectTooLargeError,
+                        StorageOperationError,
                         URLError,
                         ValueError,
                     ):
@@ -961,6 +1136,20 @@ def make_campaign_export_zip(
             json.dumps(manifest, indent=2, ensure_ascii=False),
         )
 
+
+def make_campaign_export_zip(
+    *,
+    campaign: Campaign,
+    storage: B2StorageService,
+    max_video_artifact_size_bytes: int = DEFAULT_MAX_EXPORTED_VIDEO_SIZE_BYTES,
+) -> bytes:
+    zip_buffer = BytesIO()
+    write_campaign_export_zip(
+        campaign=campaign,
+        storage=storage,
+        destination=zip_buffer,
+        max_video_artifact_size_bytes=max_video_artifact_size_bytes,
+    )
     return zip_buffer.getvalue()
 
 
@@ -992,33 +1181,67 @@ def create_campaign(
     return campaign
 
 
+def remove_temporary_export(path: str) -> None:
+    Path(path).unlink(missing_ok=True)
+
+
 @router.get("/{campaign_id}/export")
 def export_campaign_pack(
     campaign_id: uuid.UUID,
     db: Session = Depends(get_db),
     storage: B2StorageService = Depends(get_storage_service),
-) -> Response:
+    settings: Settings = Depends(get_settings),
+) -> FileResponse:
     campaign = get_campaign_with_assets_or_404(campaign_id, db)
+    with NamedTemporaryFile(
+        mode="w+b",
+        prefix="sereneset-campaign-export-",
+        suffix=".zip",
+        delete=False,
+    ) as temporary_export:
+        export_path = temporary_export.name
 
     try:
-        export_body = make_campaign_export_zip(
+        write_campaign_export_zip(
             campaign=campaign,
             storage=storage,
+            destination=export_path,
+            max_video_artifact_size_bytes=(
+                settings.max_generated_video_size_bytes
+            ),
         )
-    except (StorageConfigurationError, BotoCoreError, ClientError) as exc:
+    except (
+        StorageConfigurationError,
+        StorageOperationError,
+        BotoCoreError,
+        ClientError,
+    ) as exc:
+        remove_temporary_export(export_path)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Campaign export could not be created because B2 storage failed",
         ) from exc
+    except OSError as exc:
+        remove_temporary_export(export_path)
+        raise HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            detail="Campaign export could not be written to temporary storage",
+        ) from exc
+    except Exception:
+        remove_temporary_export(export_path)
+        raise
 
     filename = f"{slugify_filename(campaign.name)}-export.zip"
 
-    return Response(
-        content=export_body,
+    return FileResponse(
+        path=export_path,
         media_type="application/zip",
+        filename=filename,
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
         },
+        background=BackgroundTask(remove_temporary_export, export_path),
     )
 
 
