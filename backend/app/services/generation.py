@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 import mimetypes
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
 from pathlib import PurePosixPath
@@ -28,6 +28,13 @@ class GenerationInputError(ValueError):
 GENBLAZE_EXTERNAL_INPUTS_PARAMETER = "external_inputs"
 MAX_VIDEO_INPUT_SIZE_BYTES = 25 * 1024 * 1024
 VIDEO_SOURCE_INPUT_ROLE = "source_creative"
+GMI_VEO_DURATION_SECONDS = frozenset({4, 6, 8})
+GMI_VEO_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
+GMI_VEO_RESOLUTIONS = frozenset({"720p", "1080p"})
+GMI_VEO_WIRE_ALIASES = {
+    "duration": "durationSeconds",
+    "aspect_ratio": "aspectRatio",
+}
 ALLOWED_VIDEO_INPUT_CONTENT_TYPES = {
     "image/jpeg",
     "image/png",
@@ -268,6 +275,16 @@ def extract_provider_job_id(steps: list[Any]) -> str | None:
     return None
 
 
+def extract_generation_step_error(steps: list[Any]) -> str | None:
+    for step in reversed(steps):
+        for attribute in ("error", "error_message"):
+            value = getattr(step, attribute, None)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+
+    return None
+
+
 def serialize_input_asset(input_asset: dict[str, Any]) -> dict[str, Any]:
     return {
         key: input_asset[key]
@@ -367,6 +384,79 @@ def build_pipeline_parameters(
         return pipeline_parameters, None
 
     return pipeline_parameters, GENBLAZE_EXTERNAL_INPUTS_PARAMETER
+
+
+def is_gmicloud_veo_model(model: str) -> bool:
+    return model.casefold().startswith("veo")
+
+
+def validate_video_generation_parameters(
+    *,
+    model: str,
+    duration_seconds: int,
+    aspect_ratio: str,
+    resolution: str,
+) -> None:
+    if not is_gmicloud_veo_model(model):
+        return
+
+    if duration_seconds not in GMI_VEO_DURATION_SECONDS:
+        raise GenerationInputError(
+            f"Video model '{model}' supports durations of 4, 6, or 8 seconds"
+        )
+    if aspect_ratio not in GMI_VEO_ASPECT_RATIOS:
+        raise GenerationInputError(
+            f"Video model '{model}' supports aspect ratios 16:9 or 9:16"
+        )
+    if resolution not in GMI_VEO_RESOLUTIONS:
+        raise GenerationInputError(
+            f"Video model '{model}' supports resolutions 720p or 1080p"
+        )
+
+
+def coerce_gmi_duration_seconds(value: Any) -> str:
+    return str(int(value))
+
+
+def build_gmicloud_video_models(
+    provider_class: Any,
+    *,
+    model: str,
+) -> Any | None:
+    if not is_gmicloud_veo_model(model):
+        return None
+
+    models_default = getattr(provider_class, "models_default", None)
+    if not callable(models_default):
+        return None
+
+    models = models_default().fork()
+    spec = models.get(model)
+    wire_parameter_names = frozenset(GMI_VEO_WIRE_ALIASES.values())
+    allowlist = (
+        spec.param_allowlist | wire_parameter_names
+        if spec.param_allowlist is not None
+        else None
+    )
+    models.register(
+        replace(
+            spec,
+            model_id=model,
+            param_aliases={
+                **spec.param_aliases,
+                **GMI_VEO_WIRE_ALIASES,
+            },
+            param_coercers={
+                **spec.param_coercers,
+                "durationSeconds": coerce_gmi_duration_seconds,
+            },
+            param_required=(
+                spec.param_required | frozenset({"durationSeconds"})
+            ),
+            param_allowlist=allowlist,
+        )
+    )
+    return models
 
 
 def video_model_input_requirement(model: str) -> str:
@@ -647,9 +737,14 @@ class GenblazeGenerationService:
             input_assets=input_plan.provider_input_assets,
             genblaze_asset_class=GenblazeAsset,
         )
+        video_provider_models = build_gmicloud_video_models(
+            GMICloudVideoProvider,
+            model=model,
+        )
         video_provider = call_with_supported_kwargs(
             GMICloudVideoProvider,
             retry_policy=RetryPolicy.conservative(),
+            models=video_provider_models,
         )
 
         try:
@@ -679,6 +774,11 @@ class GenblazeGenerationService:
         ]
         assets = [asset for asset in generated_assets if is_video_asset(asset)]
         if not assets:
+            step_error = extract_generation_step_error(steps)
+            if step_error:
+                raise GenerationProviderError(
+                    f"Genblaze video generation failed: {step_error}"
+                )
             raise GenerationProviderError(
                 "Genblaze video generation did not return a video artifact"
             )

@@ -28,6 +28,7 @@ from app.services.generation import (
     VideoInputMode,
     infer_asset_media_type,
     optional_string,
+    validate_video_generation_parameters,
     validate_video_input_assets,
 )
 from app.services.storage import build_asset_version_storage_key
@@ -577,6 +578,12 @@ def submit_video_generation(
         source_inputs.append(source_version_input_record(source_version))
 
     try:
+        validate_video_generation_parameters(
+            model=model,
+            duration_seconds=video_in.duration_seconds,
+            aspect_ratio=video_in.aspect_ratio.value,
+            resolution=video_in.resolution.value,
+        )
         input_mode = validate_video_input_assets(
             model=model,
             input_assets=source_inputs,

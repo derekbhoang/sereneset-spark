@@ -154,6 +154,33 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         db.add.assert_not_called()
         db.commit.assert_not_called()
 
+    def test_unsupported_veo_controls_fail_before_database_write(self) -> None:
+        invalid_controls = (
+            {"duration_seconds": 2},
+            {"aspect_ratio": "1:1"},
+        )
+
+        for controls in invalid_controls:
+            with self.subTest(controls=controls):
+                campaign_id = uuid.uuid4()
+                db = MagicMock()
+                db.get.return_value = Campaign(id=campaign_id)
+
+                with self.assertRaises(HTTPException) as raised:
+                    submit_video_generation(
+                        campaign_id=campaign_id,
+                        video_in=video_request(**controls),
+                        db=db,
+                        settings=settings(),
+                    )
+
+                self.assertEqual(
+                    raised.exception.status_code,
+                    status.HTTP_422_UNPROCESSABLE_CONTENT,
+                )
+                db.add.assert_not_called()
+                db.commit.assert_not_called()
+
     def test_openapi_exposes_accepted_submission_contract(self) -> None:
         operation = app.openapi()["paths"][
             "/api/v1/campaigns/{campaign_id}/assets/generate-video"

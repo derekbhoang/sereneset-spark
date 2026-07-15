@@ -254,7 +254,8 @@ const referenceRoleLabels: Record<GenerationInputRole, string> = {
   avoid_reference: 'Avoid reference',
 }
 
-const videoAspectRatios: VideoAspectRatio[] = ['16:9', '9:16', '1:1']
+const videoDurationOptions = [4, 6, 8] as const
+const videoAspectRatios: VideoAspectRatio[] = ['16:9', '9:16']
 const videoResolutions: VideoResolution[] = ['720p', '1080p']
 const generationJobStatusLabels: Record<GenerationJobStatus, string> = {
   queued: 'Queued',
@@ -2168,10 +2169,7 @@ function App() {
           tags: ['generated', requestChannel.toLowerCase().replace(/\s/g, '-')],
           summary:
             'A queued Genblaze video with durable B2 storage and provenance metadata.',
-          duration_seconds: Math.min(
-            20,
-            Math.max(2, Math.round(videoDurationSeconds)),
-          ),
+          duration_seconds: videoDurationSeconds,
           aspect_ratio: videoAspectRatio,
           resolution: videoResolution,
           source_version_id: videoSourceVersionId || null,
@@ -3678,21 +3676,21 @@ function App() {
                     <div className="video-generation-controls">
                       <label className="field">
                         <span>Duration (seconds)</span>
-                        <input
+                        <select
                           disabled={isGenerating}
-                          max={20}
-                          min={2}
                           onChange={(event) =>
                             setVideoDurationSeconds(
-                              Number.isFinite(event.currentTarget.valueAsNumber)
-                                ? event.currentTarget.valueAsNumber
-                                : 2,
+                              Number(event.currentTarget.value),
                             )
                           }
-                          step={1}
-                          type="number"
                           value={videoDurationSeconds}
-                        />
+                        >
+                          {videoDurationOptions.map((duration) => (
+                            <option key={duration} value={duration}>
+                              {duration}
+                            </option>
+                          ))}
+                        </select>
                       </label>
 
                       <div className="video-control">

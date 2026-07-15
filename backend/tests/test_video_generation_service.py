@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from app.core.config import Settings
 from app.services.generation import (
+    build_gmicloud_video_models,
     GenblazeGenerationService,
     GenerationProviderError,
     VideoGenerationRequest,
@@ -57,6 +58,7 @@ class FakePipeline:
     last_instance: "FakePipeline | None" = None
     output_assets: list[object] = []
     run_error: Exception | None = None
+    step_error: str | None = None
 
     def __init__(self, name: str) -> None:
         self.name = name
@@ -77,6 +79,7 @@ class FakePipeline:
 
         step = SimpleNamespace(
             assets=list(self.output_assets),
+            error=self.step_error,
             provider_payload={
                 "gmicloud": {
                     "request_id": "gmi-video-request-123",
@@ -126,6 +129,7 @@ class VideoGenerationServiceTests(unittest.TestCase):
         FakePipeline.last_instance = None
         FakePipeline.output_assets = [make_output_asset()]
         FakePipeline.run_error = None
+        FakePipeline.step_error = None
         FakeVideoProvider.last_retry_policy = None
 
     def generate(self, request: VideoGenerationRequest):
@@ -152,7 +156,10 @@ class VideoGenerationServiceTests(unittest.TestCase):
         self.assertIsNotNone(pipeline)
         assert pipeline is not None
         self.assertEqual(pipeline.name, "sereneset-video-generation")
-        self.assertEqual(pipeline.step_kwargs["model"], "Veo3-Fast")
+        self.assertEqual(
+            pipeline.step_kwargs["model"],
+            "veo-3.1-fast-generate-001",
+        )
         self.assertEqual(pipeline.step_kwargs["modality"], "video")
         self.assertIsNone(pipeline.step_kwargs["external_inputs"])
         self.assertEqual(pipeline.step_kwargs["duration"], 4)
@@ -162,6 +169,40 @@ class VideoGenerationServiceTests(unittest.TestCase):
         self.assertEqual(result.assets[0].content_type, "video/mp4")
         self.assertTrue(result.manifest_verified)
         self.assertEqual(result.generation_metadata["genblaze"]["modality"], "video")
+
+    def test_maps_veo_controls_to_current_gmi_wire_payload(self) -> None:
+        from genblaze_core import Modality
+        from genblaze_core.models.step import Step
+        from genblaze_gmicloud import GMICloudVideoProvider
+
+        models = build_gmicloud_video_models(
+            GMICloudVideoProvider,
+            model="veo-3.1-fast-generate-001",
+        )
+        provider = GMICloudVideoProvider(api_key="test-key", models=models)
+        step = Step(
+            provider="gmicloud",
+            model="veo-3.1-fast-generate-001",
+            modality=Modality.VIDEO,
+            prompt="Slowly orbit around the product.",
+            params={
+                "duration": 4,
+                "aspect_ratio": "16:9",
+                "resolution": "720p",
+            },
+        )
+
+        payload = provider.prepare_payload(step)
+
+        self.assertEqual(
+            payload,
+            {
+                "prompt": "Slowly orbit around the product.",
+                "durationSeconds": "4",
+                "aspectRatio": "16:9",
+                "resolution": "720p",
+            },
+        )
 
     def test_passes_image_input_and_request_overrides(self) -> None:
         result = self.generate(
@@ -247,6 +288,18 @@ class VideoGenerationServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(
             GenerationProviderError,
             "did not return a video artifact",
+        ):
+            self.generate(VideoGenerationRequest(prompt="Motion"))
+
+    def test_preserves_failed_step_error_without_video_artifact(self) -> None:
+        FakePipeline.output_assets = []
+        FakePipeline.step_error = (
+            "GMICloud submit failed: aiplatform.endpoints.predict denied"
+        )
+
+        with self.assertRaisesRegex(
+            GenerationProviderError,
+            "aiplatform.endpoints.predict denied",
         ):
             self.generate(VideoGenerationRequest(prompt="Motion"))
 

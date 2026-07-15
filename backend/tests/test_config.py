@@ -9,7 +9,10 @@ class VideoGenerationSettingsTests(unittest.TestCase):
     def test_video_generation_defaults(self) -> None:
         settings = Settings(_env_file=None)
 
-        self.assertEqual(settings.genblaze_video_model, "Veo3-Fast")
+        self.assertEqual(
+            settings.genblaze_video_model,
+            "veo-3.1-fast-generate-001",
+        )
         self.assertEqual(settings.genblaze_video_timeout_seconds, 900)
         self.assertEqual(
             settings.max_generated_video_size_bytes,

@@ -28,7 +28,7 @@ class Settings(BaseSettings):
         alias="GENBLAZE_IMAGE_MODEL",
     )
     genblaze_video_model: str = Field(
-        default="Veo3-Fast",
+        default="veo-3.1-fast-generate-001",
         alias="GENBLAZE_VIDEO_MODEL",
     )
     genblaze_timeout_seconds: int = Field(
