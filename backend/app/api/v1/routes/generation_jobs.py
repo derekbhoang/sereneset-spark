@@ -1,7 +1,8 @@
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -44,6 +45,119 @@ def metadata_list(value: object) -> list[dict[str, object]]:
         return []
 
     return [item for item in value if isinstance(item, dict)]
+
+
+def campaign_generation_job_statement(
+    *,
+    campaign_id: uuid.UUID,
+    job_id: uuid.UUID | None = None,
+    status_filter: GenerationJobStatus | None = None,
+    for_update: bool = False,
+):
+    statement = (
+        select(GenerationJob)
+        .join(GenerationJob.asset_version)
+        .join(AssetVersion.asset)
+        .where(Asset.campaign_id == campaign_id)
+    )
+    if job_id is not None:
+        statement = statement.where(GenerationJob.id == job_id)
+    if status_filter is not None:
+        statement = statement.where(
+            GenerationJob.status == status_filter.value
+        )
+    if for_update:
+        statement = statement.with_for_update(of=GenerationJob)
+
+    return statement
+
+
+def get_campaign_generation_job_or_404(
+    *,
+    campaign_id: uuid.UUID,
+    job_id: uuid.UUID,
+    db: Session,
+    for_update: bool = False,
+) -> GenerationJob:
+    job = db.scalar(
+        campaign_generation_job_statement(
+            campaign_id=campaign_id,
+            job_id=job_id,
+            for_update=for_update,
+        )
+    )
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generation job not found",
+        )
+
+    return job
+
+
+def generation_job_metadata_record(
+    job: GenerationJob,
+) -> dict[str, object | None]:
+    return {
+        "id": str(job.id),
+        "kind": job.kind,
+        "status": job.status,
+        "progress_percent": job.progress_percent,
+        "provider_job_id": job.provider_job_id,
+        "attempt_count": job.attempt_count,
+        "error_message": job.error_message,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "completed_at": (
+            job.completed_at.isoformat() if job.completed_at else None
+        ),
+    }
+
+
+def sync_generation_job_transition_metadata(
+    *,
+    job: GenerationJob,
+    event: str,
+    previous_status: str,
+    recorded_at: datetime,
+) -> None:
+    version = job.asset_version
+    metadata = dict(version.generation_metadata or {})
+    job_record = generation_job_metadata_record(job)
+    transition_history = metadata_list(metadata.get("job_transitions"))
+    transition_history = transition_history[-19:]
+    transition_history.append(
+        {
+            "event": event,
+            "previous_status": previous_status,
+            "status": job.status,
+            "attempt_count": job.attempt_count,
+            "recorded_at": recorded_at.isoformat(),
+            "source": "api",
+        }
+    )
+    metadata["job"] = job_record
+    metadata["job_transitions"] = transition_history
+
+    provenance = metadata.get("provenance")
+    if isinstance(provenance, dict):
+        metadata["provenance"] = {
+            **provenance,
+            "job": job_record,
+            "job_transitions": transition_history,
+        }
+
+    if event == "canceled":
+        metadata.pop("failure", None)
+        metadata["cancellation"] = {
+            "recorded_at": recorded_at.isoformat(),
+            "source": "api",
+        }
+    elif event == "retried":
+        metadata.pop("failure", None)
+        metadata.pop("cancellation", None)
+
+    version.generation_metadata = metadata
+    version.asset.updated_at = recorded_at
 
 
 def get_campaign_or_404(campaign_id: uuid.UUID, db: Session) -> Campaign:
@@ -303,6 +417,141 @@ def load_video_submission(
         asset=AssetRead.model_validate(asset),
         job=GenerationJobRead.model_validate(job),
     )
+
+
+@router.get(
+    "/campaigns/{campaign_id}/generation-jobs",
+    response_model=list[GenerationJobRead],
+)
+def list_campaign_generation_jobs(
+    campaign_id: uuid.UUID,
+    status_filter: GenerationJobStatus | None = Query(
+        default=None,
+        alias="status",
+    ),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> list[GenerationJob]:
+    get_campaign_or_404(campaign_id, db)
+    statement = (
+        campaign_generation_job_statement(
+            campaign_id=campaign_id,
+            status_filter=status_filter,
+        )
+        .order_by(
+            GenerationJob.created_at.desc(),
+            GenerationJob.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    )
+    return list(db.scalars(statement).all())
+
+
+@router.get(
+    "/campaigns/{campaign_id}/generation-jobs/{job_id}",
+    response_model=GenerationJobRead,
+)
+def get_campaign_generation_job(
+    campaign_id: uuid.UUID,
+    job_id: uuid.UUID,
+    db: Session = Depends(get_db),
+) -> GenerationJob:
+    return get_campaign_generation_job_or_404(
+        campaign_id=campaign_id,
+        job_id=job_id,
+        db=db,
+    )
+
+
+@router.post(
+    "/campaigns/{campaign_id}/generation-jobs/{job_id}/cancel",
+    response_model=GenerationJobRead,
+)
+def cancel_campaign_generation_job(
+    campaign_id: uuid.UUID,
+    job_id: uuid.UUID,
+    db: Session = Depends(get_db),
+) -> GenerationJob:
+    job = get_campaign_generation_job_or_404(
+        campaign_id=campaign_id,
+        job_id=job_id,
+        db=db,
+        for_update=True,
+    )
+    if job.status == GenerationJobStatus.canceled.value:
+        db.commit()
+        return job
+
+    if job.status != GenerationJobStatus.queued.value:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only queued generation jobs can be canceled",
+        )
+
+    canceled_at = datetime.now(UTC)
+    previous_status = job.status
+    job.status = GenerationJobStatus.canceled.value
+    job.progress_percent = 0
+    job.provider_job_id = None
+    job.error_message = None
+    job.started_at = None
+    job.completed_at = canceled_at
+    job.asset_version.label = "Canceled Genblaze video"
+    sync_generation_job_transition_metadata(
+        job=job,
+        event="canceled",
+        previous_status=previous_status,
+        recorded_at=canceled_at,
+    )
+    db.commit()
+    return job
+
+
+@router.post(
+    "/campaigns/{campaign_id}/generation-jobs/{job_id}/retry",
+    response_model=GenerationJobRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def retry_campaign_generation_job(
+    campaign_id: uuid.UUID,
+    job_id: uuid.UUID,
+    db: Session = Depends(get_db),
+) -> GenerationJob:
+    job = get_campaign_generation_job_or_404(
+        campaign_id=campaign_id,
+        job_id=job_id,
+        db=db,
+        for_update=True,
+    )
+    retryable_statuses = {
+        GenerationJobStatus.failed.value,
+        GenerationJobStatus.canceled.value,
+    }
+    if job.status not in retryable_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only failed or canceled generation jobs can be retried",
+        )
+
+    retried_at = datetime.now(UTC)
+    previous_status = job.status
+    job.status = GenerationJobStatus.queued.value
+    job.progress_percent = 0
+    job.provider_job_id = None
+    job.error_message = None
+    job.started_at = None
+    job.completed_at = None
+    job.asset_version.label = "Queued Genblaze video"
+    sync_generation_job_transition_metadata(
+        job=job,
+        event="retried",
+        previous_status=previous_status,
+        recorded_at=retried_at,
+    )
+    db.commit()
+    return job
 
 
 @router.post(
