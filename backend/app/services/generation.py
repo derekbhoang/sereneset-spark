@@ -390,6 +390,7 @@ def validate_video_input_assets(
     *,
     model: str,
     input_assets: list[dict[str, Any]],
+    require_download_url: bool = True,
 ) -> VideoInputMode:
     if len(input_assets) > 1:
         raise GenerationInputError(
@@ -423,7 +424,9 @@ def validate_video_input_assets(
         )
 
     url = optional_string(input_asset.get("url"))
-    if url is None or urlparse(url).scheme.lower() != "https":
+    if require_download_url and (
+        url is None or urlparse(url).scheme.lower() != "https"
+    ):
         raise GenerationInputError(
             "The video source image must have a downloadable HTTPS URL"
         )

@@ -35,6 +35,7 @@ class VideoGenerationSchemaTests(unittest.TestCase):
             {"channel": "Paid social", "prompt": "Motion", "aspect_ratio": "4:3"},
             {"channel": "Paid social", "prompt": "Motion", "resolution": "4k"},
             {"channel": "Paid social", "prompt": "Motion", "format": "image"},
+            {"channel": "Paid social", "prompt": "Motion", "status": "approved"},
         )
 
         for payload in invalid_payloads:

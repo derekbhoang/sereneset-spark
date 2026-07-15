@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from enum import Enum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,7 +30,7 @@ class VideoGenerationCreate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=180)
     channel: str = Field(min_length=1, max_length=80)
     prompt: str = Field(min_length=1)
-    status: ReviewStatus = ReviewStatus.draft
+    status: Literal[ReviewStatus.draft] = ReviewStatus.draft
     reviewer: str | None = Field(default=None, max_length=120)
     tags: list[VideoGenerationTag] = Field(default_factory=list)
     summary: str | None = Field(default=None, min_length=1)
