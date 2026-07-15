@@ -47,6 +47,15 @@ class ImageGenerationRequest:
 
 
 @dataclass(frozen=True)
+class VideoGenerationRequest:
+    prompt: str
+    model: str | None = None
+    timeout_seconds: int | None = None
+    parameters: dict[str, Any] = field(default_factory=dict)
+    input_assets: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class GeneratedAsset:
     url: str | None
     storage_key: str | None
@@ -64,6 +73,7 @@ class GenerationResult:
     manifest_uri: str | None
     manifest_hash: str | None
     manifest_verified: bool | None
+    provider_job_id: str | None
     assets: list[GeneratedAsset]
     generation_metadata: dict[str, Any]
 
@@ -111,6 +121,27 @@ def require_genblaze_imports() -> tuple[Any, ...]:
         Pipeline,
         GMICloudImageProvider,
         S3StorageBackend,
+    )
+
+
+def require_genblaze_video_imports() -> tuple[Any, ...]:
+    try:
+        from genblaze_core import Asset as GenblazeAsset
+        from genblaze_core import Modality, Pipeline
+        from genblaze_core.providers import RetryPolicy
+        from genblaze_gmicloud import GMICloudVideoProvider
+    except ImportError as exc:
+        raise GenerationConfigurationError(
+            "Genblaze video packages are not installed. Install backend "
+            "requirements first."
+        ) from exc
+
+    return (
+        GenblazeAsset,
+        Modality,
+        Pipeline,
+        GMICloudVideoProvider,
+        RetryPolicy,
     )
 
 
@@ -162,11 +193,47 @@ def extract_asset(asset: Any, bucket_name: str) -> GeneratedAsset:
     )
 
 
+def is_video_asset(asset: GeneratedAsset) -> bool:
+    content_type = (asset.content_type or "").split(";", maxsplit=1)[0].lower()
+    if content_type.startswith("video/"):
+        return True
+
+    filename = (asset.filename or asset.storage_key or asset.url or "").lower()
+    return filename.endswith((".mp4", ".mov", ".webm", ".m4v"))
+
+
 def coerce_pipeline_result(result: Any) -> tuple[Any, Any]:
     if isinstance(result, tuple) and len(result) == 2:
         return result
 
     return getattr(result, "run", None), getattr(result, "manifest", None)
+
+
+def verify_manifest(manifest: Any) -> bool | None:
+    if manifest is None or not hasattr(manifest, "verify"):
+        return None
+
+    try:
+        return bool(manifest.verify())
+    except Exception:
+        return None
+
+
+def extract_provider_job_id(steps: list[Any]) -> str | None:
+    for step in reversed(steps):
+        provider_payload = getattr(step, "provider_payload", None)
+        if not isinstance(provider_payload, dict):
+            continue
+
+        gmicloud_payload = provider_payload.get("gmicloud")
+        if not isinstance(gmicloud_payload, dict):
+            continue
+
+        request_id = gmicloud_payload.get("request_id")
+        if request_id is not None and str(request_id).strip():
+            return str(request_id)
+
+    return None
 
 
 def serialize_input_asset(input_asset: dict[str, Any]) -> dict[str, Any]:
@@ -377,13 +444,8 @@ class GenblazeGenerationService:
             for step in steps
             for asset in (getattr(step, "assets", []) or [])
         ]
-        manifest_verified: bool | None = None
-
-        if manifest is not None and hasattr(manifest, "verify"):
-            try:
-                manifest_verified = bool(manifest.verify())
-            except Exception:
-                manifest_verified = None
+        manifest_verified = verify_manifest(manifest)
+        provider_job_id = extract_provider_job_id(steps)
 
         return GenerationResult(
             provider="gmicloud",
@@ -392,6 +454,7 @@ class GenblazeGenerationService:
             manifest_uri=getattr(manifest, "manifest_uri", None),
             manifest_hash=getattr(manifest, "canonical_hash", None),
             manifest_verified=manifest_verified,
+            provider_job_id=provider_job_id,
             assets=assets,
             generation_metadata={
                 "genblaze": {
@@ -400,6 +463,100 @@ class GenblazeGenerationService:
                     "manifest_uri": getattr(manifest, "manifest_uri", None),
                     "manifest_hash": getattr(manifest, "canonical_hash", None),
                     "manifest_verified": manifest_verified,
+                    "provider_job_id": provider_job_id,
+                    "asset_count": len(assets),
+                    "input_asset_count": len(request.input_assets),
+                    "external_input_count": len(external_inputs),
+                    "input_assets_parameter": input_assets_parameter,
+                }
+            },
+        )
+
+    def generate_video(
+        self,
+        request: VideoGenerationRequest,
+    ) -> GenerationResult:
+        self._validate_settings()
+        self._configure_env()
+
+        (
+            GenblazeAsset,
+            Modality,
+            Pipeline,
+            GMICloudVideoProvider,
+            RetryPolicy,
+        ) = require_genblaze_video_imports()
+
+        model = request.model or self.settings.genblaze_video_model
+        timeout_seconds = (
+            request.timeout_seconds
+            or self.settings.genblaze_video_timeout_seconds
+        )
+        pipeline_parameters, input_assets_parameter = build_pipeline_parameters(
+            parameters=request.parameters,
+            input_assets=request.input_assets,
+        )
+        external_inputs = build_external_input_assets(
+            input_assets=request.input_assets,
+            genblaze_asset_class=GenblazeAsset,
+        )
+        video_provider = call_with_supported_kwargs(
+            GMICloudVideoProvider,
+            retry_policy=RetryPolicy.conservative(),
+        )
+
+        try:
+            pipeline = Pipeline("sereneset-video-generation").step(
+                video_provider,
+                model=model,
+                prompt=request.prompt,
+                modality=Modality.VIDEO,
+                external_inputs=external_inputs or None,
+                **pipeline_parameters,
+            )
+            result = pipeline.run(
+                sink=self._make_storage_sink(),
+                timeout=timeout_seconds,
+            )
+        except Exception as exc:
+            raise GenerationProviderError(
+                f"Genblaze video generation failed: {exc}"
+            ) from exc
+
+        run, manifest = coerce_pipeline_result(result)
+        steps = list(getattr(run, "steps", []) or [])
+        generated_assets = [
+            extract_asset(asset, self.settings.b2_bucket_name)
+            for step in steps
+            for asset in (getattr(step, "assets", []) or [])
+        ]
+        assets = [asset for asset in generated_assets if is_video_asset(asset)]
+        if not assets:
+            raise GenerationProviderError(
+                "Genblaze video generation did not return a video artifact"
+            )
+
+        manifest_verified = verify_manifest(manifest)
+        provider_job_id = extract_provider_job_id(steps)
+
+        return GenerationResult(
+            provider="gmicloud",
+            model=model,
+            prompt=request.prompt,
+            manifest_uri=getattr(manifest, "manifest_uri", None),
+            manifest_hash=getattr(manifest, "canonical_hash", None),
+            manifest_verified=manifest_verified,
+            provider_job_id=provider_job_id,
+            assets=assets,
+            generation_metadata={
+                "genblaze": {
+                    "provider": "gmicloud",
+                    "model": model,
+                    "modality": "video",
+                    "manifest_uri": getattr(manifest, "manifest_uri", None),
+                    "manifest_hash": getattr(manifest, "canonical_hash", None),
+                    "manifest_verified": manifest_verified,
+                    "provider_job_id": provider_job_id,
                     "asset_count": len(assets),
                     "input_asset_count": len(request.input_assets),
                     "external_input_count": len(external_inputs),
