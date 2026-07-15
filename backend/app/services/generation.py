@@ -4,7 +4,9 @@ import inspect
 import mimetypes
 import os
 from dataclasses import dataclass, field
+from enum import Enum
 from functools import lru_cache
+from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -19,7 +21,24 @@ class GenerationProviderError(RuntimeError):
     pass
 
 
+class GenerationInputError(ValueError):
+    pass
+
+
 GENBLAZE_EXTERNAL_INPUTS_PARAMETER = "external_inputs"
+MAX_VIDEO_INPUT_SIZE_BYTES = 25 * 1024 * 1024
+VIDEO_SOURCE_INPUT_ROLE = "source_creative"
+ALLOWED_VIDEO_INPUT_CONTENT_TYPES = {
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+KNOWN_IMAGE_EXTENSION_CONTENT_TYPES = {
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 INPUT_ASSET_METADATA_KEYS = (
     "role",
     "storage_key",
@@ -53,6 +72,19 @@ class VideoGenerationRequest:
     timeout_seconds: int | None = None
     parameters: dict[str, Any] = field(default_factory=dict)
     input_assets: list[dict[str, Any]] = field(default_factory=list)
+    context_assets: list[dict[str, Any]] = field(default_factory=list)
+
+
+class VideoInputMode(str, Enum):
+    text_to_video = "text_to_video"
+    image_to_video = "image_to_video"
+
+
+@dataclass(frozen=True)
+class VideoInputPlan:
+    mode: VideoInputMode
+    provider_input_assets: list[dict[str, Any]]
+    provenance_input_assets: list[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -265,16 +297,21 @@ def infer_asset_media_type(
     url: str | None,
 ) -> str:
     normalized_content_type = (content_type or "").split(";")[0].strip().lower()
-    guessed_content_type, _encoding = mimetypes.guess_type(filename or url or "")
+    media_path = unquote(urlparse(filename or url or "").path).replace("\\", "/")
+    known_content_type = KNOWN_IMAGE_EXTENSION_CONTENT_TYPES.get(
+        PurePosixPath(media_path).suffix.lower()
+    )
+    guessed_content_type, _encoding = mimetypes.guess_type(media_path)
+    inferred_content_type = known_content_type or guessed_content_type
 
     if (
-        guessed_content_type
+        inferred_content_type
         and (
             not normalized_content_type
             or normalized_content_type == "application/octet-stream"
         )
     ):
-        return guessed_content_type
+        return inferred_content_type
 
     return normalized_content_type or "image/png"
 
@@ -330,6 +367,108 @@ def build_pipeline_parameters(
         return pipeline_parameters, None
 
     return pipeline_parameters, GENBLAZE_EXTERNAL_INPUTS_PARAMETER
+
+
+def video_model_input_requirement(model: str) -> str:
+    normalized_model = model.casefold()
+
+    if "transition" in normalized_model:
+        return "unsupported"
+
+    if "image2video" in normalized_model or any(
+        marker in normalized_model for marker in ("-i2v", "-r2v")
+    ):
+        return "required"
+
+    if "text2video" in normalized_model or "-t2v" in normalized_model:
+        return "forbidden"
+
+    return "optional"
+
+
+def validate_video_input_assets(
+    *,
+    model: str,
+    input_assets: list[dict[str, Any]],
+) -> VideoInputMode:
+    if len(input_assets) > 1:
+        raise GenerationInputError(
+            "Video generation accepts at most one source image"
+        )
+
+    input_requirement = video_model_input_requirement(model)
+    if input_requirement == "unsupported":
+        raise GenerationInputError(
+            f"Video model '{model}' requires an unsupported multi-image flow"
+        )
+
+    if not input_assets:
+        if input_requirement == "required":
+            raise GenerationInputError(
+                f"Video model '{model}' requires one source image"
+            )
+
+        return VideoInputMode.text_to_video
+
+    if input_requirement == "forbidden":
+        raise GenerationInputError(
+            f"Video model '{model}' only supports text-to-video generation"
+        )
+
+    input_asset = input_assets[0]
+    role = optional_string(input_asset.get("role"))
+    if role != VIDEO_SOURCE_INPUT_ROLE:
+        raise GenerationInputError(
+            "The video source image must use role 'source_creative'"
+        )
+
+    url = optional_string(input_asset.get("url"))
+    if url is None or urlparse(url).scheme.lower() != "https":
+        raise GenerationInputError(
+            "The video source image must have a downloadable HTTPS URL"
+        )
+
+    content_type = infer_asset_media_type(
+        content_type=optional_string(input_asset.get("content_type")),
+        filename=optional_string(input_asset.get("filename")),
+        url=url,
+    )
+    if content_type not in ALLOWED_VIDEO_INPUT_CONTENT_TYPES:
+        supported_types = ", ".join(sorted(ALLOWED_VIDEO_INPUT_CONTENT_TYPES))
+        raise GenerationInputError(
+            "The video source image type is not supported. "
+            f"Use one of: {supported_types}"
+        )
+
+    size_bytes = optional_int(input_asset.get("size_bytes"))
+    if size_bytes is None or size_bytes <= 0:
+        raise GenerationInputError(
+            "The video source image must have a positive size"
+        )
+
+    if size_bytes > MAX_VIDEO_INPUT_SIZE_BYTES:
+        raise GenerationInputError(
+            "The video source image must be 25 MB or smaller"
+        )
+
+    return VideoInputMode.image_to_video
+
+
+def build_video_input_plan(
+    *,
+    model: str,
+    source_input_assets: list[dict[str, Any]],
+    context_assets: list[dict[str, Any]],
+) -> VideoInputPlan:
+    mode = validate_video_input_assets(
+        model=model,
+        input_assets=source_input_assets,
+    )
+    return VideoInputPlan(
+        mode=mode,
+        provider_input_assets=list(source_input_assets),
+        provenance_input_assets=[*source_input_assets, *context_assets],
+    )
 
 
 class GenblazeGenerationService:
@@ -492,12 +631,17 @@ class GenblazeGenerationService:
             request.timeout_seconds
             or self.settings.genblaze_video_timeout_seconds
         )
+        input_plan = build_video_input_plan(
+            model=model,
+            source_input_assets=request.input_assets,
+            context_assets=request.context_assets,
+        )
         pipeline_parameters, input_assets_parameter = build_pipeline_parameters(
             parameters=request.parameters,
-            input_assets=request.input_assets,
+            input_assets=input_plan.provider_input_assets,
         )
         external_inputs = build_external_input_assets(
-            input_assets=request.input_assets,
+            input_assets=input_plan.provider_input_assets,
             genblaze_asset_class=GenblazeAsset,
         )
         video_provider = call_with_supported_kwargs(
@@ -553,15 +697,24 @@ class GenblazeGenerationService:
                     "provider": "gmicloud",
                     "model": model,
                     "modality": "video",
+                    "input_mode": input_plan.mode.value,
                     "manifest_uri": getattr(manifest, "manifest_uri", None),
                     "manifest_hash": getattr(manifest, "canonical_hash", None),
                     "manifest_verified": manifest_verified,
                     "provider_job_id": provider_job_id,
                     "asset_count": len(assets),
-                    "input_asset_count": len(request.input_assets),
+                    "input_asset_count": len(input_plan.provider_input_assets),
+                    "context_asset_count": len(request.context_assets),
+                    "provenance_asset_count": len(
+                        input_plan.provenance_input_assets
+                    ),
                     "external_input_count": len(external_inputs),
                     "input_assets_parameter": input_assets_parameter,
-                }
+                },
+                "input_assets": [
+                    serialize_input_asset(input_asset)
+                    for input_asset in input_plan.provenance_input_assets
+                ],
             },
         )
 

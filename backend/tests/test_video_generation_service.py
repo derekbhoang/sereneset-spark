@@ -183,6 +183,16 @@ class VideoGenerationServiceTests(unittest.TestCase):
                         "role": "source_creative",
                     }
                 ],
+                context_assets=[
+                    {
+                        "storage_key": "brand-assets/guidelines.pdf",
+                        "filename": "guidelines.pdf",
+                        "content_type": "application/pdf",
+                        "size_bytes": 4096,
+                        "role": "brand_reference",
+                        "source": "campaign_brand_asset",
+                    }
+                ],
             )
         )
         pipeline = FakePipeline.last_instance
@@ -212,6 +222,14 @@ class VideoGenerationServiceTests(unittest.TestCase):
         self.assertEqual(
             result.generation_metadata["genblaze"]["input_assets_parameter"],
             "external_inputs",
+        )
+        self.assertEqual(
+            result.generation_metadata["genblaze"]["context_asset_count"],
+            1,
+        )
+        self.assertEqual(
+            result.generation_metadata["input_assets"][1]["filename"],
+            "guidelines.pdf",
         )
 
     def test_wraps_provider_failure(self) -> None:
