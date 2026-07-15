@@ -20,6 +20,13 @@ from app.schemas.brand_asset import (
     CampaignBrandAssetRead,
 )
 from app.schemas.campaign import CampaignCreate, CampaignRead, CampaignUpdate
+from app.schemas.generation_job import (
+    GenerationJobRead,
+    VideoAspectRatio,
+    VideoGenerationCreate,
+    VideoGenerationSubmissionRead,
+    VideoResolution,
+)
 
 __all__ = [
     "AssetCreate",
@@ -42,4 +49,9 @@ __all__ = [
     "CampaignBrandAssetRead",
     "CampaignRead",
     "CampaignUpdate",
+    "GenerationJobRead",
+    "VideoAspectRatio",
+    "VideoGenerationCreate",
+    "VideoGenerationSubmissionRead",
+    "VideoResolution",
 ]
