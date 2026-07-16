@@ -3,12 +3,13 @@ from __future__ import annotations
 import copy
 import logging
 import mimetypes
-import time
+import signal
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
+from threading import Event
 from typing import Any, Protocol
 
 from sqlalchemy import Select, or_, select
@@ -964,8 +965,10 @@ def run_worker_forever(
     *,
     session_factory: SessionFactory = SessionLocal,
     settings: Settings | None = None,
+    stop_event: Event | None = None,
 ) -> None:
     worker_settings = settings or get_settings()
+    shutdown_event = stop_event or Event()
     logger.info("Video generation worker starting")
 
     try:
@@ -986,7 +989,7 @@ def run_worker_forever(
     except Exception:
         logger.exception("Could not recover stale video generation jobs")
 
-    while True:
+    while not shutdown_event.is_set():
         try:
             handled_job = run_worker_once(
                 session_factory=session_factory,
@@ -997,7 +1000,9 @@ def run_worker_forever(
             handled_job = False
 
         if not handled_job:
-            time.sleep(worker_settings.generation_worker_poll_seconds)
+            shutdown_event.wait(worker_settings.generation_worker_poll_seconds)
+
+    logger.info("Video generation worker stopped")
 
 
 def main() -> None:
@@ -1005,10 +1010,19 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    stop_event = Event()
+
+    def request_shutdown(signum: int, _frame: object) -> None:
+        logger.info("Video generation worker received signal %s", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
     try:
-        run_worker_forever()
+        run_worker_forever(stop_event=stop_event)
     except KeyboardInterrupt:
-        logger.info("Video generation worker stopped")
+        stop_event.set()
 
 
 if __name__ == "__main__":

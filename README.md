@@ -61,4 +61,35 @@ The first version of SereneSet Spark focuses on a complete campaign asset workfl
 9. Search and filter assets by campaign, channel, status, format, audience, or tag.
 10. Export approved assets as a campaign pack for handoff or publishing.
 
-Video concept generation can be included as a stretch goal after the copy, image, storage, review, and export workflow is working reliably.
+Video generation runs asynchronously through a PostgreSQL-backed worker so long-running provider requests do not block the API process.
+
+## Production Containers
+
+The production Compose stack runs three processes:
+
+- `api`: FastAPI served by Uvicorn on the private Compose network.
+- `worker`: the PostgreSQL-backed video generation worker, built from the same backend image as the API.
+- `frontend`: a Vite production build served by Nginx on port `8080`. Nginx forwards same-origin `/api` requests to the API service.
+
+Create the production environment file and replace every placeholder secret:
+
+```powershell
+Copy-Item .env.production.example .env.production
+```
+
+Build the images, apply the database migrations, and start the stack:
+
+```powershell
+docker compose --env-file .env.production -f compose.production.yml build
+docker compose --env-file .env.production -f compose.production.yml run --rm api alembic upgrade head
+docker compose --env-file .env.production -f compose.production.yml up -d
+```
+
+Open `http://localhost:8080` and inspect process health with:
+
+```powershell
+docker compose --env-file .env.production -f compose.production.yml ps
+docker compose --env-file .env.production -f compose.production.yml logs -f api worker frontend
+```
+
+The Compose stack expects `DATABASE_URL` to point to an existing PostgreSQL database. Generated media, brand assets, provenance sidecars, and export inputs continue to use the configured Backblaze B2 bucket. TLS should terminate at the deployment platform or an external reverse proxy in front of port `8080`.

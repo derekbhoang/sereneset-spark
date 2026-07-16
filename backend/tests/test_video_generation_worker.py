@@ -1,7 +1,8 @@
 import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import MagicMock
+from threading import Event
+from unittest.mock import MagicMock, patch
 
 from sqlalchemy.dialects import postgresql
 
@@ -15,6 +16,7 @@ from app.services.generation import (
 from app.services.storage import StoredObject
 from app.workers.video_generation import (
     DurableVideoArtifact,
+    RecoverySummary,
     VideoJobSnapshot,
     VideoProvenanceContext,
     build_completed_generation_metadata,
@@ -26,6 +28,7 @@ from app.workers.video_generation import (
     mark_video_job_failed,
     prepare_source_input_assets,
     recover_stale_video_jobs,
+    run_worker_forever,
     select_durable_video_artifact,
     store_video_artifact,
     upload_video_provenance_sidecar,
@@ -117,6 +120,40 @@ def make_result() -> GenerationResult:
 
 
 class VideoGenerationWorkerTests(unittest.TestCase):
+    def test_worker_stops_claiming_jobs_after_shutdown_is_requested(self) -> None:
+        stop_event = Event()
+        settings = MagicMock(
+            generation_job_stale_after_seconds=1800,
+            generation_job_max_attempts=2,
+            generation_worker_poll_seconds=2,
+        )
+        session_factory = MagicMock()
+
+        def run_current_job(**_kwargs: object) -> bool:
+            stop_event.set()
+            return True
+
+        with (
+            patch(
+                "app.workers.video_generation.recover_stale_video_jobs",
+                return_value=RecoverySummary(requeued=0, failed=0),
+            ),
+            patch(
+                "app.workers.video_generation.run_worker_once",
+                side_effect=run_current_job,
+            ) as run_once,
+        ):
+            run_worker_forever(
+                session_factory=session_factory,
+                settings=settings,
+                stop_event=stop_event,
+            )
+
+        run_once.assert_called_once_with(
+            session_factory=session_factory,
+            settings=settings,
+        )
+
     def test_claim_statement_uses_postgresql_skip_locked(self) -> None:
         compiled = str(
             build_video_job_claim_statement().compile(
