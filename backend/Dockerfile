@@ -20,6 +20,7 @@ RUN python -m pip install --upgrade pip \
 COPY --chown=app:app alembic.ini ./
 COPY --chown=app:app alembic ./alembic
 COPY --chown=app:app app ./app
+COPY --chown=app:app scripts ./scripts
 
 USER app
 

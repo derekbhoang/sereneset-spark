@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="240" viewBox="0 0 720 240" role="img" aria-labelledby="title desc">
+  <title id="title">SereneSet wordmark</title>
+  <desc id="desc">SereneSet in dark lettering with violet and coral brand accents.</desc>
+  <rect width="720" height="240" fill="#f7f7f2"/>
+  <rect width="18" height="240" fill="#7741f4"/>
+  <text x="74" y="140" fill="#16181c" font-family="Segoe UI, Arial, sans-serif" font-size="82" font-weight="700">SERENESET</text>
+  <rect x="78" y="164" width="132" height="10" fill="#f77056"/>
+  <rect x="224" y="164" width="64" height="10" fill="#a7e8d3"/>
+</svg>

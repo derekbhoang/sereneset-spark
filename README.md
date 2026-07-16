@@ -63,6 +63,32 @@ The first version of SereneSet Spark focuses on a complete campaign asset workfl
 
 Video generation runs asynchronously through a PostgreSQL-backed worker so long-running provider requests do not block the API process.
 
+## Demo Showcase Seed
+
+Run the migrations, configure PostgreSQL and B2 in `backend/.env`, then seed the polished showcase campaign:
+
+```powershell
+Set-Location backend
+alembic upgrade head
+python scripts/seed.py --showcase-only
+```
+
+The backend production image includes the seed script and fixtures. Against a running production Compose stack, the equivalent command is:
+
+```powershell
+docker compose --env-file .env.production -f compose.production.yml run --rm api python scripts/seed.py --showcase-only
+```
+
+The showcase includes three attached brand assets, two approved image versions, a playable approved video, immutable input snapshots, a completed video job, SHA-256 provenance, B2 manifests and sidecars, and artifacts that can be previewed and exported from the UI. The bundled media is explicitly identified in provenance as deterministic demo fixtures, not a live provider run.
+
+The seed uses stable UUIDs and deterministic B2 keys. Running the same command again updates the same rows and overwrites the same objects without creating duplicates. To generate and verify a campaign pack at seed time, add an output path:
+
+```powershell
+python scripts/seed.py --showcase-only --export-pack ..\sereneset-showcase.zip
+```
+
+Running without `--showcase-only` also seeds the original lightweight example campaigns. `--metadata-only` skips B2 writes for database-only development, but its showcase media cannot be previewed or exported until the command is rerun with B2 enabled.
+
 ## Development Checks
 
 Install backend development dependencies and run the backend suite:

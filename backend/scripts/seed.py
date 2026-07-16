@@ -13,9 +13,16 @@ BACKEND_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND_DIR))
 os.chdir(BACKEND_DIR)
 
+from app.api.v1.routes.campaigns import write_campaign_export_zip  # noqa: E402
+from app.core.config import get_settings  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
 from app.models.asset import Asset, AssetFormat, AssetVersion, ReviewStatus  # noqa: E402
 from app.models.campaign import Campaign  # noqa: E402
+from app.services.storage import B2StorageService  # noqa: E402
+from scripts.demo_showcase import (  # noqa: E402
+    get_showcase_campaign_for_export,
+    seed_showcase_campaign,
+)
 
 
 CampaignSeed = dict[str, Any]
@@ -299,6 +306,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Delete obvious throwaway campaigns named string, abc, or def.",
     )
+    parser.add_argument(
+        "--showcase-only",
+        action="store_true",
+        help="Skip the legacy metadata-only campaigns.",
+    )
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help=(
+            "Write showcase rows without uploading fixtures to B2. The showcase "
+            "will not be previewable or exportable until seeded again without "
+            "this flag."
+        ),
+    )
+    parser.add_argument(
+        "--export-pack",
+        type=Path,
+        help="Also write the seeded showcase campaign export to this ZIP path.",
+    )
     return parser.parse_args()
 
 
@@ -383,7 +409,20 @@ def upsert_version(
     return version, created
 
 
-def seed_demo_data(db: Session) -> dict[str, int]:
+def merge_counts(
+    counts: dict[str, int],
+    additional_counts: dict[str, int],
+) -> None:
+    for key, value in additional_counts.items():
+        counts[key] = counts.get(key, 0) + value
+
+
+def seed_demo_data(
+    db: Session,
+    *,
+    storage: B2StorageService | None,
+    include_legacy_campaigns: bool = True,
+) -> dict[str, int]:
     counts = {
         "campaigns_created": 0,
         "campaigns_updated": 0,
@@ -393,27 +432,41 @@ def seed_demo_data(db: Session) -> dict[str, int]:
         "versions_updated": 0,
     }
 
-    for campaign_data in DEMO_CAMPAIGNS:
-        campaign, campaign_created = upsert_campaign(db, campaign_data)
-        counts[
-            "campaigns_created" if campaign_created else "campaigns_updated"
-        ] += 1
+    if include_legacy_campaigns:
+        for campaign_data in DEMO_CAMPAIGNS:
+            campaign, campaign_created = upsert_campaign(db, campaign_data)
+            counts[
+                "campaigns_created" if campaign_created else "campaigns_updated"
+            ] += 1
 
-        for asset_data in campaign_data["assets"]:
-            asset, asset_created = upsert_asset(db, campaign, asset_data)
-            counts["assets_created" if asset_created else "assets_updated"] += 1
+            for asset_data in campaign_data["assets"]:
+                asset, asset_created = upsert_asset(db, campaign, asset_data)
+                counts["assets_created" if asset_created else "assets_updated"] += 1
 
-            for version_data in asset_data["versions"]:
-                _, version_created = upsert_version(db, asset, version_data)
-                counts[
-                    "versions_created" if version_created else "versions_updated"
-                ] += 1
+                for version_data in asset_data["versions"]:
+                    _, version_created = upsert_version(db, asset, version_data)
+                    counts[
+                        "versions_created" if version_created else "versions_updated"
+                    ] += 1
+
+    merge_counts(
+        counts,
+        seed_showcase_campaign(db, storage=storage),
+    )
 
     return counts
 
 
 def main() -> None:
     args = parse_args()
+    if args.metadata_only and args.export_pack is not None:
+        raise SystemExit("--export-pack cannot be used with --metadata-only")
+
+    settings = get_settings()
+    storage = None
+    if not args.metadata_only:
+        storage = B2StorageService(settings)
+        storage.check_bucket_access()
 
     with SessionLocal() as db:
         deleted_test_records = 0
@@ -421,12 +474,34 @@ def main() -> None:
         if args.delete_test_records:
             deleted_test_records = delete_test_records(db)
 
-        counts = seed_demo_data(db)
+        counts = seed_demo_data(
+            db,
+            storage=storage,
+            include_legacy_campaigns=not args.showcase_only,
+        )
         db.commit()
 
+    export_path: Path | None = None
+    if args.export_pack is not None:
+        assert storage is not None
+        export_path = args.export_pack.resolve()
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        with SessionLocal() as db:
+            campaign = get_showcase_campaign_for_export(db)
+            write_campaign_export_zip(
+                campaign=campaign,
+                storage=storage,
+                destination=str(export_path),
+                max_video_artifact_size_bytes=(settings.max_generated_video_size_bytes),
+            )
+
     print("Seed complete")
+    if args.metadata_only:
+        print("B2 uploads skipped; rerun without --metadata-only before demoing")
     if args.delete_test_records:
         print(f"Deleted test campaigns: {deleted_test_records}")
+    if export_path is not None:
+        print(f"Export pack: {export_path}")
 
     for key, value in counts.items():
         print(f"{key}: {value}")
