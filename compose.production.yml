@@ -18,8 +18,16 @@ x-backend-service: &backend-service
       max-file: "3"
 
 services:
+  migrate:
+    <<: *backend-service
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+
   api:
     <<: *backend-service
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     expose:
       - "8000"
     stop_grace_period: ${API_STOP_GRACE_PERIOD:-12m}
@@ -41,6 +49,8 @@ services:
     <<: *backend-service
     command: ["python", "-m", "app.workers.video_generation"]
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       api:
         condition: service_healthy
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-20m}

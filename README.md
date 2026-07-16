@@ -65,8 +65,9 @@ Video generation runs asynchronously through a PostgreSQL-backed worker so long-
 
 ## Production Containers
 
-The production Compose stack runs three processes:
+The production Compose stack runs three long-lived services and one release process:
 
+- `migrate`: runs `alembic upgrade head` once and must complete successfully before the API or worker starts.
 - `api`: FastAPI served by Uvicorn on the private Compose network.
 - `worker`: the PostgreSQL-backed video generation worker, built from the same backend image as the API.
 - `frontend`: a Vite production build served by Nginx on port `8080`. Nginx forwards same-origin `/api` requests to the API service.
@@ -77,19 +78,19 @@ Create the production environment file and replace every placeholder secret:
 Copy-Item .env.production.example .env.production
 ```
 
-Build the images, apply the database migrations, and start the stack:
+Build and start the stack:
 
 ```powershell
-docker compose --env-file .env.production -f compose.production.yml build
-docker compose --env-file .env.production -f compose.production.yml run --rm api alembic upgrade head
-docker compose --env-file .env.production -f compose.production.yml up -d
+docker compose --env-file .env.production -f compose.production.yml up -d --build
 ```
+
+Compose runs the `migrate` release process automatically. The API and worker remain stopped if Alembic exits with an error, preventing application code from starting against an outdated schema. On deployment platforms with a dedicated release phase, use the same backend image with `alembic upgrade head` as its release command.
 
 Open `http://localhost:8080` and inspect process health with:
 
 ```powershell
-docker compose --env-file .env.production -f compose.production.yml ps
-docker compose --env-file .env.production -f compose.production.yml logs -f api worker frontend
+docker compose --env-file .env.production -f compose.production.yml ps --all
+docker compose --env-file .env.production -f compose.production.yml logs -f migrate api worker frontend
 ```
 
 The Compose stack expects `DATABASE_URL` to point to an existing PostgreSQL database. Generated media, brand assets, provenance sidecars, and export inputs continue to use the configured Backblaze B2 bucket. TLS should terminate at the deployment platform or an external reverse proxy in front of port `8080`.
