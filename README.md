@@ -89,6 +89,31 @@ python scripts/seed.py --showcase-only --export-pack ..\sereneset-showcase.zip
 
 Running without `--showcase-only` also seeds the original lightweight example campaigns. `--metadata-only` skips B2 writes for database-only development, but its showcase media cannot be previewed or exported until the command is rerun with B2 enabled.
 
+### Different Device Test
+
+For a final same-network rehearsal, deploy the production API, worker, migration, and frontend images with an isolated PostgreSQL container:
+
+```powershell
+.\scripts\deploy-device-test.ps1
+```
+
+The launcher reads B2 and provider credentials directly from `backend/.env`, waits for `/api/v1/health/ready`, seeds the showcase, and prints the local and private-LAN URLs. It does not create another secrets file. Connect a phone, tablet, or second computer to the same network and open the printed LAN URL. Windows may ask once for permission to allow Docker Desktop on private networks.
+
+Run the deployed workflow smoke test through the LAN address before using the second device:
+
+```powershell
+python scripts\test-deployed-workflow.py --base-url http://192.168.68.104:8080
+```
+
+The smoke test verifies readiness, campaign CRUD, the public `status` filter, brand files, image and video artifacts, stored sidecars, provenance hashes, the completed worker job, and every file referenced by the exported campaign pack. It uses the deterministic showcase and does not submit paid generation requests.
+
+This overlay is for device testing only. It sets `ENVIRONMENT=development` so the containers may use its local PostgreSQL service; the production Compose file continues to require managed PostgreSQL with TLS. Stop the rehearsal without deleting its database volume:
+
+```powershell
+$env:ENV_FILE = (Resolve-Path backend\.env).Path
+docker compose --env-file backend\.env -f compose.production.yml -f compose.device-test.yml down
+```
+
 ## Development Checks
 
 Install backend development dependencies and run the backend suite:

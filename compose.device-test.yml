@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: sereneset_spark
+      POSTGRES_USER: sereneset
+      POSTGRES_PASSWORD: sereneset
+    volumes:
+      - device_test_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sereneset -d sereneset_spark"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  migrate:
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+psycopg://sereneset:sereneset@postgres:5432/sereneset_spark
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+psycopg://sereneset:sereneset@postgres:5432/sereneset_spark
+
+  worker:
+    environment:
+      ENVIRONMENT: development
+      DATABASE_URL: postgresql+psycopg://sereneset:sereneset@postgres:5432/sereneset_spark
+
+volumes:
+  device_test_postgres_data:
