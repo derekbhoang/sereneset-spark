@@ -70,6 +70,30 @@ class ProductionServiceSettingsTests(unittest.TestCase):
                 )
             )
 
+    def test_accepts_managed_postgresql_on_private_network(self) -> None:
+        settings = make_production_settings(
+            DATABASE_URL=("postgresql://user:password@dpg-example-a/sereneset_spark"),
+            DATABASE_CONNECTION_MODE="private",
+        )
+
+        self.assertEqual(settings.database_connection_mode, "private")
+        self.assertEqual(
+            settings.database_url,
+            "postgresql+psycopg://user:password@dpg-example-a/sereneset_spark",
+        )
+
+    def test_rejects_public_hostname_declared_as_private(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "must use an internal DNS hostname",
+        ):
+            make_production_settings(
+                DATABASE_URL=(
+                    "postgresql://user:password@db.example.com/sereneset_spark"
+                ),
+                DATABASE_CONNECTION_MODE="private",
+            )
+
     def test_rejects_incomplete_b2_configuration_in_production(self) -> None:
         for overrides in (
             {"B2_BUCKET_NAME": ""},

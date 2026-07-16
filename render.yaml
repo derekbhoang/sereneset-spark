@@ -1,0 +1,158 @@
+services:
+  - type: pserv
+    name: sereneset-spark-api
+    runtime: docker
+    plan: starter
+    region: virginia
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    preDeployCommand: alembic upgrade head
+    initialDeployHook: python scripts/seed.py --showcase-only
+    autoDeployTrigger: checksPass
+    maxShutdownDelaySeconds: 300
+    buildFilter:
+      paths:
+        - backend/**
+        - render.yaml
+    envVars:
+      - fromGroup: sereneset-spark-backend
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sereneset-spark-postgres
+          property: connectionString
+      - key: B2_BUCKET_NAME
+        sync: false
+      - key: B2_APPLICATION_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
+      - key: GMI_API_KEY
+        sync: false
+
+  - type: worker
+    name: sereneset-spark-video-worker
+    runtime: docker
+    plan: starter
+    region: virginia
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    dockerCommand: python -m scripts.start_video_worker
+    autoDeployTrigger: checksPass
+    maxShutdownDelaySeconds: 300
+    buildFilter:
+      paths:
+        - backend/**
+        - render.yaml
+    envVars:
+      - fromGroup: sereneset-spark-backend
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sereneset-spark-postgres
+          property: connectionString
+      - key: API_HOSTPORT
+        fromService:
+          name: sereneset-spark-api
+          type: pserv
+          property: hostport
+      - key: B2_BUCKET_NAME
+        fromService:
+          name: sereneset-spark-api
+          type: pserv
+          envVarKey: B2_BUCKET_NAME
+      - key: B2_APPLICATION_KEY_ID
+        fromService:
+          name: sereneset-spark-api
+          type: pserv
+          envVarKey: B2_APPLICATION_KEY_ID
+      - key: B2_APPLICATION_KEY
+        fromService:
+          name: sereneset-spark-api
+          type: pserv
+          envVarKey: B2_APPLICATION_KEY
+      - key: GMI_API_KEY
+        fromService:
+          name: sereneset-spark-api
+          type: pserv
+          envVarKey: GMI_API_KEY
+
+  - type: web
+    name: sereneset-spark
+    runtime: docker
+    plan: starter
+    region: virginia
+    dockerfilePath: ./frontend/Dockerfile
+    dockerContext: ./frontend
+    healthCheckPath: /healthz
+    autoDeployTrigger: checksPass
+    maxShutdownDelaySeconds: 60
+    buildFilter:
+      paths:
+        - frontend/**
+        - render.yaml
+    envVars:
+      - key: API_UPSTREAM
+        fromService:
+          name: sereneset-spark-api
+          type: pserv
+          property: hostport
+
+databases:
+  - name: sereneset-spark-postgres
+    databaseName: sereneset_spark
+    user: sereneset
+    plan: basic-256mb
+    region: virginia
+    postgresMajorVersion: "17"
+    ipAllowList: []
+
+envVarGroups:
+  - name: sereneset-spark-backend
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_CONNECTION_MODE
+        value: private
+      - key: DATABASE_POOL_SIZE
+        value: "3"
+      - key: DATABASE_MAX_OVERFLOW
+        value: "2"
+      - key: DATABASE_POOL_TIMEOUT_SECONDS
+        value: "30"
+      - key: DATABASE_POOL_RECYCLE_SECONDS
+        value: "300"
+      - key: DATABASE_CONNECT_TIMEOUT_SECONDS
+        value: "10"
+      - key: B2_ENDPOINT_URL
+        value: https://s3.us-east-005.backblazeb2.com
+      - key: B2_REGION_NAME
+        value: us-east-005
+      - key: B2_READINESS_TIMEOUT_SECONDS
+        value: "5"
+      - key: GENBLAZE_IMAGE_MODEL
+        value: seedream-5.0-lite
+      - key: GENBLAZE_VIDEO_MODEL
+        value: veo-3.1-fast-generate-001
+      - key: GENBLAZE_TIMEOUT_SECONDS
+        value: "600"
+      - key: GENBLAZE_VIDEO_TIMEOUT_SECONDS
+        value: "900"
+      - key: GENBLAZE_STORAGE_PREFIX
+        value: sereneset-spark/genblaze
+      - key: MAX_GENERATED_VIDEO_SIZE_BYTES
+        value: "524288000"
+      - key: GENERATION_WORKER_POLL_SECONDS
+        value: "2"
+      - key: WORKER_HEARTBEAT_INTERVAL_SECONDS
+        value: "10"
+      - key: WORKER_HEARTBEAT_STALE_AFTER_SECONDS
+        value: "45"
+      - key: GENERATION_JOB_STALE_AFTER_SECONDS
+        value: "1800"
+      - key: GENERATION_JOB_MAX_ATTEMPTS
+        value: "2"
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: FORWARDED_ALLOW_IPS
+        value: "*"
+      - key: CORS_ORIGINS
+        value: "[]"

@@ -1,6 +1,6 @@
 from functools import lru_cache
 from ipaddress import ip_address
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+psycopg://sereneset:sereneset@localhost:5432/sereneset_spark",
         alias="DATABASE_URL",
+    )
+    database_connection_mode: Literal["tls", "private"] = Field(
+        default="tls",
+        alias="DATABASE_CONNECTION_MODE",
     )
     database_pool_size: int = Field(
         default=3,
@@ -145,8 +149,7 @@ class Settings(BaseSettings):
             )
         elif normalized_scheme.startswith("postgresql://"):
             normalized_value = (
-                "postgresql+psycopg://"
-                + normalized_value[len("postgresql://") :]
+                "postgresql+psycopg://" + normalized_value[len("postgresql://") :]
             )
 
         try:
@@ -155,9 +158,7 @@ class Settings(BaseSettings):
             raise ValueError("DATABASE_URL must be a valid SQLAlchemy URL") from exc
 
         if database_url.drivername != "postgresql+psycopg":
-            raise ValueError(
-                "DATABASE_URL must use PostgreSQL with the psycopg driver"
-            )
+            raise ValueError("DATABASE_URL must use PostgreSQL with the psycopg driver")
 
         return normalized_value
 
@@ -226,20 +227,33 @@ class Settings(BaseSettings):
             pass
 
         if not hostname or hostname in local_hostnames or is_loopback:
-            raise ValueError(
-                "Production DATABASE_URL must point to managed PostgreSQL"
-            )
+            raise ValueError("Production DATABASE_URL must point to managed PostgreSQL")
 
-        sslmode = database_url.query.get("sslmode")
-        allowed_ssl_modes = {"require", "verify-ca", "verify-full"}
-        if (
-            not isinstance(sslmode, str)
-            or sslmode.casefold() not in allowed_ssl_modes
-        ):
-            raise ValueError(
-                "Production DATABASE_URL must require TLS with "
-                "sslmode=require, verify-ca, or verify-full"
-            )
+        if self.database_connection_mode == "private":
+            try:
+                ip_address(hostname)
+            except ValueError:
+                pass
+            else:
+                raise ValueError(
+                    "Private production DATABASE_URL must use an internal DNS hostname"
+                )
+
+            if "." in hostname:
+                raise ValueError(
+                    "Private production DATABASE_URL must use an internal DNS hostname"
+                )
+        else:
+            sslmode = database_url.query.get("sslmode")
+            allowed_ssl_modes = {"require", "verify-ca", "verify-full"}
+            if (
+                not isinstance(sslmode, str)
+                or sslmode.casefold() not in allowed_ssl_modes
+            ):
+                raise ValueError(
+                    "Production DATABASE_URL must require TLS with "
+                    "sslmode=require, verify-ca, or verify-full"
+                )
 
         missing_b2_settings = [
             name

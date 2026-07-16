@@ -230,6 +230,34 @@ npm run build
 
 The GitHub Actions workflow runs these checks in parallel on every push and pull request.
 
+## Render Deployment
+
+[`render.yaml`](render.yaml) defines the judge-facing deployment in Render's Virginia region:
+
+- `sereneset-spark`: public Docker web service serving the frontend over managed HTTPS and proxying same-origin `/api` requests.
+- `sereneset-spark-api`: private Docker service that runs `alembic upgrade head` before each release.
+- `sereneset-spark-video-worker`: private background worker that waits for API liveness before claiming PostgreSQL jobs.
+- `sereneset-spark-postgres`: private managed PostgreSQL 17 database with no external IP allowlist.
+
+The first successful API deployment runs the idempotent showcase seed. B2 remains the durable store for all uploaded and generated media, sidecars, provenance, and export inputs.
+
+After pushing `render.yaml` to GitHub, open the [Render Blueprint launcher](https://render.com/deploy?repo=https://github.com/derekbhoang/sereneset-spark), connect the repository, and confirm the paid resources. During initial creation, Render prompts for these values once on the API service:
+
+- `B2_BUCKET_NAME`
+- `B2_APPLICATION_KEY_ID`
+- `B2_APPLICATION_KEY`
+- `GMI_API_KEY`
+
+The worker references those secrets without duplicating them. Keep the generated `onrender.com` hostname for the initial submission; Render provisions and renews its TLS certificate automatically.
+
+Wait for the API pre-deploy command and initial seed to finish, then open the frontend URL and verify:
+
+```text
+https://sereneset-spark.onrender.com/api/v1/health/ready
+```
+
+If Render adds a suffix to the service name, use the exact URL shown in its dashboard. Readiness should report `ok` for PostgreSQL, B2, and the video worker before sharing the app. The Blueprint uses Starter compute for each process and Basic PostgreSQL; review the estimated monthly charge in Render before applying it.
+
 ## Production Containers
 
 The production Compose stack runs three long-lived services and one release process:
@@ -310,10 +338,10 @@ docker compose --env-file .env.production -f compose.production.yml down
 
 Production intentionally does not run PostgreSQL or durable object storage inside the Compose stack. Configure these external services in `.env.production`:
 
-- `DATABASE_URL` must point to managed PostgreSQL and include `sslmode=require`, `sslmode=verify-ca`, or `sslmode=verify-full`. Provider URLs beginning with `postgres://` or `postgresql://` are normalized to the installed `psycopg` driver.
+- `DATABASE_URL` must point to managed PostgreSQL. Public database connections use `DATABASE_CONNECTION_MODE=tls` and must include `sslmode=require`, `sslmode=verify-ca`, or `sslmode=verify-full`. Render uses `DATABASE_CONNECTION_MODE=private` with its dotless internal DNS hostname and blocks external database access. Provider URLs beginning with `postgres://` or `postgresql://` are normalized to the installed `psycopg` driver.
 - PostgreSQL stores campaigns, asset/version records, review state, generation jobs, provenance indexes, and B2 object keys. It does not store generated media blobs.
 - Backblaze B2 stores uploaded inputs, brand files, generated image and video artifacts, metadata sidecars, and export inputs. Use a private bucket and bucket-scoped application credentials.
-- Production startup fails when PostgreSQL points to a local host, TLS is not required, or any required B2 setting is empty or still contains an example placeholder.
+- Production startup fails when PostgreSQL points to a local host, a public connection does not require TLS, a private connection uses a public hostname, or any required B2 setting is empty or still contains an example placeholder.
 
 Database pools are bounded per process. With the example values, two API workers and one generation worker can open at most 15 PostgreSQL connections: `(2 + 1) * (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW)`. Keep this total below the managed database connection limit when changing worker counts or `WEB_CONCURRENCY`.
 
