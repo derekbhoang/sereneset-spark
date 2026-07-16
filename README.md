@@ -105,3 +105,15 @@ Production intentionally does not run PostgreSQL or durable object storage insid
 - Production startup fails when PostgreSQL points to a local host, TLS is not required, or any required B2 setting is empty or still contains an example placeholder.
 
 Database pools are bounded per process. With the example values, two API workers and one generation worker can open at most 15 PostgreSQL connections: `(2 + 1) * (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW)`. Keep this total below the managed database connection limit when changing worker counts or `WEB_CONCURRENCY`.
+
+### Health Checks
+
+- `GET /api/v1/health` is a process liveness check. It does not contact PostgreSQL, B2, or the worker and is used for internal Compose startup ordering.
+- `GET /api/v1/health/ready` is the external readiness check. It returns `200` only when PostgreSQL answers a query, the configured B2 bucket accepts a read-only `Head Bucket` request, and the video worker heartbeat is fresh. Otherwise it returns `503` with a status for each component.
+- The worker publishes its heartbeat from a background thread, so readiness remains healthy while video generation is blocked on a long provider request.
+
+Use `WORKER_HEARTBEAT_INTERVAL_SECONDS` to control publication frequency and `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` to control failure detection. The stale window must be greater than the publication interval. Use the readiness route for deployment traffic checks, but keep worker startup tied to the liveness route to avoid a circular dependency.
+
+`B2_READINESS_TIMEOUT_SECONDS` bounds the read-only B2 probe and disables retries for that probe only. Normal media operations continue to use the standard storage client configuration.
+
+For a bucket-restricted B2 application key, enable the `listAllBucketNames` capability required by S3-compatible `Head Bucket` requests. See the [Backblaze app key capability reference](https://www.backblaze.com/docs/cloud-storage-s3-compatible-app-keys).

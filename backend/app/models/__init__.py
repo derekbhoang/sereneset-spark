@@ -12,6 +12,10 @@ from app.models.generation_job import (
     GenerationJobKind,
     GenerationJobStatus,
 )
+from app.models.worker_heartbeat import (
+    VIDEO_GENERATION_WORKER,
+    WorkerHeartbeat,
+)
 
 __all__ = [
     "Asset",
@@ -26,4 +30,6 @@ __all__ = [
     "GenerationJobKind",
     "GenerationJobStatus",
     "ReviewStatus",
+    "VIDEO_GENERATION_WORKER",
+    "WorkerHeartbeat",
 ]

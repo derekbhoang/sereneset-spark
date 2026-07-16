@@ -1,5 +1,7 @@
 import unittest
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
+
+from botocore.config import Config
 
 from app.core.config import Settings
 from app.services.storage import (
@@ -22,6 +24,41 @@ def make_storage() -> tuple[B2StorageService, MagicMock]:
 
 
 class B2ServerSideCopyTests(unittest.TestCase):
+    def test_uses_an_explicit_client_configuration(self) -> None:
+        settings = Settings(
+            _env_file=None,
+            B2_BUCKET_NAME="test-bucket",
+            B2_APPLICATION_KEY_ID="test-key-id",
+            B2_APPLICATION_KEY="test-application-key",
+        )
+        client_config = Config(
+            signature_version="s3v4",
+            connect_timeout=5,
+            read_timeout=5,
+        )
+        expected_client = MagicMock()
+        storage = B2StorageService(
+            settings,
+            client_config=client_config,
+        )
+
+        with patch(
+            "app.services.storage.boto3.client",
+            return_value=expected_client,
+        ) as create_client:
+            client = storage.client
+
+        self.assertIs(client, expected_client)
+        self.assertIs(create_client.call_args.kwargs["config"], client_config)
+
+    def test_checks_bucket_access_without_reading_an_object(self) -> None:
+        storage, client = make_storage()
+
+        storage.check_bucket_access()
+
+        client.head_bucket.assert_called_once_with(Bucket="test-bucket")
+        client.get_object.assert_not_called()
+
     def test_copies_large_object_without_downloading_body(self) -> None:
         storage, client = make_storage()
         large_size = 500 * 1024 * 1024

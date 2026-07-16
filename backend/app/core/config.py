@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     b2_bucket_name: str = Field(default="", alias="B2_BUCKET_NAME")
     b2_application_key_id: str = Field(default="", alias="B2_APPLICATION_KEY_ID")
     b2_application_key: str = Field(default="", alias="B2_APPLICATION_KEY")
+    b2_readiness_timeout_seconds: int = Field(
+        default=5,
+        alias="B2_READINESS_TIMEOUT_SECONDS",
+        ge=1,
+        le=30,
+    )
     genblaze_gmi_api_key: str = Field(default="", alias="GMI_API_KEY")
     genblaze_image_model: str = Field(
         default="seedream-5.0-lite",
@@ -85,6 +91,18 @@ class Settings(BaseSettings):
         alias="GENERATION_WORKER_POLL_SECONDS",
         ge=0.1,
         le=60,
+    )
+    worker_heartbeat_interval_seconds: float = Field(
+        default=10.0,
+        alias="WORKER_HEARTBEAT_INTERVAL_SECONDS",
+        ge=1,
+        le=300,
+    )
+    worker_heartbeat_stale_after_seconds: int = Field(
+        default=45,
+        alias="WORKER_HEARTBEAT_STALE_AFTER_SECONDS",
+        ge=5,
+        le=3600,
     )
     generation_job_stale_after_seconds: int = Field(
         default=1800,
@@ -173,6 +191,19 @@ class Settings(BaseSettings):
     @classmethod
     def validate_genblaze_storage_prefix(cls, value: str) -> str:
         return value.strip().replace("\\", "/").strip("/")
+
+    @model_validator(mode="after")
+    def validate_worker_heartbeat_window(self) -> Self:
+        if (
+            self.worker_heartbeat_stale_after_seconds
+            <= self.worker_heartbeat_interval_seconds
+        ):
+            raise ValueError(
+                "WORKER_HEARTBEAT_STALE_AFTER_SECONDS must be greater than "
+                "WORKER_HEARTBEAT_INTERVAL_SECONDS"
+            )
+
+        return self
 
     @model_validator(mode="after")
     def validate_production_services(self) -> Self:

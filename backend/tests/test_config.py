@@ -47,6 +47,7 @@ class ProductionServiceSettingsTests(unittest.TestCase):
         self.assertEqual(settings.database_pool_timeout_seconds, 30)
         self.assertEqual(settings.database_pool_recycle_seconds, 300)
         self.assertEqual(settings.database_connect_timeout_seconds, 10)
+        self.assertEqual(settings.b2_readiness_timeout_seconds, 5)
 
     def test_rejects_local_postgresql_in_production(self) -> None:
         with self.assertRaisesRegex(
@@ -97,6 +98,8 @@ class VideoGenerationSettingsTests(unittest.TestCase):
             500 * 1024 * 1024,
         )
         self.assertEqual(settings.generation_worker_poll_seconds, 2.0)
+        self.assertEqual(settings.worker_heartbeat_interval_seconds, 10.0)
+        self.assertEqual(settings.worker_heartbeat_stale_after_seconds, 45)
         self.assertEqual(settings.generation_job_stale_after_seconds, 1800)
         self.assertEqual(settings.generation_job_max_attempts, 2)
 
@@ -107,6 +110,8 @@ class VideoGenerationSettingsTests(unittest.TestCase):
             GENBLAZE_VIDEO_TIMEOUT_SECONDS=1200,
             MAX_GENERATED_VIDEO_SIZE_BYTES=100 * 1024 * 1024,
             GENERATION_WORKER_POLL_SECONDS=0.5,
+            WORKER_HEARTBEAT_INTERVAL_SECONDS=15,
+            WORKER_HEARTBEAT_STALE_AFTER_SECONDS=60,
             GENERATION_JOB_STALE_AFTER_SECONDS=2400,
             GENERATION_JOB_MAX_ATTEMPTS=3,
         )
@@ -121,6 +126,8 @@ class VideoGenerationSettingsTests(unittest.TestCase):
             100 * 1024 * 1024,
         )
         self.assertEqual(settings.generation_worker_poll_seconds, 0.5)
+        self.assertEqual(settings.worker_heartbeat_interval_seconds, 15)
+        self.assertEqual(settings.worker_heartbeat_stale_after_seconds, 60)
         self.assertEqual(settings.generation_job_stale_after_seconds, 2400)
         self.assertEqual(settings.generation_job_max_attempts, 3)
 
@@ -129,7 +136,13 @@ class VideoGenerationSettingsTests(unittest.TestCase):
             {"GENBLAZE_VIDEO_MODEL": "   "},
             {"GENBLAZE_VIDEO_TIMEOUT_SECONDS": 59},
             {"MAX_GENERATED_VIDEO_SIZE_BYTES": 0},
+            {"B2_READINESS_TIMEOUT_SECONDS": 0},
             {"GENERATION_WORKER_POLL_SECONDS": 0},
+            {"WORKER_HEARTBEAT_INTERVAL_SECONDS": 0},
+            {
+                "WORKER_HEARTBEAT_INTERVAL_SECONDS": 10,
+                "WORKER_HEARTBEAT_STALE_AFTER_SECONDS": 10,
+            },
             {"GENERATION_JOB_STALE_AFTER_SECONDS": 59},
             {"GENERATION_JOB_MAX_ATTEMPTS": 0},
         )

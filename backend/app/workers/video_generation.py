@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
-from threading import Event
+from threading import Event, Thread
 from typing import Any, Protocol
 
 from sqlalchemy import Select, or_, select
@@ -43,6 +43,7 @@ from app.services.storage import (
     normalize_artifact_filename,
     normalize_storage_key,
 )
+from app.services.worker_heartbeat import run_worker_heartbeat_loop
 
 
 logger = logging.getLogger(__name__)
@@ -1010,7 +1011,9 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    worker_settings = get_settings()
     stop_event = Event()
+    heartbeat_stop_event = Event()
 
     def request_shutdown(signum: int, _frame: object) -> None:
         logger.info("Video generation worker received signal %s", signum)
@@ -1019,10 +1022,35 @@ def main() -> None:
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
 
+    heartbeat_thread = Thread(
+        target=run_worker_heartbeat_loop,
+        kwargs={
+            "session_factory": SessionLocal,
+            "stop_event": heartbeat_stop_event,
+            "interval_seconds": (
+                worker_settings.worker_heartbeat_interval_seconds
+            ),
+        },
+        name="video-worker-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+
     try:
-        run_worker_forever(stop_event=stop_event)
+        run_worker_forever(
+            settings=worker_settings,
+            stop_event=stop_event,
+        )
     except KeyboardInterrupt:
         stop_event.set()
+    finally:
+        heartbeat_stop_event.set()
+        heartbeat_thread.join(
+            timeout=min(
+                worker_settings.worker_heartbeat_interval_seconds + 1,
+                10,
+            )
+        )
 
 
 if __name__ == "__main__":

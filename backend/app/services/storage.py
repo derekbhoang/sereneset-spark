@@ -187,9 +187,15 @@ def stringify_metadata(metadata: dict[str, Any] | None) -> dict[str, str]:
 
 
 class B2StorageService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        client_config: Config | None = None,
+    ) -> None:
         self.settings = settings
         self.bucket_name = settings.b2_bucket_name
+        self._client_config = client_config or Config(signature_version="s3v4")
         self._client: BaseClient | None = None
 
     def _validate_settings(self) -> None:
@@ -221,7 +227,7 @@ class B2StorageService:
                 region_name=self.settings.b2_region_name,
                 aws_access_key_id=self.settings.b2_application_key_id,
                 aws_secret_access_key=self.settings.b2_application_key,
-                config=Config(signature_version="s3v4"),
+                config=self._client_config,
             )
 
         return self._client
@@ -288,6 +294,9 @@ class B2StorageService:
             Params={"Bucket": self.bucket_name, "Key": storage_key},
             ExpiresIn=expires_seconds,
         )
+
+    def check_bucket_access(self) -> None:
+        self.client.head_bucket(Bucket=self.bucket_name)
 
     def get_object_info(self, *, key: str) -> StoredObject:
         storage_key = normalize_storage_key(key)
@@ -475,3 +484,20 @@ class B2StorageService:
 @lru_cache
 def get_storage_service() -> B2StorageService:
     return B2StorageService(get_settings())
+
+
+def get_readiness_storage_service() -> B2StorageService:
+    settings = get_settings()
+    timeout_seconds = settings.b2_readiness_timeout_seconds
+    return B2StorageService(
+        settings,
+        client_config=Config(
+            signature_version="s3v4",
+            connect_timeout=timeout_seconds,
+            read_timeout=timeout_seconds,
+            retries={
+                "mode": "standard",
+                "total_max_attempts": 1,
+            },
+        ),
+    )
