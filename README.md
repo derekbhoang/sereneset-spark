@@ -63,6 +63,27 @@ The first version of SereneSet Spark focuses on a complete campaign asset workfl
 
 Video generation runs asynchronously through a PostgreSQL-backed worker so long-running provider requests do not block the API process.
 
+## Development Checks
+
+Install backend development dependencies and run the backend suite:
+
+```powershell
+Set-Location backend
+python -m pip install -r requirements-dev.txt
+python -m pytest
+```
+
+Run the frontend checks from `frontend`:
+
+```powershell
+npm ci
+npm run typecheck
+npm run lint
+npm run build
+```
+
+The GitHub Actions workflow runs these checks in parallel on every push and pull request.
+
 ## Production Containers
 
 The production Compose stack runs three long-lived services and one release process:
