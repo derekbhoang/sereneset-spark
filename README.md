@@ -1,6 +1,6 @@
 # SereneSet Spark (SSS)
 
-An AI campaign asset workspace for marketing teams that turns campaign briefs and brand assets into brand-guided campaign packs: copy, images, and video concepts. Every generated asset is stored with version history, prompts, model metadata, review status, and export options, so teams can approve, refine, reuse, and audit their creative work over time.
+An AI campaign asset workspace for marketing teams that turns campaign briefs and brand assets into brand-guided image and video campaign packs. Every generated asset is stored with version history, prompts, model metadata, review status, and export options, so teams can approve, refine, reuse, and audit their creative work over time.
 
 ## Problem
 
@@ -10,7 +10,7 @@ As teams adopt generative AI, this problem gets sharper: outputs can be fast, bu
 
 ## Solution
 
-SereneSet Spark gives marketing teams a single workspace to turn campaign briefs and brand assets into structured, brand-guided campaign packs. Teams can generate copy, images, and video concepts from shared campaign context, then review, refine, approve, and export assets without losing the history behind each version.
+SereneSet Spark gives marketing teams a single workspace to turn campaign briefs and brand assets into structured, brand-guided campaign packs. Teams can generate images and videos from shared campaign context, then review, refine, approve, and export assets without losing the history behind each version.
 
 Every generated asset is stored with useful metadata, including prompts, model details, campaign tags, brand inputs, review status, and version lineage. This makes the creative process easier to audit, reuse, and improve over time while helping teams move faster without losing control of brand consistency.
 
@@ -18,7 +18,7 @@ Every generated asset is stored with useful metadata, including prompts, model d
 
 1. Teams create a dedicated campaign workspace for each launch, product, audience, or channel initiative. Each campaign keeps its own briefs, generated assets, feedback, approvals, metadata, and export history separated from other campaigns so the work stays easy to organize and review.
 
-2. Teams add the campaign context, such as the brief, goals, audience, tone, channels, brand assets, and creative requirements. SereneSet Spark uses this context to guide the generation of campaign copy, images, and video concepts.
+2. Teams add the campaign context, such as the brief, goals, audience, tone, channels, brand assets, and creative requirements. SereneSet Spark uses this context to guide image and video generation.
 
 3. Teams review generated assets inside the campaign workspace. They can approve strong assets, request refinements, compare versions, and keep a clear record of how each asset changed over time.
 
@@ -30,7 +30,8 @@ Every generated asset is stored with useful metadata, including prompts, model d
 
 - **Separated campaign workspaces:** Create and manage multiple campaigns independently, with each campaign keeping its own briefs, assets, approvals, metadata, and exports.
 - **Shared brand library:** Store reusable brand guidelines, product details, tone of voice, audience profiles, and reference assets that every campaign can use.
-- **Brand-guided asset generation:** Generate campaign copy, images, and video concepts using the campaign brief and selected brand context.
+- **Brand-guided media generation:** Generate images and videos using the campaign brief, uploaded references, previous versions, and attached brand assets.
+- **Durable video jobs:** Submit long-running video generation to a PostgreSQL-backed worker and monitor progress without blocking the API.
 - **Version history:** Keep track of every refinement, regenerated asset, and approved version so teams can see how creative work changed over time.
 - **Review and approval workflow:** Mark assets as drafts, in review, approved, or rejected to support clearer collaboration between marketers, designers, and stakeholders.
 - **Metadata-rich storage:** Save prompts, model details, campaign tags, brand inputs, review status, and asset lineage alongside each generated file.
@@ -44,24 +45,118 @@ Every generated asset is stored with useful metadata, including prompts, model d
 - **Generative media orchestration:** Genblaze for connecting campaign context to AI media generation workflows.
 - **Storage:** Backblaze B2 Cloud Storage for generated assets, uploaded brand files, campaign exports, and versioned media.
 - **Metadata:** Structured campaign, asset, prompt, model, review, and version metadata stored alongside each asset.
-- **AI providers:** GMI Cloud and OpenAI for generating campaign copy, images, and video concepts.
+- **AI provider:** GMI Cloud, orchestrated through Genblaze, for image and video generation.
 
-## MVP Scope
+## Implemented Workflow
 
 The first version of SereneSet Spark focuses on a complete campaign asset workflow that can be demoed end to end:
 
 1. Create and manage multiple separated campaign workspaces.
 2. Add campaign details, including brief, audience, tone, channels, goals, and brand requirements.
 3. Create an optional shared brand library with reusable guidelines, product details, audience profiles, and reference assets.
-4. Generate campaign copy and image concepts using GMI Cloud and OpenAI.
+4. Generate images synchronously and submit video generation as durable background jobs through GMI Cloud and Genblaze.
 5. Store generated assets and uploaded brand files in Backblaze B2 Cloud Storage.
 6. Save useful metadata for each asset, including prompts, model details, campaign tags, version history, and review status.
 7. Review generated assets and mark them as draft, in review, approved, or rejected.
 8. Refine selected assets while preserving earlier versions.
 9. Search and filter assets by campaign, channel, status, format, audience, or tag.
-10. Export approved assets as a campaign pack for handoff or publishing.
+10. Export approved images, videos, brand assets, input snapshots, and provenance sidecars as a campaign pack.
 
 Video generation runs asynchronously through a PostgreSQL-backed worker so long-running provider requests do not block the API process.
+
+## Local Setup
+
+### Prerequisites
+
+- Python 3.12 or newer
+- Node.js 22 or newer and npm
+- Docker Desktop with Docker Compose
+- A private Backblaze B2 bucket and an application key scoped to that bucket
+- A GMI Cloud API key for live image and video generation
+
+### 1. Start PostgreSQL
+
+From the repository root:
+
+```powershell
+docker compose -f backend/docker-compose.yml up -d
+```
+
+This starts PostgreSQL 17 on `localhost:5432` with the development database and credentials already used by the default backend configuration.
+
+### 2. Configure the backend
+
+Create `backend/.env` and set the values for your B2 region and bucket. Do not commit this file.
+
+```dotenv
+ENVIRONMENT=development
+DATABASE_URL=postgresql+psycopg://sereneset:sereneset@localhost:5432/sereneset_spark
+
+B2_ENDPOINT_URL=https://s3.us-east-005.backblazeb2.com
+B2_REGION_NAME=us-east-005
+B2_BUCKET_NAME=your-private-bucket
+B2_APPLICATION_KEY_ID=your-key-id
+B2_APPLICATION_KEY=your-application-key
+
+GMI_API_KEY=your-gmi-api-key
+GENBLAZE_IMAGE_MODEL=seedream-5.0-lite
+GENBLAZE_VIDEO_MODEL=veo-3.1-fast-generate-001
+GENBLAZE_TIMEOUT_SECONDS=600
+GENBLAZE_VIDEO_TIMEOUT_SECONDS=900
+GENBLAZE_STORAGE_PREFIX=sereneset-spark/genblaze
+
+CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
+```
+
+The B2 endpoint and region must match the bucket. The application key needs read/write access to media objects; readiness checks also require the `listAllBucketNames` capability.
+
+### 3. Install and migrate the backend
+
+```powershell
+Set-Location backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.txt
+alembic upgrade head
+```
+
+### 4. Run the API and video worker
+
+Open two PowerShell terminals in `backend`, activate `.venv` in each, and run:
+
+```powershell
+# Terminal 1
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+```powershell
+# Terminal 2
+python -m app.workers.video_generation
+```
+
+The worker is required for video jobs and for `/api/v1/health/ready` to report ready.
+
+### 5. Run the frontend
+
+In a third terminal:
+
+```powershell
+Set-Location frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. The development frontend uses `http://127.0.0.1:8000/api/v1` by default. API documentation is available at `http://127.0.0.1:8000/docs`.
+
+### 6. Verify the services
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/health
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/health/ready
+```
+
+Readiness should report `ok` for PostgreSQL, B2, and the video worker. You can now create a campaign, attach brand assets, generate or refine an image, submit a video job, inspect provenance, approve versions, and export the campaign pack.
 
 ## Demo Showcase Seed
 
@@ -144,13 +239,30 @@ The production Compose stack runs three long-lived services and one release proc
 - `worker`: the PostgreSQL-backed video generation worker, built from the same backend image as the API.
 - `frontend`: a Vite production build served by Nginx on port `8080`. Nginx forwards same-origin `/api` requests to the API service.
 
-Create the production environment file and replace every placeholder secret:
+### 1. Provision external services
+
+Before deploying containers:
+
+1. Create a managed PostgreSQL database, allow connections from the deployment environment, and obtain a TLS-enabled connection URL.
+2. Create a private B2 bucket and a bucket-scoped application key with read/write access plus `listAllBucketNames` for readiness probes.
+3. Obtain a GMI Cloud API key with access to the configured image and video models.
+4. Choose the public application hostname and configure TLS at the platform load balancer or reverse proxy.
+
+Production media must remain in B2. PostgreSQL stores relational records, jobs, object keys, and provenance indexes, but not generated media blobs.
+
+### 2. Configure deployment secrets
+
+Create the production environment file and replace every placeholder value:
 
 ```powershell
 Copy-Item .env.production.example .env.production
 ```
 
-Build and start the stack:
+Keep `.env.production` out of source control. Set `APP_DOMAIN` and `CORS_ORIGINS` to the public HTTPS hostname, use a managed `DATABASE_URL` with `sslmode=require` or stronger verification, and use the B2 endpoint and region belonging to the configured bucket.
+
+### 3. Build, migrate, and start
+
+From the repository root:
 
 ```powershell
 docker compose --env-file .env.production -f compose.production.yml up -d --build
@@ -158,14 +270,41 @@ docker compose --env-file .env.production -f compose.production.yml up -d --buil
 
 Compose runs the `migrate` release process automatically. The API and worker remain stopped if Alembic exits with an error, preventing application code from starting against an outdated schema. On deployment platforms with a dedicated release phase, use the same backend image with `alembic upgrade head` as its release command.
 
-Open `http://localhost:8080` and inspect process health with:
+### 4. Verify the deployment
+
+Inspect process state and logs:
 
 ```powershell
 docker compose --env-file .env.production -f compose.production.yml ps --all
 docker compose --env-file .env.production -f compose.production.yml logs -f migrate api worker frontend
 ```
 
-The Compose stack expects `DATABASE_URL` to point to an existing PostgreSQL database. Generated media, brand assets, provenance sidecars, and export inputs continue to use the configured Backblaze B2 bucket. TLS should terminate at the deployment platform or an external reverse proxy in front of port `8080`.
+The `migrate` container should exit with code `0`; `api` and `frontend` should become healthy; and `worker` should remain running. Verify readiness through the public origin:
+
+```powershell
+Invoke-RestMethod https://spark.example.com/api/v1/health/ready
+```
+
+Then test the complete workflow in a private or signed-out browser session: create a campaign, upload and attach a brand asset, generate an image, refine it, submit a video, wait for the job to succeed, play both artifacts, inspect stored provenance, approve the versions, and download the export pack. Confirm that generated files and sidecars exist in B2 and that no browser request uses a localhost API URL.
+
+The frontend container listens on host port `APP_PORT` (default `8080`). Do not expose the API container separately; Nginx proxies same-origin `/api` requests to it. Terminate TLS at the deployment platform or an external reverse proxy in front of the frontend port.
+
+### 5. Deploy updates
+
+Build the new image version and rerun Compose with the updated `APP_VERSION`. The one-shot migration process runs before the updated API and worker start:
+
+```powershell
+$env:APP_VERSION = "2026.07.16"
+docker compose --env-file .env.production -f compose.production.yml up -d --build
+```
+
+Review migration and application logs after every deployment. Database migrations must remain compatible with the currently running application during rolling deployments.
+
+Stop the application containers without deleting managed data or B2 objects:
+
+```powershell
+docker compose --env-file .env.production -f compose.production.yml down
+```
 
 ### Production Data Services
 
