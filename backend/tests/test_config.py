@@ -5,6 +5,84 @@ from pydantic import ValidationError
 from app.core.config import Settings
 
 
+def make_production_settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "ENVIRONMENT": "production",
+        "DATABASE_URL": (
+            "postgresql+psycopg://user:password@db.example.com:5432/"
+            "sereneset_spark?sslmode=require"
+        ),
+        "B2_ENDPOINT_URL": "https://s3.us-east-005.backblazeb2.com",
+        "B2_REGION_NAME": "us-east-005",
+        "B2_BUCKET_NAME": "sereneset-media",
+        "B2_APPLICATION_KEY_ID": "production-key-id",
+        "B2_APPLICATION_KEY": "production-application-key",
+    }
+    values.update(overrides)
+    return Settings(_env_file=None, **values)
+
+
+class ProductionServiceSettingsTests(unittest.TestCase):
+    def test_normalizes_common_managed_postgresql_urls(self) -> None:
+        for scheme in ("postgres://", "postgresql://"):
+            with self.subTest(scheme=scheme):
+                settings = Settings(
+                    _env_file=None,
+                    DATABASE_URL=(
+                        f"{scheme}user:password@db.example.com:5432/"
+                        "sereneset_spark?sslmode=require"
+                    ),
+                )
+
+                self.assertTrue(
+                    settings.database_url.startswith("postgresql+psycopg://")
+                )
+
+    def test_accepts_managed_postgresql_and_b2_in_production(self) -> None:
+        settings = make_production_settings()
+
+        self.assertEqual(settings.environment, "production")
+        self.assertEqual(settings.database_pool_size, 3)
+        self.assertEqual(settings.database_max_overflow, 2)
+        self.assertEqual(settings.database_pool_timeout_seconds, 30)
+        self.assertEqual(settings.database_pool_recycle_seconds, 300)
+        self.assertEqual(settings.database_connect_timeout_seconds, 10)
+
+    def test_rejects_local_postgresql_in_production(self) -> None:
+        with self.assertRaisesRegex(
+            ValidationError,
+            "must point to managed PostgreSQL",
+        ):
+            make_production_settings(
+                DATABASE_URL=(
+                    "postgresql+psycopg://user:password@localhost:5432/"
+                    "sereneset_spark?sslmode=require"
+                )
+            )
+
+    def test_rejects_postgresql_without_tls_in_production(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "must require TLS"):
+            make_production_settings(
+                DATABASE_URL=(
+                    "postgresql+psycopg://user:password@db.example.com:5432/"
+                    "sereneset_spark"
+                )
+            )
+
+    def test_rejects_incomplete_b2_configuration_in_production(self) -> None:
+        for overrides in (
+            {"B2_BUCKET_NAME": ""},
+            {"B2_APPLICATION_KEY_ID": "replace-me"},
+            {"B2_APPLICATION_KEY": "changeme"},
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(
+                    ValidationError,
+                    "Production requires configured B2 settings",
+                ):
+                    make_production_settings(**overrides)
+
+
 class VideoGenerationSettingsTests(unittest.TestCase):
     def test_video_generation_defaults(self) -> None:
         settings = Settings(_env_file=None)

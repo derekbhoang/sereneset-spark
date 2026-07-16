@@ -94,3 +94,14 @@ docker compose --env-file .env.production -f compose.production.yml logs -f migr
 ```
 
 The Compose stack expects `DATABASE_URL` to point to an existing PostgreSQL database. Generated media, brand assets, provenance sidecars, and export inputs continue to use the configured Backblaze B2 bucket. TLS should terminate at the deployment platform or an external reverse proxy in front of port `8080`.
+
+### Production Data Services
+
+Production intentionally does not run PostgreSQL or durable object storage inside the Compose stack. Configure these external services in `.env.production`:
+
+- `DATABASE_URL` must point to managed PostgreSQL and include `sslmode=require`, `sslmode=verify-ca`, or `sslmode=verify-full`. Provider URLs beginning with `postgres://` or `postgresql://` are normalized to the installed `psycopg` driver.
+- PostgreSQL stores campaigns, asset/version records, review state, generation jobs, provenance indexes, and B2 object keys. It does not store generated media blobs.
+- Backblaze B2 stores uploaded inputs, brand files, generated image and video artifacts, metadata sidecars, and export inputs. Use a private bucket and bucket-scoped application credentials.
+- Production startup fails when PostgreSQL points to a local host, TLS is not required, or any required B2 setting is empty or still contains an example placeholder.
+
+Database pools are bounded per process. With the example values, two API workers and one generation worker can open at most 15 PostgreSQL connections: `(2 + 1) * (DATABASE_POOL_SIZE + DATABASE_MAX_OVERFLOW)`. Keep this total below the managed database connection limit when changing worker counts or `WEB_CONCURRENCY`.

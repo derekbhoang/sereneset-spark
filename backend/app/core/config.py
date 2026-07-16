@@ -1,18 +1,52 @@
 from functools import lru_cache
+from ipaddress import ip_address
+from typing import Self
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 
 
 class Settings(BaseSettings):
     app_name: str = "SereneSet Spark"
     app_version: str = "1.0.0"
-    environment: str = "development"
+    environment: str = Field(default="development", alias="ENVIRONMENT")
     api_v1_prefix: str = "/api/v1"
 
     database_url: str = Field(
         default="postgresql+psycopg://sereneset:sereneset@localhost:5432/sereneset_spark",
         alias="DATABASE_URL",
+    )
+    database_pool_size: int = Field(
+        default=3,
+        alias="DATABASE_POOL_SIZE",
+        ge=1,
+        le=50,
+    )
+    database_max_overflow: int = Field(
+        default=2,
+        alias="DATABASE_MAX_OVERFLOW",
+        ge=0,
+        le=100,
+    )
+    database_pool_timeout_seconds: int = Field(
+        default=30,
+        alias="DATABASE_POOL_TIMEOUT_SECONDS",
+        ge=1,
+        le=300,
+    )
+    database_pool_recycle_seconds: int = Field(
+        default=300,
+        alias="DATABASE_POOL_RECYCLE_SECONDS",
+        ge=60,
+        le=3600,
+    )
+    database_connect_timeout_seconds: int = Field(
+        default=10,
+        alias="DATABASE_CONNECT_TIMEOUT_SECONDS",
+        ge=1,
+        le=60,
     )
     b2_endpoint_url: str = Field(
         default="https://s3.us-west-004.backblazeb2.com",
@@ -82,10 +116,41 @@ class Settings(BaseSettings):
     @field_validator("database_url")
     @classmethod
     def validate_database_url(cls, value: str) -> str:
-        if not value.strip():
+        normalized_value = value.strip()
+        if not normalized_value:
             raise ValueError("DATABASE_URL must not be empty")
 
-        return value
+        normalized_scheme = normalized_value.casefold()
+        if normalized_scheme.startswith("postgres://"):
+            normalized_value = (
+                "postgresql+psycopg://" + normalized_value[len("postgres://") :]
+            )
+        elif normalized_scheme.startswith("postgresql://"):
+            normalized_value = (
+                "postgresql+psycopg://"
+                + normalized_value[len("postgresql://") :]
+            )
+
+        try:
+            database_url = make_url(normalized_value)
+        except ArgumentError as exc:
+            raise ValueError("DATABASE_URL must be a valid SQLAlchemy URL") from exc
+
+        if database_url.drivername != "postgresql+psycopg":
+            raise ValueError(
+                "DATABASE_URL must use PostgreSQL with the psycopg driver"
+            )
+
+        return normalized_value
+
+    @field_validator("environment")
+    @classmethod
+    def normalize_environment(cls, value: str) -> str:
+        normalized_value = value.strip().casefold()
+        if not normalized_value:
+            raise ValueError("ENVIRONMENT must not be empty")
+
+        return normalized_value
 
     @field_validator("b2_endpoint_url")
     @classmethod
@@ -108,6 +173,62 @@ class Settings(BaseSettings):
     @classmethod
     def validate_genblaze_storage_prefix(cls, value: str) -> str:
         return value.strip().replace("\\", "/").strip("/")
+
+    @model_validator(mode="after")
+    def validate_production_services(self) -> Self:
+        if self.environment != "production":
+            return self
+
+        database_url = make_url(self.database_url)
+        hostname = (database_url.host or "").rstrip(".").casefold()
+        local_hostnames = {
+            "0.0.0.0",
+            "host.docker.internal",
+            "localhost",
+            "localhost.localdomain",
+            "postgres",
+        }
+        is_loopback = False
+        try:
+            is_loopback = ip_address(hostname).is_loopback
+        except ValueError:
+            pass
+
+        if not hostname or hostname in local_hostnames or is_loopback:
+            raise ValueError(
+                "Production DATABASE_URL must point to managed PostgreSQL"
+            )
+
+        sslmode = database_url.query.get("sslmode")
+        allowed_ssl_modes = {"require", "verify-ca", "verify-full"}
+        if (
+            not isinstance(sslmode, str)
+            or sslmode.casefold() not in allowed_ssl_modes
+        ):
+            raise ValueError(
+                "Production DATABASE_URL must require TLS with "
+                "sslmode=require, verify-ca, or verify-full"
+            )
+
+        missing_b2_settings = [
+            name
+            for name, value in {
+                "B2_ENDPOINT_URL": self.b2_endpoint_url,
+                "B2_REGION_NAME": self.b2_region_name,
+                "B2_BUCKET_NAME": self.b2_bucket_name,
+                "B2_APPLICATION_KEY_ID": self.b2_application_key_id,
+                "B2_APPLICATION_KEY": self.b2_application_key,
+            }.items()
+            if not value.strip()
+            or value.strip().casefold() in {"changeme", "replace-me"}
+        ]
+        if missing_b2_settings:
+            raise ValueError(
+                "Production requires configured B2 settings: "
+                + ", ".join(missing_b2_settings)
+            )
+
+        return self
 
 
 @lru_cache
