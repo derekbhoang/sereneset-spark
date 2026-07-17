@@ -127,6 +127,7 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"],
         alias="CORS_ORIGINS",
     )
+    public_frontend_url: str = Field(default="", alias="PUBLIC_FRONTEND_URL")
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -193,6 +194,25 @@ class Settings(BaseSettings):
     def validate_genblaze_storage_prefix(cls, value: str) -> str:
         return value.strip().replace("\\", "/").strip("/")
 
+    @field_validator("public_frontend_url")
+    @classmethod
+    def normalize_public_frontend_url(cls, value: str) -> str:
+        normalized_value = value.strip().rstrip("/")
+        if normalized_value and not normalized_value.startswith(
+            ("http://", "https://")
+        ):
+            raise ValueError("PUBLIC_FRONTEND_URL must be an HTTP(S) URL")
+
+        return normalized_value
+
+    @property
+    def allowed_cors_origins(self) -> list[str]:
+        origins = list(self.cors_origins)
+        if self.public_frontend_url and self.public_frontend_url not in origins:
+            origins.append(self.public_frontend_url)
+
+        return origins
+
     @model_validator(mode="after")
     def validate_worker_heartbeat_window(self) -> Self:
         if (
@@ -210,6 +230,11 @@ class Settings(BaseSettings):
     def validate_production_services(self) -> Self:
         if self.environment != "production":
             return self
+
+        if self.public_frontend_url and not self.public_frontend_url.startswith(
+            "https://"
+        ):
+            raise ValueError("Production PUBLIC_FRONTEND_URL must use HTTPS")
 
         database_url = make_url(self.database_url)
         hostname = (database_url.host or "").rstrip(".").casefold()

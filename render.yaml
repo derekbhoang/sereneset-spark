@@ -1,11 +1,12 @@
 services:
-  - type: pserv
+  - type: web
     name: sereneset-spark-api
     runtime: docker
     plan: starter
     region: virginia
     dockerfilePath: ./backend/Dockerfile
     dockerContext: ./backend
+    healthCheckPath: /api/v1/health
     preDeployCommand: alembic upgrade head
     initialDeployHook: python scripts/seed.py --showcase-only
     autoDeployTrigger: checksPass
@@ -20,6 +21,11 @@ services:
         fromDatabase:
           name: sereneset-spark-postgres
           property: connectionString
+      - key: PUBLIC_FRONTEND_URL
+        fromService:
+          name: sereneset-spark
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
       - key: B2_BUCKET_NAME
         sync: false
       - key: B2_APPLICATION_KEY_ID
@@ -52,55 +58,67 @@ services:
       - key: API_HOSTPORT
         fromService:
           name: sereneset-spark-api
-          type: pserv
+          type: web
           property: hostport
       - key: B2_BUCKET_NAME
         fromService:
           name: sereneset-spark-api
-          type: pserv
+          type: web
           envVarKey: B2_BUCKET_NAME
       - key: B2_APPLICATION_KEY_ID
         fromService:
           name: sereneset-spark-api
-          type: pserv
+          type: web
           envVarKey: B2_APPLICATION_KEY_ID
       - key: B2_APPLICATION_KEY
         fromService:
           name: sereneset-spark-api
-          type: pserv
+          type: web
           envVarKey: B2_APPLICATION_KEY
       - key: GMI_API_KEY
         fromService:
           name: sereneset-spark-api
-          type: pserv
+          type: web
           envVarKey: GMI_API_KEY
 
   - type: web
     name: sereneset-spark
-    runtime: docker
-    plan: starter
-    region: virginia
-    dockerfilePath: ./frontend/Dockerfile
-    dockerContext: ./frontend
-    healthCheckPath: /healthz
+    runtime: static
+    buildCommand: >-
+      cd frontend && npm ci &&
+      VITE_API_BASE_URL="${API_ORIGIN}/api/v1" npm run build
+    staticPublishPath: ./frontend/dist
     autoDeployTrigger: checksPass
-    maxShutdownDelaySeconds: 60
     buildFilter:
       paths:
         - frontend/**
         - render.yaml
     envVars:
-      - key: API_UPSTREAM
+      - key: API_ORIGIN
         fromService:
           name: sereneset-spark-api
-          type: pserv
-          property: hostport
+          type: web
+          envVarKey: RENDER_EXTERNAL_URL
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
 
 databases:
   - name: sereneset-spark-postgres
     databaseName: sereneset_spark
     user: sereneset
-    plan: basic-256mb
+    plan: free
     region: virginia
     postgresMajorVersion: "17"
     ipAllowList: []

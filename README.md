@@ -232,12 +232,12 @@ The GitHub Actions workflow runs these checks in parallel on every push and pull
 
 ## Render Deployment
 
-[`render.yaml`](render.yaml) defines the judge-facing deployment in Render's Virginia region:
+[`render.yaml`](render.yaml) defines the budget-conscious judge-facing deployment in Render's Virginia region:
 
-- `sereneset-spark`: public Docker web service serving the frontend over managed HTTPS and proxying same-origin `/api` requests.
-- `sereneset-spark-api`: private Docker service that runs `alembic upgrade head` before each release.
+- `sereneset-spark`: free static frontend served from Render's CDN over managed HTTPS.
+- `sereneset-spark-api`: paid Starter Docker web service that runs `alembic upgrade head` before each release.
 - `sereneset-spark-video-worker`: private background worker that waits for API liveness before claiming PostgreSQL jobs.
-- `sereneset-spark-postgres`: private managed PostgreSQL 17 database with no external IP allowlist.
+- `sereneset-spark-postgres`: free private managed PostgreSQL 17 database with no external IP allowlist.
 
 The first successful API deployment runs the idempotent showcase seed. B2 remains the durable store for all uploaded and generated media, sidecars, provenance, and export inputs.
 
@@ -248,15 +248,15 @@ After pushing `render.yaml` to GitHub, open the [Render Blueprint launcher](http
 - `B2_APPLICATION_KEY`
 - `GMI_API_KEY`
 
-The worker references those secrets without duplicating them. Keep the generated `onrender.com` hostname for the initial submission; Render provisions and renews its TLS certificate automatically.
+The worker references those secrets without duplicating them. Render injects the generated API and frontend URLs into the Vite build and FastAPI CORS allowlist, so suffixed `onrender.com` hostnames work without manual configuration. Keep those generated hostnames for the initial submission; Render provisions and renews their TLS certificates automatically.
 
 Wait for the API pre-deploy command and initial seed to finish, then open the frontend URL and verify:
 
 ```text
-https://sereneset-spark.onrender.com/api/v1/health/ready
+https://sereneset-spark-api.onrender.com/api/v1/health/ready
 ```
 
-If Render adds a suffix to the service name, use the exact URL shown in its dashboard. Readiness should report `ok` for PostgreSQL, B2, and the video worker before sharing the app. The Blueprint uses Starter compute for each process and Basic PostgreSQL; review the estimated monthly charge in Render before applying it.
+If Render adds a suffix to the service name, use the exact URL shown in its dashboard. Readiness should report `ok` for PostgreSQL, B2, and the video worker before sharing the app. The Blueprint costs approximately $14 for 30 days: $7 each for the API and worker, with a free static frontend and free PostgreSQL. The database is limited to 1 GB, has no backups, and expires after 30 days; upgrade it before expiry if the deployment must remain available longer.
 
 ## Production Containers
 

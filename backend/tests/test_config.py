@@ -49,6 +49,27 @@ class ProductionServiceSettingsTests(unittest.TestCase):
         self.assertEqual(settings.database_connect_timeout_seconds, 10)
         self.assertEqual(settings.b2_readiness_timeout_seconds, 5)
 
+    def test_adds_public_frontend_to_cors_origins(self) -> None:
+        settings = make_production_settings(
+            PUBLIC_FRONTEND_URL=" https://sereneset-spark.onrender.com/ ",
+            CORS_ORIGINS=[],
+        )
+
+        self.assertEqual(
+            settings.public_frontend_url,
+            "https://sereneset-spark.onrender.com",
+        )
+        self.assertEqual(
+            settings.allowed_cors_origins,
+            ["https://sereneset-spark.onrender.com"],
+        )
+
+    def test_rejects_insecure_production_frontend_url(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "must use HTTPS"):
+            make_production_settings(
+                PUBLIC_FRONTEND_URL="http://sereneset-spark.onrender.com"
+            )
+
     def test_rejects_local_postgresql_in_production(self) -> None:
         with self.assertRaisesRegex(
             ValidationError,
