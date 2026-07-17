@@ -234,10 +234,10 @@ The GitHub Actions workflow runs these checks in parallel on every push and pull
 
 [`render.yaml`](render.yaml) defines the judge-facing deployment in Render's Virginia region:
 
-- `sereneset-spark`: public Docker web service serving the frontend over managed HTTPS and proxying same-origin `/api` requests.
+- `sereneset-spark`: free public Docker web service serving the frontend over managed HTTPS and proxying same-origin `/api` requests.
 - `sereneset-spark-api`: private Docker service that runs `alembic upgrade head` before each release.
 - `sereneset-spark-video-worker`: private background worker that waits for API liveness before claiming PostgreSQL jobs.
-- `sereneset-spark-postgres`: private managed PostgreSQL 17 database with no external IP allowlist.
+- `sereneset-spark-postgres`: private free PostgreSQL 17 database with no external IP allowlist. It provides 1 GB and expires 30 days after creation.
 
 The first successful API deployment runs the idempotent showcase seed. B2 remains the durable store for all uploaded and generated media, sidecars, provenance, and export inputs.
 
@@ -256,7 +256,9 @@ Wait for the API pre-deploy command and initial seed to finish, then open the fr
 https://sereneset-spark.onrender.com/api/v1/health/ready
 ```
 
-If Render adds a suffix to the service name, use the exact URL shown in its dashboard. Readiness should report `ok` for PostgreSQL, B2, and the video worker before sharing the app. The Blueprint uses Starter compute for each process and Basic PostgreSQL; review the estimated monthly charge in Render before applying it.
+If Render adds a suffix to the service name, use the exact URL shown in its dashboard. Readiness should report `ok` for PostgreSQL, B2, and the video worker before sharing the app. The API and video worker use Starter compute; the frontend and 30-day PostgreSQL instance use Render's free plans. The expected infrastructure charge is about $14 per month. Review Render's estimate before applying it.
+
+Render spins down a free frontend after 15 minutes without inbound traffic, and the next request can take about one minute to wake it. Open the app shortly before a live demo or judging session. The paid API and worker remain available, while B2 continues to hold all durable media if the temporary PostgreSQL instance expires.
 
 ## Production Containers
 

@@ -78,7 +78,7 @@ services:
   - type: web
     name: sereneset-spark
     runtime: docker
-    plan: starter
+    plan: free
     region: virginia
     dockerfilePath: ./frontend/Dockerfile
     dockerContext: ./frontend
@@ -100,7 +100,7 @@ databases:
   - name: sereneset-spark-postgres
     databaseName: sereneset_spark
     user: sereneset
-    plan: basic-256mb
+    plan: free
     region: virginia
     postgresMajorVersion: "17"
     ipAllowList: []
