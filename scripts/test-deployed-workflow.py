@@ -250,42 +250,52 @@ def main() -> None:
     parser.add_argument(
         "--base-url",
         default="http://127.0.0.1:8080",
-        help="Frontend origin that proxies /api/v1 requests.",
+        help="Frontend origin.",
+    )
+    parser.add_argument(
+        "--api-url",
+        help="API origin when it differs from the frontend origin.",
     )
     parser.add_argument("--timeout-seconds", type=int, default=45)
     args = parser.parse_args()
-    client = HttpClient(args.base_url, args.timeout_seconds)
+    frontend_client = HttpClient(args.base_url, args.timeout_seconds)
+    api_client = HttpClient(args.api_url or args.base_url, args.timeout_seconds)
 
-    frontend = client.request("/")
+    frontend = frontend_client.request("/")
     require(frontend.status == 200, "Frontend did not return HTTP 200")
     require(b"SereneSet Spark" in frontend.body, "Frontend shell is missing")
 
-    readiness = client.request("/api/v1/health/ready").json()
+    readiness = api_client.request("/api/v1/health/ready").json()
     require(readiness["status"] == "ready", "Deployment is not ready")
     require(
         all(check["status"] == "ok" for check in readiness["checks"].values()),
         "One or more readiness dependencies are unhealthy",
     )
+    check_campaign_crud(api_client)
 
-    campaigns = client.request("/api/v1/campaigns").json()
+    campaigns = api_client.request("/api/v1/campaigns").json()
     showcase = next(
         (campaign for campaign in campaigns if campaign["name"] == SHOWCASE_NAME),
         None,
     )
-    require(showcase is not None, "Showcase campaign was not found")
+    require(
+        showcase is not None,
+        "Showcase campaign was not found; run "
+        "python scripts/seed.py --showcase-only in the API service",
+    )
     campaign_id = showcase["id"]
 
-    links = check_brand_assets(client, campaign_id)
-    assets, version_count = check_assets(client, campaign_id)
-    check_generation_job(client, campaign_id)
-    export_size = check_export(client, campaign_id)
-    check_campaign_crud(client)
+    links = check_brand_assets(api_client, campaign_id)
+    assets, version_count = check_assets(api_client, campaign_id)
+    check_generation_job(api_client, campaign_id)
+    export_size = check_export(api_client, campaign_id)
 
     print(
         json.dumps(
             {
                 "status": "passed",
-                "base_url": args.base_url,
+                "frontend_url": frontend_client.base_url,
+                "api_url": api_client.base_url,
                 "campaign_id": campaign_id,
                 "brand_assets": len(links),
                 "assets": len(assets),
