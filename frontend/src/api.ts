@@ -236,6 +236,7 @@ export type VideoGenerationCreateDto = {
   aspect_ratio?: VideoAspectRatio
   resolution?: VideoResolution
   source_version_id?: string | null
+  source_brand_asset_id?: string | null
 }
 
 export type GenerationJobDto = {

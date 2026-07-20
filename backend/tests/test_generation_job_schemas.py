@@ -26,6 +26,26 @@ class VideoGenerationSchemaTests(unittest.TestCase):
         self.assertEqual(request.aspect_ratio, VideoAspectRatio.landscape)
         self.assertEqual(request.resolution, VideoResolution.hd)
         self.assertIsNone(request.source_version_id)
+        self.assertIsNone(request.source_brand_asset_id)
+
+    def test_video_request_accepts_exactly_one_source_kind(self) -> None:
+        brand_asset_id = uuid.uuid4()
+        request = VideoGenerationCreate(
+            channel="Paid social",
+            prompt="Move only the background.",
+            source_brand_asset_id=brand_asset_id,
+        )
+
+        self.assertEqual(request.source_brand_asset_id, brand_asset_id)
+        self.assertIsNone(request.source_version_id)
+
+        with self.assertRaises(ValidationError):
+            VideoGenerationCreate(
+                channel="Paid social",
+                prompt="Move only the background.",
+                source_version_id=uuid.uuid4(),
+                source_brand_asset_id=brand_asset_id,
+            )
 
     def test_video_request_rejects_invalid_or_unknown_controls(self) -> None:
         invalid_payloads = (

@@ -25,6 +25,7 @@ from app.schemas.generation_job import (
 )
 from app.services.generation import (
     GenerationInputError,
+    VIDEO_SOURCE_INPUT_ROLE,
     VideoInputMode,
     infer_asset_media_type,
     optional_string,
@@ -259,10 +260,62 @@ def source_version_input_record(
     }
 
 
+def get_source_brand_asset_link_or_404(
+    *,
+    campaign_id: uuid.UUID,
+    source_brand_asset_id: uuid.UUID,
+    db: Session,
+) -> CampaignBrandAsset:
+    statement = (
+        select(CampaignBrandAsset)
+        .join(CampaignBrandAsset.brand_asset)
+        .options(selectinload(CampaignBrandAsset.brand_asset))
+        .where(
+            CampaignBrandAsset.campaign_id == campaign_id,
+            CampaignBrandAsset.brand_asset_id == source_brand_asset_id,
+            BrandAsset.is_active.is_(True),
+        )
+        .order_by(CampaignBrandAsset.created_at.asc())
+        .limit(1)
+    )
+    link = db.scalar(statement)
+    if link is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Source brand asset is not attached to this campaign",
+        )
+
+    return link
+
+
+def campaign_brand_asset_input_record(
+    link: CampaignBrandAsset,
+    *,
+    role: str | None = None,
+) -> dict[str, object]:
+    brand_asset = link.brand_asset
+    return {
+        "role": role or link.role,
+        "storage_key": brand_asset.storage_key,
+        "filename": brand_asset.filename,
+        "content_type": brand_asset.content_type,
+        "size_bytes": brand_asset.size_bytes,
+        "sha256": brand_asset.sha256,
+        "source": "campaign_brand_asset",
+        "storage_ownership": "brand_asset",
+        "brand_asset_id": str(brand_asset.id),
+        "campaign_brand_asset_id": str(link.id),
+        "brand_asset_type": brand_asset.asset_type.value,
+        "brand_asset_name": brand_asset.name,
+        "usage_guidance": brand_asset.usage_guidance,
+    }
+
+
 def campaign_brand_context_assets(
     *,
     campaign_id: uuid.UUID,
     db: Session,
+    exclude_brand_asset_id: uuid.UUID | None = None,
 ) -> list[dict[str, object]]:
     statement = (
         select(CampaignBrandAsset)
@@ -274,25 +327,13 @@ def campaign_brand_context_assets(
         )
         .order_by(CampaignBrandAsset.created_at.asc())
     )
+    if exclude_brand_asset_id is not None:
+        statement = statement.where(
+            CampaignBrandAsset.brand_asset_id != exclude_brand_asset_id
+        )
+
     links = list(db.scalars(statement).all())
-    return [
-        {
-            "role": link.role,
-            "storage_key": link.brand_asset.storage_key,
-            "filename": link.brand_asset.filename,
-            "content_type": link.brand_asset.content_type,
-            "size_bytes": link.brand_asset.size_bytes,
-            "sha256": link.brand_asset.sha256,
-            "source": "campaign_brand_asset",
-            "storage_ownership": "brand_asset",
-            "brand_asset_id": str(link.brand_asset.id),
-            "campaign_brand_asset_id": str(link.id),
-            "brand_asset_type": link.brand_asset.asset_type.value,
-            "brand_asset_name": link.brand_asset.name,
-            "usage_guidance": link.brand_asset.usage_guidance,
-        }
-        for link in links
-    ]
+    return [campaign_brand_asset_input_record(link) for link in links]
 
 
 def build_queued_video_models(
@@ -319,6 +360,11 @@ def build_queued_video_models(
         "source_version_id": (
             str(video_in.source_version_id)
             if video_in.source_version_id is not None
+            else None
+        ),
+        "source_brand_asset_id": (
+            str(video_in.source_brand_asset_id)
+            if video_in.source_brand_asset_id is not None
             else None
         ),
         "source_input_assets": source_inputs,
@@ -576,6 +622,18 @@ def submit_video_generation(
             db=db,
         )
         source_inputs.append(source_version_input_record(source_version))
+    elif video_in.source_brand_asset_id is not None:
+        source_brand_asset_link = get_source_brand_asset_link_or_404(
+            campaign_id=campaign_id,
+            source_brand_asset_id=video_in.source_brand_asset_id,
+            db=db,
+        )
+        source_inputs.append(
+            campaign_brand_asset_input_record(
+                source_brand_asset_link,
+                role=VIDEO_SOURCE_INPUT_ROLE,
+            )
+        )
 
     try:
         validate_video_generation_parameters(
@@ -598,6 +656,7 @@ def submit_video_generation(
     context_assets = campaign_brand_context_assets(
         campaign_id=campaign_id,
         db=db,
+        exclude_brand_asset_id=video_in.source_brand_asset_id,
     )
     asset, _version, job = build_queued_video_models(
         campaign_id=campaign_id,

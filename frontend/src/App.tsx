@@ -160,10 +160,19 @@ type BrandAssetFormState = {
   sourceUrl: string
 }
 
-type VideoSourceOption = {
-  versionId: string
-  label: string
-}
+type VideoSourceOption =
+  | {
+      key: string
+      kind: 'brand_asset'
+      brandAssetId: string
+      label: string
+    }
+  | {
+      key: string
+      kind: 'asset_version'
+      versionId: string
+      label: string
+    }
 
 const defaultPrompt =
   'Generate a composed launch asset that keeps the product central and uses calm, benefit-led messaging.'
@@ -347,25 +356,48 @@ function getFileExtension(filename: string | null): string {
   return extension.slice(0, 5).toLowerCase()
 }
 
-function isEligibleVideoSourceVersion(version: AssetVersion): boolean {
-  if (
-    !version.artifactStorageKey ||
-    !version.artifactFilename ||
-    !version.artifactSizeBytes ||
-    version.artifactSizeBytes > maxReferenceImageSizeBytes
-  ) {
+function isEligibleVideoSourceFile(
+  contentType: string | null,
+  filename: string | null,
+  sizeBytes: number | null,
+): boolean {
+  if (!filename || !sizeBytes || sizeBytes > maxReferenceImageSizeBytes) {
     return false
   }
 
-  const contentType = version.artifactContentType
+  const normalizedContentType = contentType
     ?.split(';', 1)[0]
     .trim()
     .toLowerCase()
 
   return (
-    (contentType ? allowedReferenceImageTypes.includes(contentType) : false) ||
+    (normalizedContentType
+      ? allowedReferenceImageTypes.includes(normalizedContentType)
+      : false) ||
     ['jpg', 'jpeg', 'png', 'webp'].includes(
-      getFileExtension(version.artifactFilename),
+      getFileExtension(filename),
+    )
+  )
+}
+
+function isEligibleVideoSourceVersion(version: AssetVersion): boolean {
+  return Boolean(
+    version.artifactStorageKey &&
+      isEligibleVideoSourceFile(
+        version.artifactContentType,
+        version.artifactFilename,
+        version.artifactSizeBytes,
+      ),
+  )
+}
+
+function isEligibleVideoSourceBrandAsset(asset: BrandAssetDto): boolean {
+  return (
+    asset.is_active &&
+    isEligibleVideoSourceFile(
+      asset.content_type,
+      asset.filename,
+      asset.size_bytes,
     )
   )
 }
@@ -900,7 +932,7 @@ function App() {
     useState<VideoAspectRatio>('16:9')
   const [videoResolution, setVideoResolution] =
     useState<VideoResolution>('720p')
-  const [videoSourceVersionId, setVideoSourceVersionId] = useState('')
+  const [videoSourceKey, setVideoSourceKey] = useState('')
   const [isLoadingCampaigns, setIsLoadingCampaigns] = useState(true)
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
   const [isLoadingGenerationJobs, setIsLoadingGenerationJobs] = useState(false)
@@ -1134,7 +1166,7 @@ function App() {
     setGenerationJobs([])
     setGenerationJobsCampaignId(selectedCampaignId)
     setGenerationJobsError(null)
-    setVideoSourceVersionId('')
+    setVideoSourceKey('')
 
     async function loadGenerationJobs(campaignId: string) {
       setIsLoadingGenerationJobs(true)
@@ -1294,6 +1326,25 @@ function App() {
   )
   const videoSourceOptions = useMemo<VideoSourceOption[]>(() => {
     const options: VideoSourceOption[] = []
+    const addedBrandAssetIds = new Set<string>()
+
+    for (const attachment of campaignBrandAssets) {
+      const brandAsset = attachment.brand_asset
+      if (
+        addedBrandAssetIds.has(brandAsset.id) ||
+        !isEligibleVideoSourceBrandAsset(brandAsset)
+      ) {
+        continue
+      }
+
+      addedBrandAssetIds.add(brandAsset.id)
+      options.push({
+        key: `brand:${brandAsset.id}`,
+        kind: 'brand_asset',
+        brandAssetId: brandAsset.id,
+        label: `Brand / ${brandAsset.name} / ${brandAsset.filename}`,
+      })
+    }
 
     for (const asset of campaignAssets) {
       if (asset.format !== 'Image') {
@@ -1306,8 +1357,10 @@ function App() {
         }
 
         options.push({
+          key: `version:${version.versionId}`,
+          kind: 'asset_version',
           versionId: version.versionId,
-          label: `${asset.title} / v${version.versionNumber} / ${
+          label: `Generated / ${asset.title} / v${version.versionNumber} / ${
             version.artifactFilename ?? 'image'
           }`,
         })
@@ -1315,7 +1368,7 @@ function App() {
     }
 
     return options
-  }, [campaignAssets])
+  }, [campaignAssets, campaignBrandAssets])
 
   const channels = useMemo(
     () => ['All', ...(selectedCampaign?.channels ?? [])],
@@ -1362,13 +1415,13 @@ function App() {
   ).length
 
   useEffect(() => {
-    setVideoSourceVersionId((currentVersionId) =>
-      currentVersionId &&
+    setVideoSourceKey((currentSourceKey) =>
+      currentSourceKey &&
       !videoSourceOptions.some(
-        (option) => option.versionId === currentVersionId,
+        (option) => option.key === currentSourceKey,
       )
         ? ''
-        : currentVersionId,
+        : currentSourceKey,
     )
   }, [videoSourceOptions])
 
@@ -2160,6 +2213,9 @@ function App() {
       let createdAssetDto: AssetDto
 
       if (requestFormat === 'Video concept') {
+        const selectedVideoSource = videoSourceOptions.find(
+          (option) => option.key === videoSourceKey,
+        )
         const videoPayload: VideoGenerationCreateDto = {
           title: `${requestChannel} video draft`,
           channel: requestChannel,
@@ -2172,7 +2228,14 @@ function App() {
           duration_seconds: videoDurationSeconds,
           aspect_ratio: videoAspectRatio,
           resolution: videoResolution,
-          source_version_id: videoSourceVersionId || null,
+          source_version_id:
+            selectedVideoSource?.kind === 'asset_version'
+              ? selectedVideoSource.versionId
+              : null,
+          source_brand_asset_id:
+            selectedVideoSource?.kind === 'brand_asset'
+              ? selectedVideoSource.brandAssetId
+              : null,
         }
         const submission = await submitVideoGeneration(
           selectedCampaign.id,
@@ -3749,13 +3812,13 @@ function App() {
                         <select
                           disabled={isGenerating}
                           onChange={(event) =>
-                            setVideoSourceVersionId(event.target.value)
+                            setVideoSourceKey(event.target.value)
                           }
-                          value={videoSourceVersionId}
+                          value={videoSourceKey}
                         >
-                          <option value="">No source image</option>
+                          <option value="">Text to video (no source image)</option>
                           {videoSourceOptions.map((option) => (
-                            <option key={option.versionId} value={option.versionId}>
+                            <option key={option.key} value={option.key}>
                               {option.label}
                             </option>
                           ))}

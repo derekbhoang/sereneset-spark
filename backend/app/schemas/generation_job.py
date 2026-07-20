@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.models.asset import ReviewStatus
 from app.models.generation_job import GenerationJobKind, GenerationJobStatus
@@ -39,6 +39,20 @@ class VideoGenerationCreate(BaseModel):
     aspect_ratio: VideoAspectRatio = VideoAspectRatio.landscape
     resolution: VideoResolution = VideoResolution.hd
     source_version_id: uuid.UUID | None = None
+    source_brand_asset_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def validate_single_source_image(self) -> "VideoGenerationCreate":
+        if (
+            self.source_version_id is not None
+            and self.source_brand_asset_id is not None
+        ):
+            raise ValueError(
+                "Select either an image version or a brand asset as the "
+                "video source, not both"
+            )
+
+        return self
 
 
 class GenerationJobRead(BaseModel):

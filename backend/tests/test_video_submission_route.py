@@ -7,12 +7,18 @@ from fastapi import HTTPException, status
 from app.core.config import Settings
 from app.main import app
 from app.models.asset import Asset, AssetFormat, AssetVersion, ReviewStatus
+from app.models.brand_asset import (
+    BrandAsset,
+    BrandAssetType,
+    CampaignBrandAsset,
+)
 from app.models.campaign import Campaign
 from app.models.generation_job import GenerationJobStatus
 from app.schemas.generation_job import VideoGenerationCreate
 from app.services.generation import VideoInputMode
 from app.api.v1.routes.generation_jobs import (
     build_queued_video_models,
+    campaign_brand_asset_input_record,
     source_version_input_record,
     submit_video_generation,
 )
@@ -107,6 +113,42 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         self.assertEqual(record["storage_ownership"], "source_asset_version")
         self.assertEqual(record["source_version_id"], str(source_version.id))
 
+    def test_snapshots_brand_asset_as_video_source(self) -> None:
+        campaign_id = uuid.uuid4()
+        brand_asset = BrandAsset(
+            id=uuid.uuid4(),
+            name="Product with sunset background",
+            asset_type=BrandAssetType.product_image,
+            description=None,
+            usage_guidance="Keep the product still.",
+            storage_key="brand-assets/product/original.jpg",
+            filename="original.jpg",
+            content_type="image/jpeg",
+            size_bytes=2048,
+            sha256="c" * 64,
+            tags=[],
+            source_url=None,
+            is_active=True,
+        )
+        link = CampaignBrandAsset(
+            id=uuid.uuid4(),
+            campaign_id=campaign_id,
+            brand_asset_id=brand_asset.id,
+            role="product",
+        )
+        link.brand_asset = brand_asset
+
+        record = campaign_brand_asset_input_record(
+            link,
+            role="source_creative",
+        )
+
+        self.assertEqual(record["role"], "source_creative")
+        self.assertEqual(record["storage_key"], brand_asset.storage_key)
+        self.assertEqual(record["brand_asset_id"], str(brand_asset.id))
+        self.assertEqual(record["campaign_brand_asset_id"], str(link.id))
+        self.assertEqual(record["storage_ownership"], "brand_asset")
+
     def test_submission_queues_without_calling_generation_or_storage(self) -> None:
         campaign_id = uuid.uuid4()
         db = MagicMock()
@@ -131,6 +173,73 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         queued_asset = db.add.call_args.args[0]
         self.assertEqual(queued_asset.format, AssetFormat.video_concept)
         load_submission.assert_called_once()
+
+    def test_submission_uses_attached_brand_image_as_provider_source(self) -> None:
+        campaign_id = uuid.uuid4()
+        brand_asset_id = uuid.uuid4()
+        source_record = {
+            "role": "source_creative",
+            "storage_key": "brand-assets/product/original.jpg",
+            "filename": "original.jpg",
+            "content_type": "image/jpeg",
+            "size_bytes": 2048,
+            "sha256": "d" * 64,
+            "source": "campaign_brand_asset",
+            "storage_ownership": "brand_asset",
+            "brand_asset_id": str(brand_asset_id),
+        }
+        db = MagicMock()
+        db.get.return_value = Campaign(id=campaign_id)
+        expected_response = object()
+
+        with (
+            patch(
+                "app.api.v1.routes.generation_jobs."
+                "get_source_brand_asset_link_or_404",
+                return_value=object(),
+            ),
+            patch(
+                "app.api.v1.routes.generation_jobs."
+                "campaign_brand_asset_input_record",
+                return_value=source_record,
+            ),
+            patch(
+                "app.api.v1.routes.generation_jobs."
+                "campaign_brand_context_assets",
+                return_value=[],
+            ) as context_assets,
+            patch(
+                "app.api.v1.routes.generation_jobs.load_video_submission",
+                return_value=expected_response,
+            ),
+        ):
+            response = submit_video_generation(
+                campaign_id=campaign_id,
+                video_in=video_request(
+                    source_brand_asset_id=brand_asset_id,
+                ),
+                db=db,
+                settings=settings(),
+            )
+
+        self.assertIs(response, expected_response)
+        queued_asset = db.add.call_args.args[0]
+        queued_job = queued_asset.versions[0].generation_job
+        self.assertEqual(queued_job.parameters["input_mode"], "image_to_video")
+        self.assertEqual(
+            queued_job.parameters["source_brand_asset_id"],
+            str(brand_asset_id),
+        )
+        self.assertEqual(
+            queued_job.parameters["source_input_assets"],
+            [source_record],
+        )
+        self.assertEqual(queued_job.parameters["context_assets"], [])
+        context_assets.assert_called_once_with(
+            campaign_id=campaign_id,
+            db=db,
+            exclude_brand_asset_id=brand_asset_id,
+        )
 
     def test_image_required_model_fails_before_database_write(self) -> None:
         campaign_id = uuid.uuid4()
