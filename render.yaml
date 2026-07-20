@@ -7,8 +7,7 @@ services:
     dockerfilePath: ./backend/Dockerfile
     dockerContext: ./backend
     healthCheckPath: /api/v1/health
-    preDeployCommand: >-
-      sh -c 'alembic upgrade head && python scripts/seed.py --showcase-only'
+    preDeployCommand: python scripts/release.py
     autoDeployTrigger: checksPass
     maxShutdownDelaySeconds: 300
     buildFilter:
