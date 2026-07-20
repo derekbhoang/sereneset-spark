@@ -1468,14 +1468,12 @@ function App() {
           )
         })
 
-        generationJobsRef.current = nextJobs
-        setGenerationJobs(nextJobs)
-        setGenerationJobsError(null)
         shouldContinuePolling = nextJobs.some((job) =>
           isActiveGenerationJobStatus(job.status),
         )
 
         if (hasTerminalTransition) {
+          // Keep polling active until the completed artifact reaches asset state.
           const assetDtos = await fetchCampaignAssets(campaignId)
 
           if (isCancelled) {
@@ -1491,8 +1489,15 @@ function App() {
               : (nextAssets[0]?.id ?? ''),
           )
         }
+
+        generationJobsRef.current = nextJobs
+        setGenerationJobs(nextJobs)
+        setGenerationJobsError(null)
       } catch (error) {
         if (!isCancelled && !isAbortError(error)) {
+          shouldContinuePolling = generationJobsRef.current.some((job) =>
+            isActiveGenerationJobStatus(job.status),
+          )
           setGenerationJobsError(
             `Could not refresh video jobs: ${getErrorMessage(error)}`,
           )
