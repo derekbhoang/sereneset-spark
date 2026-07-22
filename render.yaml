@@ -152,7 +152,7 @@ envVarGroups:
       - key: GENBLAZE_VIDEO_EDIT_MODEL
         value: wan2.7-videoedit
       - key: GENBLAZE_VIDEO_TO_VIDEO_ENABLED
-        value: "false"
+        value: "true"
       - key: GENBLAZE_TIMEOUT_SECONDS
         value: "600"
       - key: GENBLAZE_VIDEO_TIMEOUT_SECONDS
