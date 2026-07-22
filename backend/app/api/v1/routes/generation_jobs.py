@@ -1,10 +1,22 @@
 import uuid
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    UploadFile,
+    status,
+)
+from pydantic import ValidationError
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.core.config import Settings, get_settings
@@ -27,6 +39,7 @@ from app.services.generation import (
     GenerationInputError,
     VIDEO_SOURCE_INPUT_ROLE,
     VideoInputMode,
+    format_size_limit,
     infer_asset_media_type,
     optional_string,
     validate_video_generation_parameters,
@@ -36,10 +49,21 @@ from app.services.input_provenance import (
     build_asset_version_input,
     infer_input_media_kind,
 )
-from app.services.storage import build_asset_version_storage_key
+from app.services.storage import (
+    B2StorageService,
+    FileObjectInspection,
+    StorageConfigurationError,
+    StorageObjectTooLargeError,
+    StorageOperationError,
+    build_asset_version_input_storage_key,
+    build_asset_version_storage_key,
+    get_storage_service,
+    normalize_artifact_filename,
+)
 
 
 router = APIRouter(tags=["generation-jobs"])
+VIDEO_UPLOAD_CONTENT_TYPES_BY_SUFFIX = {".mp4": "video/mp4"}
 
 
 def metadata_dict(value: object) -> dict[str, object]:
@@ -51,6 +75,93 @@ def metadata_list(value: object) -> list[dict[str, object]]:
         return []
 
     return [item for item in value if isinstance(item, dict)]
+
+
+def parse_video_generation_payload(payload: str) -> VideoGenerationCreate:
+    try:
+        return VideoGenerationCreate.model_validate_json(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.errors(),
+        ) from exc
+
+
+def normalize_video_upload_filename(file: UploadFile) -> str:
+    try:
+        return normalize_artifact_filename(file.filename or "")
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc).replace("Artifact", "Source video"),
+        ) from exc
+
+
+def normalize_video_upload_content_type(
+    *,
+    file: UploadFile,
+    filename: str,
+) -> str:
+    suffix = PurePosixPath(filename).suffix.casefold()
+    content_type = VIDEO_UPLOAD_CONTENT_TYPES_BY_SUFFIX.get(suffix)
+    if content_type is None:
+        supported_extensions = ", ".join(sorted(VIDEO_UPLOAD_CONTENT_TYPES_BY_SUFFIX))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Source video file type is not supported. "
+                f"Use one of: {supported_extensions}"
+            ),
+        )
+
+    declared_content_type = (
+        (file.content_type or "").split(";", maxsplit=1)[0].strip().casefold()
+    )
+    allowed_declared_types = {"", "application/octet-stream", content_type}
+    if declared_content_type not in allowed_declared_types:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Source video must use content type '{content_type}'",
+        )
+
+    return content_type
+
+
+def inspect_video_upload(
+    *,
+    storage: B2StorageService,
+    file: UploadFile,
+    max_size_bytes: int,
+) -> FileObjectInspection:
+    try:
+        return storage.inspect_fileobj(
+            fileobj=file.file,
+            max_size_bytes=max_size_bytes,
+        )
+    except StorageObjectTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                "Source video must be "
+                f"{format_size_limit(max_size_bytes)} or smaller"
+            ),
+        ) from exc
+    except StorageOperationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+
+def delete_uploaded_video_safely(
+    *,
+    storage: B2StorageService,
+    storage_key: str,
+) -> None:
+    try:
+        storage.delete_object(key=storage_key)
+    except (StorageConfigurationError, BotoCoreError, ClientError):
+        pass
 
 
 def campaign_generation_job_statement(
@@ -346,6 +457,53 @@ def campaign_brand_context_assets(
     return [campaign_brand_asset_input_record(link) for link in links]
 
 
+def uploaded_video_input_record(
+    *,
+    storage_key: str,
+    filename: str,
+    content_type: str,
+    inspection: FileObjectInspection,
+) -> dict[str, object]:
+    return {
+        "role": VIDEO_SOURCE_INPUT_ROLE,
+        "storage_key": storage_key,
+        "filename": filename,
+        "content_type": content_type,
+        "media_kind": infer_input_media_kind(content_type).value,
+        "size_bytes": inspection.size,
+        "sha256": inspection.sha256,
+        "source": "user_upload",
+        "storage_ownership": "asset_version",
+    }
+
+
+def validate_video_submission(
+    *,
+    video_in: VideoGenerationCreate,
+    model: str,
+    source_inputs: list[dict[str, object]],
+    settings: Settings,
+) -> VideoInputMode:
+    try:
+        validate_video_generation_parameters(
+            model=model,
+            duration_seconds=video_in.duration_seconds,
+            aspect_ratio=video_in.aspect_ratio.value,
+            resolution=video_in.resolution.value,
+        )
+        return validate_video_input_assets(
+            model=model,
+            input_assets=source_inputs,
+            require_download_url=False,
+            settings=settings,
+        )
+    except GenerationInputError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+
 def build_queued_video_models(
     *,
     campaign_id: uuid.UUID,
@@ -354,10 +512,13 @@ def build_queued_video_models(
     input_mode: VideoInputMode,
     source_inputs: list[dict[str, object]],
     context_assets: list[dict[str, object]],
+    asset_id: uuid.UUID | None = None,
+    version_id: uuid.UUID | None = None,
+    job_id: uuid.UUID | None = None,
 ) -> tuple[Asset, AssetVersion, GenerationJob]:
-    asset_id = uuid.uuid4()
-    version_id = uuid.uuid4()
-    job_id = uuid.uuid4()
+    asset_id = asset_id or uuid.uuid4()
+    version_id = version_id or uuid.uuid4()
+    job_id = job_id or uuid.uuid4()
     generation_parameters: dict[str, object] = {
         "duration": video_in.duration_seconds,
         "aspect_ratio": video_in.aspect_ratio.value,
@@ -652,24 +813,12 @@ def submit_video_generation(
             )
         )
 
-    try:
-        validate_video_generation_parameters(
-            model=model,
-            duration_seconds=video_in.duration_seconds,
-            aspect_ratio=video_in.aspect_ratio.value,
-            resolution=video_in.resolution.value,
-        )
-        input_mode = validate_video_input_assets(
-            model=model,
-            input_assets=source_inputs,
-            require_download_url=False,
-            settings=settings,
-        )
-    except GenerationInputError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=str(exc),
-        ) from exc
+    input_mode = validate_video_submission(
+        video_in=video_in,
+        model=model,
+        source_inputs=source_inputs,
+        settings=settings,
+    )
 
     context_assets = campaign_brand_context_assets(
         campaign_id=campaign_id,
@@ -692,6 +841,160 @@ def submit_video_generation(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Video generation job could not be queued",
+        ) from exc
+
+    return load_video_submission(
+        asset_id=asset.id,
+        job_id=job.id,
+        db=db,
+    )
+
+
+@router.post(
+    "/campaigns/{campaign_id}/assets/generate-video-with-input",
+    response_model=VideoGenerationSubmissionRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def submit_video_generation_with_upload(
+    campaign_id: uuid.UUID,
+    payload: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+    storage: B2StorageService = Depends(get_storage_service),
+) -> VideoGenerationSubmissionRead:
+    video_in = parse_video_generation_payload(payload)
+    if (
+        video_in.source_version_id is not None
+        or video_in.source_brand_asset_id is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                "An uploaded source video cannot be combined with a stored "
+                "source version or brand asset"
+            ),
+        )
+
+    get_campaign_or_404(campaign_id, db)
+    filename = normalize_video_upload_filename(file)
+    content_type = normalize_video_upload_content_type(
+        file=file,
+        filename=filename,
+    )
+    inspection = inspect_video_upload(
+        storage=storage,
+        file=file,
+        max_size_bytes=settings.max_video_source_video_size_bytes,
+    )
+
+    asset_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    storage_key = build_asset_version_input_storage_key(
+        campaign_id=campaign_id,
+        asset_id=asset_id,
+        version_number=1,
+        role=VIDEO_SOURCE_INPUT_ROLE,
+        filename=filename,
+    )
+    source_input = uploaded_video_input_record(
+        storage_key=storage_key,
+        filename=filename,
+        content_type=content_type,
+        inspection=inspection,
+    )
+    model = video_in.model or settings.genblaze_video_edit_model
+    input_mode = validate_video_submission(
+        video_in=video_in,
+        model=model,
+        source_inputs=[source_input],
+        settings=settings,
+    )
+    context_assets = campaign_brand_context_assets(
+        campaign_id=campaign_id,
+        db=db,
+    )
+    asset, _version, job = build_queued_video_models(
+        campaign_id=campaign_id,
+        video_in=video_in,
+        model=model,
+        input_mode=input_mode,
+        source_inputs=[source_input],
+        context_assets=context_assets,
+        asset_id=asset_id,
+        version_id=version_id,
+        job_id=job_id,
+    )
+
+    try:
+        storage.upload_fileobj(
+            key=storage_key,
+            fileobj=file.file,
+            content_type=content_type,
+            max_size_bytes=settings.max_video_source_video_size_bytes,
+            inspection=inspection,
+            metadata={
+                "campaign_id": str(campaign_id),
+                "asset_id": str(asset_id),
+                "version_number": 1,
+                "content_kind": "asset-version-input",
+                "media_kind": "video",
+                "role": VIDEO_SOURCE_INPUT_ROLE,
+                "filename": filename,
+                "sha256": inspection.sha256,
+            },
+        )
+    except StorageObjectTooLargeError as exc:
+        delete_uploaded_video_safely(
+            storage=storage,
+            storage_key=storage_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                "Source video must be "
+                f"{format_size_limit(settings.max_video_source_video_size_bytes)} "
+                "or smaller"
+            ),
+        ) from exc
+    except (
+        StorageConfigurationError,
+        StorageOperationError,
+        BotoCoreError,
+        ClientError,
+    ) as exc:
+        delete_uploaded_video_safely(
+            storage=storage,
+            storage_key=storage_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Source video was not uploaded because B2 storage failed",
+        ) from exc
+
+    try:
+        db.add(asset)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        delete_uploaded_video_safely(
+            storage=storage,
+            storage_key=storage_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Video generation job could not be queued",
+        ) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        delete_uploaded_video_safely(
+            storage=storage,
+            storage_key=storage_key,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Video generation job metadata could not be saved",
         ) from exc
 
     return load_video_submission(

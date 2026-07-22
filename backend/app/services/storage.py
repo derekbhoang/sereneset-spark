@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import uuid
@@ -5,9 +6,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.client import BaseClient
 from botocore.config import Config
 
@@ -27,6 +29,8 @@ class StorageObjectTooLargeError(StorageOperationError):
 
 
 DEFAULT_DOWNLOAD_CHUNK_SIZE_BYTES = 1024 * 1024
+DEFAULT_UPLOAD_INSPECTION_CHUNK_SIZE_BYTES = 1024 * 1024
+DEFAULT_MULTIPART_UPLOAD_CHUNK_SIZE_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,12 @@ class StoredObject:
     content_type: str
     size: int
     etag: str | None = None
+
+
+@dataclass(frozen=True)
+class FileObjectInspection:
+    size: int
+    sha256: str
 
 
 def normalize_storage_key(key: str) -> str:
@@ -261,6 +271,128 @@ class B2StorageService:
             key=storage_key,
             content_type=content_type,
             size=len(body),
+        )
+
+    def inspect_fileobj(
+        self,
+        *,
+        fileobj: BinaryIO,
+        max_size_bytes: int,
+        chunk_size_bytes: int = DEFAULT_UPLOAD_INSPECTION_CHUNK_SIZE_BYTES,
+    ) -> FileObjectInspection:
+        if max_size_bytes < 1:
+            raise ValueError("Maximum upload size must be greater than zero")
+        if chunk_size_bytes < 1:
+            raise ValueError("Upload inspection chunk size must be greater than zero")
+
+        try:
+            fileobj.seek(0)
+        except (AttributeError, OSError, ValueError) as exc:
+            raise StorageOperationError("Upload file must be seekable") from exc
+
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            while True:
+                read_size = min(
+                    chunk_size_bytes,
+                    max_size_bytes - size + 1,
+                )
+                chunk = fileobj.read(read_size)
+                if not chunk:
+                    break
+                if not isinstance(chunk, bytes):
+                    raise StorageOperationError("Upload file must contain binary data")
+
+                size += len(chunk)
+                if size > max_size_bytes:
+                    raise StorageObjectTooLargeError(
+                        "Upload file exceeds the configured size limit"
+                    )
+                digest.update(chunk)
+        except Exception:
+            try:
+                fileobj.seek(0)
+            except (AttributeError, OSError, ValueError):
+                pass
+            raise
+
+        try:
+            fileobj.seek(0)
+        except (AttributeError, OSError, ValueError) as exc:
+            raise StorageOperationError("Upload file could not be rewound") from exc
+
+        if size == 0:
+            raise StorageOperationError("Upload file must not be empty")
+
+        return FileObjectInspection(size=size, sha256=digest.hexdigest())
+
+    def upload_fileobj(
+        self,
+        *,
+        key: str,
+        fileobj: BinaryIO,
+        content_type: str,
+        max_size_bytes: int,
+        inspection: FileObjectInspection | None = None,
+        metadata: dict[str, Any] | None = None,
+        cache_control: str | None = None,
+        multipart_chunk_size_bytes: int = (DEFAULT_MULTIPART_UPLOAD_CHUNK_SIZE_BYTES),
+    ) -> StoredObject:
+        if max_size_bytes < 1:
+            raise ValueError("Maximum upload size must be greater than zero")
+        if multipart_chunk_size_bytes < 5 * 1024 * 1024:
+            raise ValueError("Multipart upload chunks must be at least 5 MB")
+
+        storage_key = normalize_storage_key(key)
+        file_inspection = inspection or self.inspect_fileobj(
+            fileobj=fileobj,
+            max_size_bytes=max_size_bytes,
+        )
+        if file_inspection.size < 1:
+            raise StorageOperationError("Upload file must not be empty")
+        if file_inspection.size > max_size_bytes:
+            raise StorageObjectTooLargeError(
+                "Upload file exceeds the configured size limit"
+            )
+
+        try:
+            fileobj.seek(0)
+        except (AttributeError, OSError, ValueError) as exc:
+            raise StorageOperationError("Upload file could not be rewound") from exc
+
+        extra_args: dict[str, Any] = {
+            "ContentType": content_type,
+            "Metadata": stringify_metadata(metadata),
+        }
+        if cache_control:
+            extra_args["CacheControl"] = cache_control
+
+        transfer_config = TransferConfig(
+            multipart_threshold=multipart_chunk_size_bytes,
+            multipart_chunksize=multipart_chunk_size_bytes,
+            max_concurrency=1,
+            use_threads=False,
+        )
+        try:
+            self.client.upload_fileobj(
+                Fileobj=fileobj,
+                Bucket=self.bucket_name,
+                Key=storage_key,
+                ExtraArgs=extra_args,
+                Config=transfer_config,
+            )
+        finally:
+            try:
+                fileobj.seek(0)
+            except (AttributeError, OSError, ValueError):
+                pass
+
+        return StoredObject(
+            bucket=self.bucket_name,
+            key=storage_key,
+            content_type=content_type,
+            size=file_inspection.size,
         )
 
     def upload_json(

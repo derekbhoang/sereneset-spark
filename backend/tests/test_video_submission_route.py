@@ -1,8 +1,10 @@
 import unittest
 import uuid
+from io import BytesIO
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException, status
+from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.config import Settings
 from app.main import app
@@ -22,7 +24,9 @@ from app.api.v1.routes.generation_jobs import (
     get_source_version_or_404,
     source_version_input_record,
     submit_video_generation,
+    submit_video_generation_with_upload,
 )
+from app.services.storage import FileObjectInspection, StoredObject
 
 
 def video_request(**overrides: object) -> VideoGenerationCreate:
@@ -67,6 +71,14 @@ def stored_video_source() -> AssetVersion:
 
 def settings() -> Settings:
     return Settings(_env_file=None)
+
+
+def uploaded_video(body: bytes = b"video-input") -> MagicMock:
+    upload = MagicMock()
+    upload.filename = "source.mp4"
+    upload.content_type = "video/mp4"
+    upload.file = BytesIO(body)
+    return upload
 
 
 class VideoSubmissionRouteTests(unittest.TestCase):
@@ -235,6 +247,143 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         queued_asset = db.add.call_args.args[0]
         self.assertEqual(queued_asset.format, AssetFormat.video_concept)
         load_submission.assert_called_once()
+
+    def test_streams_uploaded_video_to_owned_version_input(self) -> None:
+        campaign_id = uuid.uuid4()
+        body = b"source-video-body"
+        inspection = FileObjectInspection(
+            size=len(body),
+            sha256="e" * 64,
+        )
+        db = MagicMock()
+        db.get.return_value = Campaign(id=campaign_id)
+        storage = MagicMock()
+        storage.inspect_fileobj.return_value = inspection
+        storage.upload_fileobj.return_value = StoredObject(
+            bucket="test-bucket",
+            key="unused-by-route",
+            content_type="video/mp4",
+            size=len(body),
+        )
+        expected_response = object()
+
+        with (
+            patch(
+                "app.api.v1.routes.generation_jobs.validate_video_input_assets",
+                return_value=VideoInputMode.video_to_video,
+            ),
+            patch(
+                "app.api.v1.routes.generation_jobs.campaign_brand_context_assets",
+                return_value=[],
+            ),
+            patch(
+                "app.api.v1.routes.generation_jobs.load_video_submission",
+                return_value=expected_response,
+            ),
+        ):
+            response = submit_video_generation_with_upload(
+                campaign_id=campaign_id,
+                payload=video_request(model="wan2.7-videoedit").model_dump_json(),
+                file=uploaded_video(body),
+                db=db,
+                settings=settings(),
+                storage=storage,
+            )
+
+        self.assertIs(response, expected_response)
+        storage.inspect_fileobj.assert_called_once()
+        storage.upload_fileobj.assert_called_once()
+        upload_arguments = storage.upload_fileobj.call_args.kwargs
+        self.assertEqual(upload_arguments["inspection"], inspection)
+        self.assertEqual(upload_arguments["content_type"], "video/mp4")
+        self.assertIn("/versions/v1/inputs/source_creative/", upload_arguments["key"])
+        queued_asset = db.add.call_args.args[0]
+        queued_version = queued_asset.versions[0]
+        queued_job = queued_version.generation_job
+        self.assertEqual(queued_job.parameters["input_mode"], "video_to_video")
+        self.assertEqual(len(queued_version.inputs), 1)
+        version_input = queued_version.inputs[0]
+        self.assertEqual(version_input.media_kind, "video")
+        self.assertEqual(version_input.sha256, inspection.sha256)
+        self.assertEqual(version_input.storage_ownership, "asset_version")
+        self.assertEqual(version_input.storage_key, upload_arguments["key"])
+        db.commit.assert_called_once_with()
+
+    def test_uploaded_video_fails_closed_before_b2_upload(self) -> None:
+        campaign_id = uuid.uuid4()
+        db = MagicMock()
+        db.get.return_value = Campaign(id=campaign_id)
+        storage = MagicMock()
+        storage.inspect_fileobj.return_value = FileObjectInspection(
+            size=1024,
+            sha256="f" * 64,
+        )
+
+        with self.assertRaises(HTTPException) as raised:
+            submit_video_generation_with_upload(
+                campaign_id=campaign_id,
+                payload=video_request(model="wan2.7-videoedit").model_dump_json(),
+                file=uploaded_video(),
+                db=db,
+                settings=settings(),
+                storage=storage,
+            )
+
+        self.assertEqual(
+            raised.exception.status_code,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+        self.assertIn(
+            "backend provider routing is not enabled yet",
+            raised.exception.detail,
+        )
+        storage.upload_fileobj.assert_not_called()
+        db.add.assert_not_called()
+        db.commit.assert_not_called()
+
+    def test_removes_uploaded_video_when_database_commit_fails(self) -> None:
+        campaign_id = uuid.uuid4()
+        inspection = FileObjectInspection(
+            size=1024,
+            sha256="1" * 64,
+        )
+        db = MagicMock()
+        db.get.return_value = Campaign(id=campaign_id)
+        db.commit.side_effect = SQLAlchemyError("database unavailable")
+        storage = MagicMock()
+        storage.inspect_fileobj.return_value = inspection
+
+        with (
+            patch(
+                "app.api.v1.routes.generation_jobs.validate_video_input_assets",
+                return_value=VideoInputMode.video_to_video,
+            ),
+            patch(
+                "app.api.v1.routes.generation_jobs."
+                "campaign_brand_context_assets",
+                return_value=[],
+            ),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                submit_video_generation_with_upload(
+                    campaign_id=campaign_id,
+                    payload=video_request(
+                        model="wan2.7-videoedit"
+                    ).model_dump_json(),
+                    file=uploaded_video(),
+                    db=db,
+                    settings=settings(),
+                    storage=storage,
+                )
+
+        self.assertEqual(
+            raised.exception.status_code,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+        storage.upload_fileobj.assert_called_once()
+        uploaded_key = storage.upload_fileobj.call_args.kwargs["key"]
+        storage.delete_object.assert_called_once_with(key=uploaded_key)
+        db.rollback.assert_called_once_with()
 
     def test_submission_uses_attached_brand_image_as_provider_source(self) -> None:
         campaign_id = uuid.uuid4()
@@ -425,6 +574,14 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             ]["$ref"],
             "#/components/schemas/VideoGenerationSubmissionRead",
         )
+
+    def test_openapi_exposes_multipart_video_upload_contract(self) -> None:
+        operation = app.openapi()["paths"][
+            "/api/v1/campaigns/{campaign_id}/assets/generate-video-with-input"
+        ]["post"]
+
+        self.assertIn("multipart/form-data", operation["requestBody"]["content"])
+        self.assertIn("202", operation["responses"])
 
 
 if __name__ == "__main__":

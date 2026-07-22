@@ -1,4 +1,6 @@
+import hashlib
 import unittest
+from io import BytesIO
 from unittest.mock import MagicMock, call, patch
 
 from botocore.config import Config
@@ -163,6 +165,89 @@ class B2ChunkedDownloadTests(unittest.TestCase):
 
         body.read.assert_not_called()
         body.close.assert_called_once_with()
+
+
+class B2StreamedUploadTests(unittest.TestCase):
+    def test_inspects_and_uploads_without_reading_the_whole_file_at_once(
+        self,
+    ) -> None:
+        storage, client = make_storage()
+
+        class TrackingFile(BytesIO):
+            def __init__(self, body: bytes) -> None:
+                super().__init__(body)
+                self.read_sizes: list[int] = []
+
+            def read(self, size: int = -1) -> bytes:
+                self.read_sizes.append(size)
+                return super().read(size)
+
+        body = b"video-data" * 300_000
+        fileobj = TrackingFile(body)
+
+        stored_object = storage.upload_fileobj(
+            key="campaigns/video/input.mp4",
+            fileobj=fileobj,
+            content_type="video/mp4",
+            max_size_bytes=len(body),
+            metadata={"sha256": hashlib.sha256(body).hexdigest()},
+        )
+
+        self.assertEqual(stored_object.size, len(body))
+        self.assertEqual(stored_object.content_type, "video/mp4")
+        self.assertEqual(fileobj.tell(), 0)
+        self.assertTrue(fileobj.read_sizes)
+        self.assertNotIn(-1, fileobj.read_sizes)
+        self.assertLessEqual(max(fileobj.read_sizes), 1024 * 1024)
+        upload_call = client.upload_fileobj.call_args
+        self.assertIs(upload_call.kwargs["Fileobj"], fileobj)
+        self.assertEqual(upload_call.kwargs["Bucket"], "test-bucket")
+        self.assertEqual(
+            upload_call.kwargs["Key"],
+            "campaigns/video/input.mp4",
+        )
+        self.assertEqual(
+            upload_call.kwargs["ExtraArgs"]["ContentType"],
+            "video/mp4",
+        )
+        self.assertFalse(upload_call.kwargs["Config"].use_threads)
+
+    def test_returns_a_sha256_and_rewinds_after_inspection(self) -> None:
+        storage, _client = make_storage()
+        body = b"bounded-video-input"
+        fileobj = BytesIO(body)
+
+        inspection = storage.inspect_fileobj(
+            fileobj=fileobj,
+            max_size_bytes=len(body),
+            chunk_size_bytes=4,
+        )
+
+        self.assertEqual(inspection.size, len(body))
+        self.assertEqual(
+            inspection.sha256,
+            hashlib.sha256(body).hexdigest(),
+        )
+        self.assertEqual(fileobj.tell(), 0)
+
+    def test_rejects_oversized_upload_before_contacting_b2(self) -> None:
+        storage, client = make_storage()
+        fileobj = BytesIO(b"12345")
+
+        with self.assertRaisesRegex(
+            StorageObjectTooLargeError,
+            "configured size limit",
+        ):
+            storage.upload_fileobj(
+                key="campaigns/video/input.mp4",
+                fileobj=fileobj,
+                content_type="video/mp4",
+                max_size_bytes=4,
+            )
+
+        self.assertEqual(fileobj.tell(), 0)
+        client.upload_fileobj.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
