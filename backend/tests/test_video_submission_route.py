@@ -19,6 +19,7 @@ from app.services.generation import VideoInputMode
 from app.api.v1.routes.generation_jobs import (
     build_queued_video_models,
     campaign_brand_asset_input_record,
+    get_source_version_or_404,
     source_version_input_record,
     submit_video_generation,
 )
@@ -31,6 +32,37 @@ def video_request(**overrides: object) -> VideoGenerationCreate:
     }
     payload.update(overrides)
     return VideoGenerationCreate.model_validate(payload)
+
+
+def stored_video_source() -> AssetVersion:
+    source_asset = Asset(
+        id=uuid.uuid4(),
+        campaign_id=uuid.uuid4(),
+        title="Source video",
+        format=AssetFormat.video_concept,
+        channel="Paid social",
+        status=ReviewStatus.draft,
+        reviewer=None,
+        tags=[],
+        summary="Source video",
+    )
+    source_version = AssetVersion(
+        id=uuid.uuid4(),
+        asset_id=source_asset.id,
+        version_number=1,
+        label="Source video v1",
+        prompt="Original motion",
+        model="Veo3-Fast",
+        provider="gmicloud",
+        storage_key="campaigns/source/video-metadata.json",
+        artifact_storage_key="campaigns/source/artifact/source.mp4",
+        artifact_filename="source.mp4",
+        artifact_content_type="video/mp4",
+        artifact_size_bytes=10 * 1024 * 1024,
+        generation_metadata={},
+    )
+    source_version.asset = source_asset
+    return source_version
 
 
 def settings() -> Settings:
@@ -112,6 +144,30 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         self.assertEqual(record["role"], "source_creative")
         self.assertEqual(record["storage_ownership"], "source_asset_version")
         self.assertEqual(record["source_version_id"], str(source_version.id))
+
+    def test_snapshots_stored_video_as_source_media(self) -> None:
+        source_version = stored_video_source()
+
+        record = source_version_input_record(source_version)
+
+        self.assertEqual(record["content_type"], "video/mp4")
+        self.assertEqual(record["filename"], "source.mp4")
+        self.assertEqual(record["source_version_id"], str(source_version.id))
+
+    def test_source_lookup_accepts_stored_video_version(self) -> None:
+        campaign_id = uuid.uuid4()
+        source_version = stored_video_source()
+        source_version.asset.campaign_id = campaign_id
+        db = MagicMock()
+        db.scalar.return_value = source_version
+
+        result = get_source_version_or_404(
+            campaign_id=campaign_id,
+            source_version_id=source_version.id,
+            db=db,
+        )
+
+        self.assertIs(result, source_version)
 
     def test_snapshots_brand_asset_as_video_source(self) -> None:
         campaign_id = uuid.uuid4()
@@ -259,6 +315,67 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         self.assertEqual(
             raised.exception.status_code,
             status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+        db.add.assert_not_called()
+        db.commit.assert_not_called()
+
+    def test_video_source_fails_before_queueing_for_current_model(self) -> None:
+        campaign_id = uuid.uuid4()
+        source_version = stored_video_source()
+        db = MagicMock()
+        db.get.return_value = Campaign(id=campaign_id)
+
+        with patch(
+            "app.api.v1.routes.generation_jobs.get_source_version_or_404",
+            return_value=source_version,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                submit_video_generation(
+                    campaign_id=campaign_id,
+                    video_in=video_request(source_version_id=source_version.id),
+                    db=db,
+                    settings=settings(),
+                )
+
+        self.assertEqual(
+            raised.exception.status_code,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+        self.assertIn(
+            "does not support video source inputs",
+            raised.exception.detail,
+        )
+        db.add.assert_not_called()
+        db.commit.assert_not_called()
+
+    def test_verified_video_edit_model_stays_disabled_until_routed(self) -> None:
+        campaign_id = uuid.uuid4()
+        source_version = stored_video_source()
+        db = MagicMock()
+        db.get.return_value = Campaign(id=campaign_id)
+
+        with patch(
+            "app.api.v1.routes.generation_jobs.get_source_version_or_404",
+            return_value=source_version,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                submit_video_generation(
+                    campaign_id=campaign_id,
+                    video_in=video_request(
+                        model="wan2.7-videoedit",
+                        source_version_id=source_version.id,
+                    ),
+                    db=db,
+                    settings=settings(),
+                )
+
+        self.assertEqual(
+            raised.exception.status_code,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+        self.assertIn(
+            "backend provider routing is not enabled yet",
+            raised.exception.detail,
         )
         db.add.assert_not_called()
         db.commit.assert_not_called()

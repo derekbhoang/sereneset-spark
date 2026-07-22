@@ -195,10 +195,13 @@ def get_source_version_or_404(
             detail="Source asset version not found in campaign",
         )
 
-    if source_version.asset.format != AssetFormat.image:
+    if source_version.asset.format not in {
+        AssetFormat.image,
+        AssetFormat.video_concept,
+    }:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Video source version must belong to an image asset",
+            detail="Video source version must belong to an image or video asset",
         )
 
     if source_version.artifact_storage_key is None:
@@ -240,7 +243,7 @@ def source_version_sha256(source_version: AssetVersion) -> str | None:
 def source_version_input_record(
     source_version: AssetVersion,
 ) -> dict[str, object]:
-    filename = source_version.artifact_filename or "source-image"
+    filename = source_version.artifact_filename or "source-media"
     return {
         "role": "source_creative",
         "storage_key": source_version.artifact_storage_key,

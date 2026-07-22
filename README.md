@@ -120,6 +120,8 @@ python -m scripts.check_gmi_video_model --model wan2.7-videoedit
 
 The configured `veo-3.1-fast-generate-001` model supports text-to-video and image-to-video, but not video-to-video. At the time of verification, `wan2.7-videoedit` reports an active video model with a required `video` input parameter and video output. Upstream model contracts can change, so run the check again before deployment.
 
+The API currently fails closed for video source inputs. It recognizes stored video versions, but returns `422` until the backend explicitly maps the source URL to the selected provider model's native video parameter. It never silently converts a video to one frame or submits a job that would ignore the video.
+
 ### 3. Install and migrate the backend
 
 ```powershell

@@ -26,8 +26,12 @@ class GenerationInputError(ValueError):
 
 
 GENBLAZE_EXTERNAL_INPUTS_PARAMETER = "external_inputs"
-MAX_VIDEO_INPUT_SIZE_BYTES = 25 * 1024 * 1024
+MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES = 25 * 1024 * 1024
+MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES = 100 * 1024 * 1024
 VIDEO_SOURCE_INPUT_ROLE = "source_creative"
+VERIFIED_VIDEO_TO_VIDEO_MODELS = frozenset({"wan2.7-videoedit"})
+# Keep this empty until the provider model spec routes video to its native slot.
+VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS: frozenset[str] = frozenset()
 GMI_VEO_DURATION_SECONDS = frozenset({4, 6, 8})
 GMI_VEO_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
 GMI_VEO_RESOLUTIONS = frozenset({"720p", "1080p"})
@@ -35,14 +39,18 @@ GMI_VEO_WIRE_ALIASES = {
     "duration": "durationSeconds",
     "aspect_ratio": "aspectRatio",
 }
-ALLOWED_VIDEO_INPUT_CONTENT_TYPES = {
+ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES = {
     "image/jpeg",
     "image/png",
     "image/webp",
 }
-KNOWN_IMAGE_EXTENSION_CONTENT_TYPES = {
+ALLOWED_VIDEO_SOURCE_VIDEO_CONTENT_TYPES = {
+    "video/mp4",
+}
+KNOWN_MEDIA_EXTENSION_CONTENT_TYPES = {
     ".jpeg": "image/jpeg",
     ".jpg": "image/jpeg",
+    ".mp4": "video/mp4",
     ".png": "image/png",
     ".webp": "image/webp",
 }
@@ -85,6 +93,20 @@ class VideoGenerationRequest:
 class VideoInputMode(str, Enum):
     text_to_video = "text_to_video"
     image_to_video = "image_to_video"
+    video_to_video = "video_to_video"
+
+
+class VideoModelInputRequirement(str, Enum):
+    unsupported_multi_image = "unsupported_multi_image"
+    image_required = "image_required"
+    image_optional = "image_optional"
+    text_only = "text_only"
+    video_required = "video_required"
+
+
+class VideoSourceMediaKind(str, Enum):
+    image = "image"
+    video = "video"
 
 
 @dataclass(frozen=True)
@@ -315,7 +337,7 @@ def infer_asset_media_type(
 ) -> str:
     normalized_content_type = (content_type or "").split(";")[0].strip().lower()
     media_path = unquote(urlparse(filename or url or "").path).replace("\\", "/")
-    known_content_type = KNOWN_IMAGE_EXTENSION_CONTENT_TYPES.get(
+    known_content_type = KNOWN_MEDIA_EXTENSION_CONTENT_TYPES.get(
         PurePosixPath(media_path).suffix.lower()
     )
     guessed_content_type, _encoding = mimetypes.guess_type(media_path)
@@ -365,7 +387,7 @@ def build_external_input_assets(
     if missing_url_filenames:
         joined_filenames = ", ".join(missing_url_filenames)
         raise GenerationProviderError(
-            "Generation input images were uploaded but no downloadable B2 URL "
+            "Generation input media was stored but no downloadable B2 URL "
             f"was prepared for: {joined_filenames}"
         )
 
@@ -459,21 +481,39 @@ def build_gmicloud_video_models(
     return models
 
 
-def video_model_input_requirement(model: str) -> str:
+def video_model_input_requirement(model: str) -> VideoModelInputRequirement:
     normalized_model = model.casefold()
 
+    if normalized_model in VERIFIED_VIDEO_TO_VIDEO_MODELS:
+        return VideoModelInputRequirement.video_required
+
     if "transition" in normalized_model:
-        return "unsupported"
+        return VideoModelInputRequirement.unsupported_multi_image
 
     if "image2video" in normalized_model or any(
         marker in normalized_model for marker in ("-i2v", "-r2v")
     ):
-        return "required"
+        return VideoModelInputRequirement.image_required
 
     if "text2video" in normalized_model or "-t2v" in normalized_model:
-        return "forbidden"
+        return VideoModelInputRequirement.text_only
 
-    return "optional"
+    return VideoModelInputRequirement.image_optional
+
+
+def video_source_media_kind(content_type: str) -> VideoSourceMediaKind:
+    if content_type.startswith("image/"):
+        return VideoSourceMediaKind.image
+    if content_type.startswith("video/"):
+        return VideoSourceMediaKind.video
+
+    raise GenerationInputError(
+        "The video generation source must be an image or video file"
+    )
+
+
+def video_to_video_routing_enabled(model: str) -> bool:
+    return model.casefold() in VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS
 
 
 def validate_video_input_assets(
@@ -483,25 +523,27 @@ def validate_video_input_assets(
     require_download_url: bool = True,
 ) -> VideoInputMode:
     if len(input_assets) > 1:
-        raise GenerationInputError(
-            "Video generation accepts at most one source image"
-        )
+        raise GenerationInputError("Video generation accepts at most one source file")
 
     input_requirement = video_model_input_requirement(model)
-    if input_requirement == "unsupported":
+    if input_requirement == VideoModelInputRequirement.unsupported_multi_image:
         raise GenerationInputError(
             f"Video model '{model}' requires an unsupported multi-image flow"
         )
 
     if not input_assets:
-        if input_requirement == "required":
+        if input_requirement == VideoModelInputRequirement.image_required:
             raise GenerationInputError(
                 f"Video model '{model}' requires one source image"
+            )
+        if input_requirement == VideoModelInputRequirement.video_required:
+            raise GenerationInputError(
+                f"Video model '{model}' requires one source video"
             )
 
         return VideoInputMode.text_to_video
 
-    if input_requirement == "forbidden":
+    if input_requirement == VideoModelInputRequirement.text_only:
         raise GenerationInputError(
             f"Video model '{model}' only supports text-to-video generation"
         )
@@ -510,7 +552,7 @@ def validate_video_input_assets(
     role = optional_string(input_asset.get("role"))
     if role != VIDEO_SOURCE_INPUT_ROLE:
         raise GenerationInputError(
-            "The video source image must use role 'source_creative'"
+            "The video generation source must use role 'source_creative'"
         )
 
     url = optional_string(input_asset.get("url"))
@@ -518,7 +560,7 @@ def validate_video_input_assets(
         url is None or urlparse(url).scheme.lower() != "https"
     ):
         raise GenerationInputError(
-            "The video source image must have a downloadable HTTPS URL"
+            "The video generation source must have a downloadable HTTPS URL"
         )
 
     content_type = infer_asset_media_type(
@@ -526,23 +568,45 @@ def validate_video_input_assets(
         filename=optional_string(input_asset.get("filename")),
         url=url,
     )
-    if content_type not in ALLOWED_VIDEO_INPUT_CONTENT_TYPES:
-        supported_types = ", ".join(sorted(ALLOWED_VIDEO_INPUT_CONTENT_TYPES))
+    media_kind = video_source_media_kind(content_type)
+    size_bytes = optional_int(input_asset.get("size_bytes"))
+    if size_bytes is None or size_bytes <= 0:
+        raise GenerationInputError(
+            "The video generation source must have a positive size"
+        )
+
+    if media_kind == VideoSourceMediaKind.video:
+        if input_requirement != VideoModelInputRequirement.video_required:
+            raise GenerationInputError(
+                f"Video model '{model}' does not support video source inputs"
+            )
+        if content_type not in ALLOWED_VIDEO_SOURCE_VIDEO_CONTENT_TYPES:
+            supported_types = ", ".join(
+                sorted(ALLOWED_VIDEO_SOURCE_VIDEO_CONTENT_TYPES)
+            )
+            raise GenerationInputError(
+                f"The source video type is not supported. Use one of: {supported_types}"
+            )
+        if size_bytes > MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES:
+            raise GenerationInputError("The source video must be 100 MB or smaller")
+        if not video_to_video_routing_enabled(model):
+            raise GenerationInputError(
+                f"Video-to-video support is verified for model '{model}', but "
+                "backend provider routing is not enabled yet"
+            )
+
+        return VideoInputMode.video_to_video
+
+    if input_requirement == VideoModelInputRequirement.video_required:
+        raise GenerationInputError(f"Video model '{model}' requires one source video")
+    if content_type not in ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES:
+        supported_types = ", ".join(sorted(ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES))
         raise GenerationInputError(
             "The video source image type is not supported. "
             f"Use one of: {supported_types}"
         )
-
-    size_bytes = optional_int(input_asset.get("size_bytes"))
-    if size_bytes is None or size_bytes <= 0:
-        raise GenerationInputError(
-            "The video source image must have a positive size"
-        )
-
-    if size_bytes > MAX_VIDEO_INPUT_SIZE_BYTES:
-        raise GenerationInputError(
-            "The video source image must be 25 MB or smaller"
-        )
+    if size_bytes > MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES:
+        raise GenerationInputError("The video source image must be 25 MB or smaller")
 
     return VideoInputMode.image_to_video
 

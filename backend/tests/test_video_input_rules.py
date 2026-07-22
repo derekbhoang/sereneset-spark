@@ -1,11 +1,15 @@
 import unittest
+from unittest.mock import patch
 
 from app.services.generation import (
     build_video_input_plan,
     GenerationInputError,
     VideoInputMode,
+    VideoModelInputRequirement,
+    VideoSourceMediaKind,
     validate_video_input_assets,
     video_model_input_requirement,
+    video_source_media_kind,
 )
 
 
@@ -16,6 +20,18 @@ def source_image(**overrides: object) -> dict[str, object]:
         "filename": "product.jpg",
         "content_type": "image/jpeg",
         "size_bytes": 1024,
+    }
+    input_asset.update(overrides)
+    return input_asset
+
+
+def source_video(**overrides: object) -> dict[str, object]:
+    input_asset: dict[str, object] = {
+        "role": "source_creative",
+        "url": "https://example.com/source.mp4",
+        "filename": "source.mp4",
+        "content_type": "video/mp4",
+        "size_bytes": 10 * 1024 * 1024,
     }
     input_asset.update(overrides)
     return input_asset
@@ -37,19 +53,79 @@ class VideoInputRuleTests(unittest.TestCase):
 
     def test_classifies_known_model_families(self) -> None:
         expectations = {
-            "Kling-Image2Video-V2.1-Master": "required",
-            "pixverse-v5.6-i2v": "required",
-            "wan2.6-r2v": "required",
-            "Kling-Text2Video-V2.1-Master": "forbidden",
-            "pixverse-v5.6-t2v": "forbidden",
-            "pixverse-v5.6-transition": "unsupported",
-            "Veo3-Fast": "optional",
-            "future-gmi-video-model": "optional",
+            "Kling-Image2Video-V2.1-Master": (
+                VideoModelInputRequirement.image_required
+            ),
+            "pixverse-v5.6-i2v": VideoModelInputRequirement.image_required,
+            "wan2.6-r2v": VideoModelInputRequirement.image_required,
+            "Kling-Text2Video-V2.1-Master": VideoModelInputRequirement.text_only,
+            "pixverse-v5.6-t2v": VideoModelInputRequirement.text_only,
+            "pixverse-v5.6-transition": (
+                VideoModelInputRequirement.unsupported_multi_image
+            ),
+            "Veo3-Fast": VideoModelInputRequirement.image_optional,
+            "wan2.7-videoedit": VideoModelInputRequirement.video_required,
+            "future-gmi-video-model": VideoModelInputRequirement.image_optional,
         }
 
         for model, expected in expectations.items():
             with self.subTest(model=model):
                 self.assertEqual(video_model_input_requirement(model), expected)
+
+    def test_classifies_image_and_video_source_media(self) -> None:
+        self.assertEqual(
+            video_source_media_kind("image/webp"),
+            VideoSourceMediaKind.image,
+        )
+        self.assertEqual(
+            video_source_media_kind("video/mp4"),
+            VideoSourceMediaKind.video,
+        )
+
+    def test_video_sources_fail_closed_until_provider_routing_exists(self) -> None:
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "does not support video source inputs",
+        ):
+            validate_video_input_assets(
+                model="veo-3.1-fast-generate-001",
+                input_assets=[source_video()],
+            )
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "backend provider routing is not enabled yet",
+        ):
+            validate_video_input_assets(
+                model="wan2.7-videoedit",
+                input_assets=[source_video()],
+            )
+
+    def test_video_to_video_mode_is_explicit_when_routing_is_enabled(self) -> None:
+        with patch(
+            "app.services.generation.VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS",
+            frozenset({"wan2.7-videoedit"}),
+        ):
+            mode = validate_video_input_assets(
+                model="wan2.7-videoedit",
+                input_assets=[source_video()],
+            )
+
+        self.assertEqual(mode, VideoInputMode.video_to_video)
+
+    def test_verified_video_edit_model_requires_a_video_source(self) -> None:
+        invalid_inputs = ([], [source_image()])
+
+        for input_assets in invalid_inputs:
+            with self.subTest(input_assets=input_assets):
+                with self.assertRaisesRegex(
+                    GenerationInputError,
+                    "requires one source video",
+                ):
+                    validate_video_input_assets(
+                        model="wan2.7-videoedit",
+                        input_assets=input_assets,
+                    )
 
     def test_enforces_model_input_requirements(self) -> None:
         invalid_requests = (

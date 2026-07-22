@@ -38,18 +38,24 @@ class VideoGenerationCreate(BaseModel):
     duration_seconds: int = Field(default=4, ge=2, le=20)
     aspect_ratio: VideoAspectRatio = VideoAspectRatio.landscape
     resolution: VideoResolution = VideoResolution.hd
-    source_version_id: uuid.UUID | None = None
-    source_brand_asset_id: uuid.UUID | None = None
+    source_version_id: uuid.UUID | None = Field(
+        default=None,
+        description="Stored image or video asset version to use as source media.",
+    )
+    source_brand_asset_id: uuid.UUID | None = Field(
+        default=None,
+        description="Attached image or video brand asset to use as source media.",
+    )
 
     @model_validator(mode="after")
-    def validate_single_source_image(self) -> "VideoGenerationCreate":
+    def validate_single_source_media(self) -> "VideoGenerationCreate":
         if (
             self.source_version_id is not None
             and self.source_brand_asset_id is not None
         ):
             raise ValueError(
-                "Select either an image version or a brand asset as the "
-                "video source, not both"
+                "Select either an asset version or a brand asset as the "
+                "source media, not both"
             )
 
         return self
