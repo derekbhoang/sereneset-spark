@@ -14,6 +14,12 @@ from urllib.parse import unquote, urlparse
 from app.core.config import Settings, get_settings
 from app.models.asset import AssetInputMediaKind
 from app.services.input_provenance import infer_input_media_kind
+from app.services.video_model_capabilities import (
+    VideoModelCapability,
+    VideoModelInputRequirement,
+    VideoSourceMediaKind,
+    get_video_model_capability,
+)
 
 
 class GenerationConfigurationError(RuntimeError):
@@ -33,16 +39,6 @@ MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES = 25 * 1024 * 1024
 MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES = 100 * 1024 * 1024
 VIDEO_SOURCE_INPUT_ROLE = "source_creative"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-VERIFIED_VIDEO_TO_VIDEO_MODELS = frozenset({"wan2.7-videoedit"})
-# Keep this empty until the provider model spec routes video to its native slot.
-VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS: frozenset[str] = frozenset()
-GMI_VEO_DURATION_SECONDS = frozenset({4, 6, 8})
-GMI_VEO_ASPECT_RATIOS = frozenset({"16:9", "9:16"})
-GMI_VEO_RESOLUTIONS = frozenset({"720p", "1080p"})
-GMI_VEO_WIRE_ALIASES = {
-    "duration": "durationSeconds",
-    "aspect_ratio": "aspectRatio",
-}
 ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES = {
     "image/jpeg",
     "image/png",
@@ -102,19 +98,6 @@ class VideoInputMode(str, Enum):
     text_to_video = "text_to_video"
     image_to_video = "image_to_video"
     video_to_video = "video_to_video"
-
-
-class VideoModelInputRequirement(str, Enum):
-    unsupported_multi_image = "unsupported_multi_image"
-    image_required = "image_required"
-    image_optional = "image_optional"
-    text_only = "text_only"
-    video_required = "video_required"
-
-
-class VideoSourceMediaKind(str, Enum):
-    image = "image"
-    video = "video"
 
 
 @dataclass(frozen=True)
@@ -424,8 +407,24 @@ def build_pipeline_parameters(
     return pipeline_parameters, GENBLAZE_EXTERNAL_INPUTS_PARAMETER
 
 
-def is_gmicloud_veo_model(model: str) -> bool:
-    return model.casefold().startswith("veo")
+def require_video_model_capability(model: str) -> VideoModelCapability:
+    capability = get_video_model_capability(model)
+    if capability is None:
+        raise GenerationInputError(
+            f"Video model '{model}' is not registered for backend generation"
+        )
+
+    return capability
+
+
+def format_supported_values(values: tuple[object, ...]) -> str:
+    rendered_values = [str(value) for value in values]
+    if len(rendered_values) == 1:
+        return rendered_values[0]
+    if len(rendered_values) == 2:
+        return " or ".join(rendered_values)
+
+    return ", ".join(rendered_values[:-1]) + f", or {rendered_values[-1]}"
 
 
 def validate_video_generation_parameters(
@@ -435,20 +434,31 @@ def validate_video_generation_parameters(
     aspect_ratio: str,
     resolution: str,
 ) -> None:
-    if not is_gmicloud_veo_model(model):
-        return
+    capability = require_video_model_capability(model)
 
-    if duration_seconds not in GMI_VEO_DURATION_SECONDS:
+    if (
+        capability.allowed_duration_seconds is not None
+        and duration_seconds not in capability.allowed_duration_seconds
+    ):
         raise GenerationInputError(
-            f"Video model '{model}' supports durations of 4, 6, or 8 seconds"
+            f"Video model '{model}' supports durations of "
+            f"{format_supported_values(capability.allowed_duration_seconds)} seconds"
         )
-    if aspect_ratio not in GMI_VEO_ASPECT_RATIOS:
+    if (
+        capability.allowed_aspect_ratios is not None
+        and aspect_ratio not in capability.allowed_aspect_ratios
+    ):
         raise GenerationInputError(
-            f"Video model '{model}' supports aspect ratios 16:9 or 9:16"
+            f"Video model '{model}' supports aspect ratios "
+            f"{format_supported_values(capability.allowed_aspect_ratios)}"
         )
-    if resolution not in GMI_VEO_RESOLUTIONS:
+    if (
+        capability.allowed_resolutions is not None
+        and resolution not in capability.allowed_resolutions
+    ):
         raise GenerationInputError(
-            f"Video model '{model}' supports resolutions 720p or 1080p"
+            f"Video model '{model}' supports resolutions "
+            f"{format_supported_values(capability.allowed_resolutions)}"
         )
 
 
@@ -461,7 +471,16 @@ def build_gmicloud_video_models(
     *,
     model: str,
 ) -> Any | None:
-    if not is_gmicloud_veo_model(model):
+    capability = get_video_model_capability(model)
+    if capability is None or capability.provider != "gmicloud":
+        return None
+
+    parameter_aliases = dict(capability.provider_parameter_aliases)
+    if not (
+        parameter_aliases
+        or capability.provider_required_parameters
+        or capability.provider_integer_string_parameters
+    ):
         return None
 
     models_default = getattr(provider_class, "models_default", None)
@@ -470,7 +489,7 @@ def build_gmicloud_video_models(
 
     models = models_default().fork()
     spec = models.get(model)
-    wire_parameter_names = frozenset(GMI_VEO_WIRE_ALIASES.values())
+    wire_parameter_names = frozenset(parameter_aliases.values())
     allowlist = (
         spec.param_allowlist | wire_parameter_names
         if spec.param_allowlist is not None
@@ -482,14 +501,19 @@ def build_gmicloud_video_models(
             model_id=model,
             param_aliases={
                 **spec.param_aliases,
-                **GMI_VEO_WIRE_ALIASES,
+                **parameter_aliases,
             },
             param_coercers={
                 **spec.param_coercers,
-                "durationSeconds": coerce_gmi_duration_seconds,
+                **{
+                    parameter: coerce_gmi_duration_seconds
+                    for parameter in (
+                        capability.provider_integer_string_parameters
+                    )
+                },
             },
             param_required=(
-                spec.param_required | frozenset({"durationSeconds"})
+                spec.param_required | capability.provider_required_parameters
             ),
             param_allowlist=allowlist,
         )
@@ -498,23 +522,7 @@ def build_gmicloud_video_models(
 
 
 def video_model_input_requirement(model: str) -> VideoModelInputRequirement:
-    normalized_model = model.casefold()
-
-    if normalized_model in VERIFIED_VIDEO_TO_VIDEO_MODELS:
-        return VideoModelInputRequirement.video_required
-
-    if "transition" in normalized_model:
-        return VideoModelInputRequirement.unsupported_multi_image
-
-    if "image2video" in normalized_model or any(
-        marker in normalized_model for marker in ("-i2v", "-r2v")
-    ):
-        return VideoModelInputRequirement.image_required
-
-    if "text2video" in normalized_model or "-t2v" in normalized_model:
-        return VideoModelInputRequirement.text_only
-
-    return VideoModelInputRequirement.image_optional
+    return require_video_model_capability(model).input_requirement
 
 
 def video_source_media_kind(content_type: str) -> VideoSourceMediaKind:
@@ -537,10 +545,17 @@ def video_to_video_routing_enabled(
     if settings is None or not settings.genblaze_video_to_video_enabled:
         return False
 
-    normalized_model = model.casefold()
+    capability = get_video_model_capability(model)
+    if capability is None:
+        return False
+
+    normalized_model = model.strip().casefold()
     return (
         normalized_model == settings.genblaze_video_edit_model.casefold()
-        and normalized_model in VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS
+        and capability.input_requirement
+        == VideoModelInputRequirement.video_required
+        and capability.provider_source_parameter is not None
+        and capability.provider_source_routing_implemented
     )
 
 
@@ -652,7 +667,8 @@ def validate_video_input_assets(
     if len(input_assets) > 1:
         raise GenerationInputError("Video generation accepts at most one source file")
 
-    input_requirement = video_model_input_requirement(model)
+    capability = require_video_model_capability(model)
+    input_requirement = capability.input_requirement
     if input_requirement == VideoModelInputRequirement.unsupported_multi_image:
         raise GenerationInputError(
             f"Video model '{model}' requires an unsupported multi-image flow"
@@ -686,7 +702,10 @@ def validate_video_input_assets(
             if settings is not None
             else MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES
         )
-        if input_requirement != VideoModelInputRequirement.video_required:
+        if (
+            source.media_kind not in capability.accepted_source_media_kinds
+            or input_requirement != VideoModelInputRequirement.video_required
+        ):
             raise GenerationInputError(
                 f"Video model '{model}' does not support video source inputs"
             )
@@ -710,7 +729,10 @@ def validate_video_input_assets(
 
         return VideoInputMode.video_to_video
 
-    if input_requirement == VideoModelInputRequirement.video_required:
+    if (
+        source.media_kind not in capability.accepted_source_media_kinds
+        or input_requirement == VideoModelInputRequirement.video_required
+    ):
         raise GenerationInputError(f"Video model '{model}' requires one source video")
     if source.content_type not in ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES:
         supported_types = ", ".join(sorted(ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES))

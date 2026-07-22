@@ -770,6 +770,27 @@ class VideoSubmissionRouteTests(unittest.TestCase):
                 db.add.assert_not_called()
                 db.commit.assert_not_called()
 
+    def test_unregistered_model_fails_before_database_write(self) -> None:
+        campaign_id = uuid.uuid4()
+        db = MagicMock()
+        db.get.return_value = Campaign(id=campaign_id)
+
+        with self.assertRaises(HTTPException) as raised:
+            submit_video_generation(
+                campaign_id=campaign_id,
+                video_in=video_request(model="future-image2video-model"),
+                db=db,
+                settings=settings(),
+            )
+
+        self.assertEqual(
+            raised.exception.status_code,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+        self.assertIn("is not registered", raised.exception.detail)
+        db.add.assert_not_called()
+        db.commit.assert_not_called()
+
     def test_openapi_exposes_accepted_submission_contract(self) -> None:
         operation = app.openapi()["paths"][
             "/api/v1/campaigns/{campaign_id}/assets/generate-video"

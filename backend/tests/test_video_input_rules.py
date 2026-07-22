@@ -1,4 +1,5 @@
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from app.core.config import Settings
@@ -12,6 +13,7 @@ from app.services.generation import (
     video_model_input_requirement,
     video_source_media_kind,
 )
+from app.services.video_model_capabilities import get_video_model_capability
 
 
 def source_image(**overrides: object) -> dict[str, object]:
@@ -66,12 +68,20 @@ class VideoInputRuleTests(unittest.TestCase):
             ),
             "Veo3-Fast": VideoModelInputRequirement.image_optional,
             "wan2.7-videoedit": VideoModelInputRequirement.video_required,
-            "future-gmi-video-model": VideoModelInputRequirement.image_optional,
         }
 
         for model, expected in expectations.items():
             with self.subTest(model=model):
                 self.assertEqual(video_model_input_requirement(model), expected)
+
+    def test_rejects_unregistered_models_instead_of_guessing_from_name(self) -> None:
+        for model in ("future-gmi-video-model", "future-image2video-model"):
+            with self.subTest(model=model):
+                with self.assertRaisesRegex(
+                    GenerationInputError,
+                    "is not registered for backend generation",
+                ):
+                    video_model_input_requirement(model)
 
     def test_classifies_image_and_video_source_media(self) -> None:
         self.assertEqual(
@@ -107,9 +117,14 @@ class VideoInputRuleTests(unittest.TestCase):
             _env_file=None,
             GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
         )
+        capability = get_video_model_capability("wan2.7-videoedit")
+        assert capability is not None
         with patch(
-            "app.services.generation.VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS",
-            frozenset({"wan2.7-videoedit"}),
+            "app.services.generation.get_video_model_capability",
+            return_value=replace(
+                capability,
+                provider_source_routing_implemented=True,
+            ),
         ):
             mode = validate_video_input_assets(
                 model="wan2.7-videoedit",
