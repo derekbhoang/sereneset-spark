@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import logging
 import mimetypes
+import re
 import signal
 import uuid
 from collections.abc import Callable
@@ -11,13 +12,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 from threading import Event, Thread
 from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import Select, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.db.session import SessionLocal
-from app.models.asset import AssetVersion
 from app.models.generation_job import (
     GenerationJob,
     GenerationJobKind,
@@ -31,8 +32,11 @@ from app.services.generation import (
     GenerationResult,
     GenblazeGenerationService,
     VideoGenerationRequest,
+    VideoInputMode,
     is_video_asset,
     optional_string,
+    require_video_model_capability,
+    validate_video_input_assets,
 )
 from app.services.storage import (
     B2StorageService,
@@ -51,6 +55,7 @@ logger = logging.getLogger(__name__)
 SessionFactory = Callable[[], Session]
 VIDEO_PROVIDER_PARAMETER_KEYS = ("duration", "aspect_ratio", "resolution")
 MAX_ERROR_MESSAGE_LENGTH = 2000
+HTTP_URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+")
 
 
 class DownloadUrlSigner(Protocol):
@@ -385,12 +390,108 @@ def prepare_source_input_assets(
     return prepared_inputs
 
 
-def video_provider_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
-    return {
+def video_provider_parameters(
+    parameters: dict[str, Any],
+    *,
+    model: str,
+) -> dict[str, Any]:
+    provider_parameters = {
         key: parameters[key]
         for key in VIDEO_PROVIDER_PARAMETER_KEYS
         if parameters.get(key) is not None
     }
+    capability = require_video_model_capability(model)
+    allowed_parameters = capability.provider_allowed_parameters
+    if allowed_parameters is None:
+        return provider_parameters
+
+    canonical_allowed_parameters = set(allowed_parameters)
+    canonical_allowed_parameters.update(
+        canonical
+        for canonical, native in capability.provider_parameter_aliases
+        if native in allowed_parameters
+    )
+    return {
+        key: value
+        for key, value in provider_parameters.items()
+        if key in canonical_allowed_parameters
+    }
+
+
+def validate_worker_video_input_mode(
+    *,
+    snapshot: VideoJobSnapshot,
+    source_inputs: list[dict[str, Any]],
+    settings: Settings,
+    require_download_url: bool,
+) -> VideoInputMode:
+    declared_mode_value = optional_string(snapshot.parameters.get("input_mode"))
+    try:
+        declared_mode = VideoInputMode(declared_mode_value)
+    except (TypeError, ValueError) as exc:
+        raise GenerationInputError(
+            "Generation job has an invalid video input mode"
+        ) from exc
+
+    actual_mode = validate_video_input_assets(
+        model=snapshot.model,
+        input_assets=source_inputs,
+        require_download_url=require_download_url,
+        settings=settings,
+    )
+    if actual_mode != declared_mode:
+        raise GenerationInputError(
+            "Generation job input mode does not match its stored source media"
+        )
+
+    return actual_mode
+
+
+def prepare_video_generation_request(
+    *,
+    snapshot: VideoJobSnapshot,
+    storage: DownloadUrlSigner,
+    settings: Settings,
+) -> VideoGenerationRequest:
+    source_inputs = job_asset_records(
+        snapshot.parameters,
+        "source_input_assets",
+    )
+    context_assets = job_asset_records(snapshot.parameters, "context_assets")
+    validate_worker_video_input_mode(
+        snapshot=snapshot,
+        source_inputs=source_inputs,
+        settings=settings,
+        require_download_url=False,
+    )
+
+    presigned_url_ttl = max(
+        3600,
+        settings.genblaze_video_timeout_seconds + 300,
+    )
+    prepared_source_inputs = prepare_source_input_assets(
+        source_inputs=source_inputs,
+        storage=storage,
+        expires_seconds=presigned_url_ttl,
+    )
+    validate_worker_video_input_mode(
+        snapshot=snapshot,
+        source_inputs=prepared_source_inputs,
+        settings=settings,
+        require_download_url=True,
+    )
+
+    return VideoGenerationRequest(
+        prompt=snapshot.prompt,
+        model=snapshot.model,
+        timeout_seconds=settings.genblaze_video_timeout_seconds,
+        parameters=video_provider_parameters(
+            snapshot.parameters,
+            model=snapshot.model,
+        ),
+        input_assets=prepared_source_inputs,
+        context_assets=context_assets,
+    )
 
 
 def video_content_type(asset: GeneratedAsset, filename: str) -> str:
@@ -516,7 +617,10 @@ def build_completed_generation_metadata(
     source_inputs = job_asset_records(snapshot.parameters, "source_input_assets")
     context_assets = job_asset_records(snapshot.parameters, "context_assets")
     input_assets = [*source_inputs, *context_assets]
-    generation_parameters = video_provider_parameters(snapshot.parameters)
+    generation_parameters = video_provider_parameters(
+        snapshot.parameters,
+        model=snapshot.model,
+    )
     asset_records = [generated_asset_metadata(asset) for asset in result.assets]
     job_record: dict[str, object | None] = {
         "id": str(snapshot.id),
@@ -766,6 +870,32 @@ def finalize_video_job_success(
         raise
 
 
+def redact_url_query_strings(message: str) -> str:
+    def redact_match(match: re.Match[str]) -> str:
+        raw_url = match.group(0)
+        trailing_punctuation = ""
+        while raw_url and raw_url[-1] in ".,;:)]}":
+            trailing_punctuation = raw_url[-1] + trailing_punctuation
+            raw_url = raw_url[:-1]
+
+        parsed_url = urlsplit(raw_url)
+        if not parsed_url.query:
+            return match.group(0)
+
+        redacted_url = urlunsplit(
+            (
+                parsed_url.scheme,
+                parsed_url.netloc,
+                parsed_url.path,
+                "redacted",
+                parsed_url.fragment,
+            )
+        )
+        return redacted_url + trailing_punctuation
+
+    return HTTP_URL_PATTERN.sub(redact_match, message)
+
+
 def safe_worker_error_message(exc: Exception) -> str:
     expected_errors = (
         GenerationConfigurationError,
@@ -780,7 +910,7 @@ def safe_worker_error_message(exc: Exception) -> str:
     else:
         message = "Unexpected video generation worker error"
 
-    return message[:MAX_ERROR_MESSAGE_LENGTH]
+    return redact_url_query_strings(message)[:MAX_ERROR_MESSAGE_LENGTH]
 
 
 def mark_video_job_failed(
@@ -828,30 +958,12 @@ def execute_video_job(
     if snapshot is None:
         return False
 
-    source_inputs = job_asset_records(
-        snapshot.parameters,
-        "source_input_assets",
-    )
-    context_assets = job_asset_records(snapshot.parameters, "context_assets")
-    presigned_url_ttl = max(
-        3600,
-        settings.genblaze_video_timeout_seconds + 300,
-    )
-    prepared_source_inputs = prepare_source_input_assets(
-        source_inputs=source_inputs,
+    request = prepare_video_generation_request(
+        snapshot=snapshot,
         storage=storage,
-        expires_seconds=presigned_url_ttl,
+        settings=settings,
     )
-    result = generation.generate_video(
-        VideoGenerationRequest(
-            prompt=snapshot.prompt,
-            model=snapshot.model,
-            timeout_seconds=settings.genblaze_video_timeout_seconds,
-            parameters=video_provider_parameters(snapshot.parameters),
-            input_assets=prepared_source_inputs,
-            context_assets=context_assets,
-        )
-    )
+    result = generation.generate_video(request)
     generated_artifact = select_durable_video_artifact(
         result,
         max_size_bytes=settings.max_generated_video_size_bytes,
@@ -950,8 +1062,17 @@ def run_worker_once(
             settings=worker_settings,
         )
     except Exception as exc:
-        logger.exception("Video generation job %s failed", job_id)
         error_message = safe_worker_error_message(exc)
+        sanitized_exception = RuntimeError(error_message)
+        logger.error(
+            "Video generation job %s failed",
+            job_id,
+            exc_info=(
+                type(sanitized_exception),
+                sanitized_exception,
+                exc.__traceback__,
+            ),
+        )
         with session_factory() as db:
             mark_video_job_failed(
                 db,

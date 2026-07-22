@@ -6,10 +6,12 @@ from unittest.mock import MagicMock, patch
 
 from sqlalchemy.dialects import postgresql
 
+from app.core.config import Settings
 from app.models.asset import Asset, AssetFormat, AssetVersion, ReviewStatus
 from app.models.generation_job import GenerationJob, GenerationJobStatus
 from app.services.generation import (
     GeneratedAsset,
+    GenerationInputError,
     GenerationProviderError,
     GenerationResult,
 )
@@ -27,11 +29,14 @@ from app.workers.video_generation import (
     finalize_video_job_success,
     mark_video_job_failed,
     prepare_source_input_assets,
+    prepare_video_generation_request,
     recover_stale_video_jobs,
     run_worker_forever,
+    safe_worker_error_message,
     select_durable_video_artifact,
     store_video_artifact,
     upload_video_provenance_sidecar,
+    video_provider_parameters,
 )
 
 
@@ -115,6 +120,56 @@ def make_result() -> GenerationResult:
         ],
         generation_metadata={
             "genblaze": {"modality": "video", "asset_count": 1}
+        },
+    )
+
+
+def make_video_edit_snapshot(
+    *,
+    input_mode: str = "video_to_video",
+) -> VideoJobSnapshot:
+    return VideoJobSnapshot(
+        id=uuid.uuid4(),
+        asset_version_id=uuid.uuid4(),
+        campaign_id=uuid.uuid4(),
+        asset_id=uuid.uuid4(),
+        version_number=1,
+        provider="gmicloud",
+        model="wan2.7-videoedit",
+        prompt="Make the background move gently.",
+        parameters={
+            "duration": 4,
+            "aspect_ratio": "16:9",
+            "resolution": "720p",
+            "input_mode": input_mode,
+            "source_input_assets": [
+                {
+                    "role": "source_creative",
+                    "storage_key": "campaigns/source/source.mp4",
+                    "filename": "source.mp4",
+                    "content_type": "video/mp4",
+                    "media_kind": "video",
+                    "size_bytes": 4096,
+                    "sha256": "b" * 64,
+                    "source": "user_upload",
+                    "storage_ownership": "asset_version",
+                }
+            ],
+            "context_assets": [
+                {
+                    "role": "brand_reference",
+                    "storage_key": "brand-assets/guidelines.pdf",
+                    "filename": "guidelines.pdf",
+                    "content_type": "application/pdf",
+                    "size_bytes": 1024,
+                    "source": "campaign_brand_asset",
+                }
+            ],
+        },
+        attempt_count=1,
+        started_at=datetime(2026, 7, 22, 1, 0, tzinfo=UTC),
+        version_generation_metadata={
+            "source": "backend_genblaze_video_submission"
         },
     )
 
@@ -249,6 +304,136 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         storage.generate_presigned_download_url.assert_called_once_with(
             key=source["storage_key"],
             expires_seconds=3600,
+        )
+
+    def test_prepares_video_edit_request_from_validated_stored_source(self) -> None:
+        snapshot = make_video_edit_snapshot()
+        storage = MagicMock()
+        storage.generate_presigned_download_url.return_value = (
+            "https://s3.example.com/source.mp4?signature=temporary"
+        )
+        settings = Settings(
+            _env_file=None,
+            GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+            GENBLAZE_VIDEO_TIMEOUT_SECONDS=4000,
+        )
+
+        request = prepare_video_generation_request(
+            snapshot=snapshot,
+            storage=storage,
+            settings=settings,
+        )
+
+        self.assertEqual(request.model, "wan2.7-videoedit")
+        self.assertEqual(request.timeout_seconds, 4000)
+        self.assertEqual(request.parameters, {})
+        self.assertEqual(len(request.input_assets), 1)
+        self.assertIn("signature=temporary", request.input_assets[0]["url"])
+        self.assertEqual(
+            request.context_assets,
+            snapshot.parameters["context_assets"],
+        )
+        self.assertNotIn(
+            "url",
+            snapshot.parameters["source_input_assets"][0],
+        )
+        storage.generate_presigned_download_url.assert_called_once_with(
+            key="campaigns/source/source.mp4",
+            expires_seconds=4300,
+        )
+
+    def test_rejects_worker_input_mode_mismatch_before_signing(self) -> None:
+        snapshot = make_video_edit_snapshot(input_mode="image_to_video")
+        storage = MagicMock()
+        settings = Settings(
+            _env_file=None,
+            GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+        )
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "input mode does not match",
+        ):
+            prepare_video_generation_request(
+                snapshot=snapshot,
+                storage=storage,
+                settings=settings,
+            )
+
+        storage.generate_presigned_download_url.assert_not_called()
+
+    def test_rejects_disabled_video_edit_job_before_signing(self) -> None:
+        snapshot = make_video_edit_snapshot()
+        storage = MagicMock()
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "disabled by configuration",
+        ):
+            prepare_video_generation_request(
+                snapshot=snapshot,
+                storage=storage,
+                settings=Settings(_env_file=None),
+            )
+
+        storage.generate_presigned_download_url.assert_not_called()
+
+    def test_rejects_non_https_signed_source_url(self) -> None:
+        snapshot = make_video_edit_snapshot()
+        storage = MagicMock()
+        storage.generate_presigned_download_url.return_value = (
+            "http://s3.example.com/source.mp4?signature=temporary"
+        )
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "downloadable HTTPS URL",
+        ):
+            prepare_video_generation_request(
+                snapshot=snapshot,
+                storage=storage,
+                settings=Settings(
+                    _env_file=None,
+                    GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+                ),
+            )
+
+    def test_worker_controls_follow_registered_model_contract(self) -> None:
+        parameters = {
+            "duration": 4,
+            "aspect_ratio": "16:9",
+            "resolution": "720p",
+        }
+
+        self.assertEqual(
+            video_provider_parameters(
+                parameters,
+                model="veo-3.1-fast-generate-001",
+            ),
+            parameters,
+        )
+        self.assertEqual(
+            video_provider_parameters(
+                parameters,
+                model="wan2.7-videoedit",
+            ),
+            {},
+        )
+
+    def test_worker_failure_message_redacts_presigned_url_query(self) -> None:
+        message = safe_worker_error_message(
+            GenerationProviderError(
+                "Provider rejected "
+                "https://s3.example.com/source.mp4?"
+                "X-Amz-Signature=secret&X-Amz-Expires=3600, retry later"
+            )
+        )
+
+        self.assertNotIn("secret", message)
+        self.assertNotIn("X-Amz-Expires", message)
+        self.assertIn(
+            "https://s3.example.com/source.mp4?redacted, retry later",
+            message,
         )
 
     def test_selects_durable_artifact_and_enforces_size_limit(self) -> None:
