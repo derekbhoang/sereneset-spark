@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import mimetypes
 import os
+import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
@@ -31,6 +32,7 @@ GENBLAZE_EXTERNAL_INPUTS_PARAMETER = "external_inputs"
 MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES = 25 * 1024 * 1024
 MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES = 100 * 1024 * 1024
 VIDEO_SOURCE_INPUT_ROLE = "source_creative"
+SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 VERIFIED_VIDEO_TO_VIDEO_MODELS = frozenset({"wan2.7-videoedit"})
 # Keep this empty until the provider model spec routes video to its native slot.
 VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS: frozenset[str] = frozenset()
@@ -120,6 +122,14 @@ class VideoInputPlan:
     mode: VideoInputMode
     provider_input_assets: list[dict[str, Any]]
     provenance_input_assets: list[dict[str, Any]]
+
+
+@dataclass(frozen=True)
+class ValidatedVideoSourceInput:
+    filename: str
+    content_type: str
+    media_kind: VideoSourceMediaKind
+    size_bytes: int
 
 
 @dataclass(frozen=True)
@@ -542,6 +552,96 @@ def format_size_limit(size_bytes: int) -> str:
     return f"{size_bytes} bytes"
 
 
+def validate_video_source_metadata(
+    *,
+    input_asset: dict[str, Any],
+    require_download_url: bool,
+) -> ValidatedVideoSourceInput:
+    role = optional_string(input_asset.get("role"))
+    if role != VIDEO_SOURCE_INPUT_ROLE:
+        raise GenerationInputError(
+            "The video generation source must use role 'source_creative'"
+        )
+
+    url = optional_string(input_asset.get("url"))
+    if require_download_url:
+        if url is None or urlparse(url).scheme.lower() != "https":
+            raise GenerationInputError(
+                "The video generation source must have a downloadable HTTPS URL"
+            )
+    elif optional_string(input_asset.get("storage_key")) is None:
+        raise GenerationInputError(
+            "The video generation source must have a B2 storage key"
+        )
+
+    filename = optional_string(input_asset.get("filename"))
+    if filename is None:
+        raise GenerationInputError(
+            "The video generation source must have a filename"
+        )
+
+    declared_content_type = optional_string(input_asset.get("content_type"))
+    normalized_content_type = (
+        declared_content_type.split(";", maxsplit=1)[0].strip().lower()
+        if declared_content_type is not None
+        else None
+    )
+    filename_content_type = KNOWN_MEDIA_EXTENSION_CONTENT_TYPES.get(
+        PurePosixPath(filename.replace("\\", "/")).suffix.lower()
+    )
+    if (
+        normalized_content_type
+        and normalized_content_type != "application/octet-stream"
+        and filename_content_type is not None
+        and normalized_content_type != filename_content_type
+    ):
+        raise GenerationInputError(
+            "The video generation source filename and content type do not match"
+        )
+
+    content_type = infer_asset_media_type(
+        content_type=declared_content_type,
+        filename=filename,
+        url=url,
+    )
+    media_kind = video_source_media_kind(content_type)
+    declared_media_kind = optional_string(input_asset.get("media_kind"))
+    if (
+        declared_media_kind is not None
+        and declared_media_kind.casefold() != media_kind.value
+    ):
+        raise GenerationInputError(
+            "The video generation source media kind does not match its content type"
+        )
+
+    size_bytes = optional_int(input_asset.get("size_bytes"))
+    if size_bytes is None or size_bytes <= 0:
+        raise GenerationInputError(
+            "The video generation source must have a positive size"
+        )
+
+    sha256 = optional_string(input_asset.get("sha256"))
+    if sha256 is not None and SHA256_PATTERN.fullmatch(sha256) is None:
+        raise GenerationInputError(
+            "The video generation source SHA-256 checksum is invalid"
+        )
+
+    if (
+        media_kind == VideoSourceMediaKind.video
+        and PurePosixPath(filename).suffix.casefold() != ".mp4"
+    ):
+        raise GenerationInputError(
+            "The source video filename must use the .mp4 extension"
+        )
+
+    return ValidatedVideoSourceInput(
+        filename=filename,
+        content_type=content_type,
+        media_kind=media_kind,
+        size_bytes=size_bytes,
+    )
+
+
 def validate_video_input_assets(
     *,
     model: str,
@@ -575,34 +675,12 @@ def validate_video_input_assets(
             f"Video model '{model}' only supports text-to-video generation"
         )
 
-    input_asset = input_assets[0]
-    role = optional_string(input_asset.get("role"))
-    if role != VIDEO_SOURCE_INPUT_ROLE:
-        raise GenerationInputError(
-            "The video generation source must use role 'source_creative'"
-        )
-
-    url = optional_string(input_asset.get("url"))
-    if require_download_url and (
-        url is None or urlparse(url).scheme.lower() != "https"
-    ):
-        raise GenerationInputError(
-            "The video generation source must have a downloadable HTTPS URL"
-        )
-
-    content_type = infer_asset_media_type(
-        content_type=optional_string(input_asset.get("content_type")),
-        filename=optional_string(input_asset.get("filename")),
-        url=url,
+    source = validate_video_source_metadata(
+        input_asset=input_assets[0],
+        require_download_url=require_download_url,
     )
-    media_kind = video_source_media_kind(content_type)
-    size_bytes = optional_int(input_asset.get("size_bytes"))
-    if size_bytes is None or size_bytes <= 0:
-        raise GenerationInputError(
-            "The video generation source must have a positive size"
-        )
 
-    if media_kind == VideoSourceMediaKind.video:
+    if source.media_kind == VideoSourceMediaKind.video:
         max_size_bytes = (
             settings.max_video_source_video_size_bytes
             if settings is not None
@@ -612,14 +690,14 @@ def validate_video_input_assets(
             raise GenerationInputError(
                 f"Video model '{model}' does not support video source inputs"
             )
-        if content_type not in ALLOWED_VIDEO_SOURCE_VIDEO_CONTENT_TYPES:
+        if source.content_type not in ALLOWED_VIDEO_SOURCE_VIDEO_CONTENT_TYPES:
             supported_types = ", ".join(
                 sorted(ALLOWED_VIDEO_SOURCE_VIDEO_CONTENT_TYPES)
             )
             raise GenerationInputError(
                 f"The source video type is not supported. Use one of: {supported_types}"
             )
-        if size_bytes > max_size_bytes:
+        if source.size_bytes > max_size_bytes:
             raise GenerationInputError(
                 "The source video must be "
                 f"{format_size_limit(max_size_bytes)} or smaller"
@@ -634,7 +712,7 @@ def validate_video_input_assets(
 
     if input_requirement == VideoModelInputRequirement.video_required:
         raise GenerationInputError(f"Video model '{model}' requires one source video")
-    if content_type not in ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES:
+    if source.content_type not in ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES:
         supported_types = ", ".join(sorted(ALLOWED_VIDEO_SOURCE_IMAGE_CONTENT_TYPES))
         raise GenerationInputError(
             "The video source image type is not supported. "
@@ -645,7 +723,7 @@ def validate_video_input_assets(
         if settings is not None
         else MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES
     )
-    if size_bytes > max_size_bytes:
+    if source.size_bytes > max_size_bytes:
         raise GenerationInputError(
             "The video source image must be "
             f"{format_size_limit(max_size_bytes)} or smaller"

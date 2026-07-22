@@ -206,6 +206,73 @@ class VideoInputRuleTests(unittest.TestCase):
                         input_assets=input_assets,
                     )
 
+    def test_validates_source_metadata_before_provider_rules(self) -> None:
+        invalid_sources = (
+            (
+                source_image(filename=""),
+                True,
+                "must have a filename",
+            ),
+            (
+                source_image(url=None),
+                False,
+                "must have a B2 storage key",
+            ),
+            (
+                source_image(filename="product.mp4"),
+                True,
+                "filename and content type do not match",
+            ),
+            (
+                source_image(media_kind="video"),
+                True,
+                "media kind does not match",
+            ),
+            (
+                source_image(sha256="not-a-checksum"),
+                True,
+                "SHA-256 checksum is invalid",
+            ),
+        )
+
+        for input_asset, require_download_url, expected_error in invalid_sources:
+            with self.subTest(expected_error=expected_error):
+                with self.assertRaisesRegex(
+                    GenerationInputError,
+                    expected_error,
+                ):
+                    validate_video_input_assets(
+                        model="Veo3-Fast",
+                        input_assets=[input_asset],
+                        require_download_url=require_download_url,
+                    )
+
+    def test_accepts_b2_source_before_worker_signing(self) -> None:
+        mode = validate_video_input_assets(
+            model="Veo3-Fast",
+            input_assets=[
+                source_image(
+                    url=None,
+                    storage_key="campaigns/source/product.jpg",
+                    media_kind="image",
+                    sha256="a" * 64,
+                )
+            ],
+            require_download_url=False,
+        )
+
+        self.assertEqual(mode, VideoInputMode.image_to_video)
+
+    def test_video_source_requires_mp4_filename(self) -> None:
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "filename must use the .mp4 extension",
+        ):
+            validate_video_input_assets(
+                model="wan2.7-videoedit",
+                input_assets=[source_video(filename="source.mov")],
+            )
+
     def test_infers_supported_type_from_filename(self) -> None:
         input_asset = source_image(
             content_type="application/octet-stream",

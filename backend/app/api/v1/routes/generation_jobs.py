@@ -639,6 +639,90 @@ def resolve_video_source(
     return ResolvedVideoSource(origin=VideoSourceOrigin.none)
 
 
+def validate_resolved_video_source(source: ResolvedVideoSource) -> None:
+    if source.origin == VideoSourceOrigin.none:
+        return
+
+    record = source.input_record
+    if record is None:
+        raise GenerationInputError("Resolved video source is missing its input record")
+
+    expected_provenance = {
+        VideoSourceOrigin.asset_version: (
+            "source_version_artifact",
+            "source_asset_version",
+        ),
+        VideoSourceOrigin.brand_asset: (
+            "campaign_brand_asset",
+            "brand_asset",
+        ),
+        VideoSourceOrigin.user_upload: (
+            "user_upload",
+            "asset_version",
+        ),
+    }
+    expected_source, expected_ownership = expected_provenance[source.origin]
+    if optional_string(record.get("source")) != expected_source:
+        raise GenerationInputError(
+            "Resolved video source has inconsistent provenance"
+        )
+    if optional_string(record.get("storage_ownership")) != expected_ownership:
+        raise GenerationInputError(
+            "Resolved video source has inconsistent storage ownership"
+        )
+
+    if source.origin == VideoSourceOrigin.asset_version:
+        if optional_string(record.get("source_version_id")) != str(
+            source.source_version_id
+        ):
+            raise GenerationInputError(
+                "Resolved video source version ID does not match its provenance"
+            )
+        if optional_string(record.get("source_asset_id")) is None:
+            raise GenerationInputError(
+                "Resolved video source is missing its source asset ID"
+            )
+        source_version_number = record.get("source_version_number")
+        if (
+            not isinstance(source_version_number, int)
+            or isinstance(source_version_number, bool)
+            or source_version_number < 1
+        ):
+            raise GenerationInputError(
+                "Resolved video source has an invalid source version number"
+            )
+
+    if source.origin == VideoSourceOrigin.brand_asset:
+        if optional_string(record.get("brand_asset_id")) != str(
+            source.source_brand_asset_id
+        ):
+            raise GenerationInputError(
+                "Resolved video brand asset ID does not match its provenance"
+            )
+        if optional_string(record.get("campaign_brand_asset_id")) is None:
+            raise GenerationInputError(
+                "Resolved video source is missing its campaign attachment ID"
+            )
+
+    if source.origin == VideoSourceOrigin.user_upload:
+        content_validation = metadata_dict(record.get("content_validation"))
+        video_track_count = content_validation.get("video_track_count")
+        media_data_box_count = content_validation.get("media_data_box_count")
+        if (
+            optional_string(record.get("sha256")) is None
+            or content_validation.get("container") != "mp4"
+            or not isinstance(video_track_count, int)
+            or isinstance(video_track_count, bool)
+            or video_track_count < 1
+            or not isinstance(media_data_box_count, int)
+            or isinstance(media_data_box_count, bool)
+            or media_data_box_count < 1
+        ):
+            raise GenerationInputError(
+                "Uploaded video source is missing verified MP4 content metadata"
+            )
+
+
 def validate_video_submission(
     *,
     video_in: VideoGenerationCreate,
@@ -647,6 +731,7 @@ def validate_video_submission(
     settings: Settings,
 ) -> VideoInputMode:
     try:
+        validate_resolved_video_source(source)
         validate_video_generation_parameters(
             model=model,
             duration_seconds=video_in.duration_seconds,

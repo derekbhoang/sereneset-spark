@@ -18,7 +18,7 @@ from app.models.brand_asset import (
 from app.models.campaign import Campaign
 from app.models.generation_job import GenerationJobStatus
 from app.schemas.generation_job import VideoGenerationCreate
-from app.services.generation import VideoInputMode
+from app.services.generation import GenerationInputError, VideoInputMode
 from app.api.v1.routes.generation_jobs import (
     ResolvedVideoSource,
     VideoSourceOrigin,
@@ -29,6 +29,7 @@ from app.api.v1.routes.generation_jobs import (
     source_version_input_record,
     submit_video_generation,
     submit_video_generation_with_upload,
+    validate_resolved_video_source,
 )
 from app.services.storage import FileObjectInspection, StoredObject
 
@@ -298,6 +299,39 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         )
         self.assertIn("cannot be combined", raised.exception.detail)
 
+    def test_rejects_resolved_source_with_inconsistent_provenance(self) -> None:
+        source_version_id = uuid.uuid4()
+        resolved = ResolvedVideoSource(
+            origin=VideoSourceOrigin.asset_version,
+            source_version_id=source_version_id,
+            input_record={
+                "source": "user_upload",
+                "storage_ownership": "asset_version",
+                "source_version_id": str(source_version_id),
+            },
+        )
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "inconsistent provenance",
+        ):
+            validate_resolved_video_source(resolved)
+
+    def test_rejects_upload_without_verified_content_metadata(self) -> None:
+        resolved = ResolvedVideoSource(
+            origin=VideoSourceOrigin.user_upload,
+            input_record={
+                "source": "user_upload",
+                "storage_ownership": "asset_version",
+            },
+        )
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "missing verified MP4 content metadata",
+        ):
+            validate_resolved_video_source(resolved)
+
     def test_snapshots_brand_asset_as_video_source(self) -> None:
         campaign_id = uuid.uuid4()
         brand_asset = BrandAsset(
@@ -550,16 +584,19 @@ class VideoSubmissionRouteTests(unittest.TestCase):
     def test_submission_uses_attached_brand_image_as_provider_source(self) -> None:
         campaign_id = uuid.uuid4()
         brand_asset_id = uuid.uuid4()
+        campaign_brand_asset_id = uuid.uuid4()
         source_record = {
             "role": "source_creative",
             "storage_key": "brand-assets/product/original.jpg",
             "filename": "original.jpg",
             "content_type": "image/jpeg",
+            "media_kind": "image",
             "size_bytes": 2048,
             "sha256": "d" * 64,
             "source": "campaign_brand_asset",
             "storage_ownership": "brand_asset",
             "brand_asset_id": str(brand_asset_id),
+            "campaign_brand_asset_id": str(campaign_brand_asset_id),
         }
         db = MagicMock()
         db.get.return_value = Campaign(id=campaign_id)
