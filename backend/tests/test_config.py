@@ -137,7 +137,17 @@ class VideoGenerationSettingsTests(unittest.TestCase):
             settings.genblaze_video_model,
             "veo-3.1-fast-generate-001",
         )
+        self.assertEqual(settings.genblaze_video_edit_model, "wan2.7-videoedit")
+        self.assertFalse(settings.genblaze_video_to_video_enabled)
         self.assertEqual(settings.genblaze_video_timeout_seconds, 900)
+        self.assertEqual(
+            settings.max_video_source_image_size_bytes,
+            25 * 1024 * 1024,
+        )
+        self.assertEqual(
+            settings.max_video_source_video_size_bytes,
+            100 * 1024 * 1024,
+        )
         self.assertEqual(
             settings.max_generated_video_size_bytes,
             500 * 1024 * 1024,
@@ -152,7 +162,11 @@ class VideoGenerationSettingsTests(unittest.TestCase):
         settings = Settings(
             _env_file=None,
             GENBLAZE_VIDEO_MODEL="  Kling-Text2Video-V2.1-Master  ",
+            GENBLAZE_VIDEO_EDIT_MODEL="  wan2.7-videoedit  ",
+            GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
             GENBLAZE_VIDEO_TIMEOUT_SECONDS=1200,
+            MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES=10 * 1024 * 1024,
+            MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES=80 * 1024 * 1024,
             MAX_GENERATED_VIDEO_SIZE_BYTES=100 * 1024 * 1024,
             GENERATION_WORKER_POLL_SECONDS=0.5,
             WORKER_HEARTBEAT_INTERVAL_SECONDS=15,
@@ -165,7 +179,17 @@ class VideoGenerationSettingsTests(unittest.TestCase):
             settings.genblaze_video_model,
             "Kling-Text2Video-V2.1-Master",
         )
+        self.assertEqual(settings.genblaze_video_edit_model, "wan2.7-videoedit")
+        self.assertTrue(settings.genblaze_video_to_video_enabled)
         self.assertEqual(settings.genblaze_video_timeout_seconds, 1200)
+        self.assertEqual(
+            settings.max_video_source_image_size_bytes,
+            10 * 1024 * 1024,
+        )
+        self.assertEqual(
+            settings.max_video_source_video_size_bytes,
+            80 * 1024 * 1024,
+        )
         self.assertEqual(
             settings.max_generated_video_size_bytes,
             100 * 1024 * 1024,
@@ -179,7 +203,10 @@ class VideoGenerationSettingsTests(unittest.TestCase):
     def test_rejects_invalid_video_generation_settings(self) -> None:
         invalid_settings = (
             {"GENBLAZE_VIDEO_MODEL": "   "},
+            {"GENBLAZE_VIDEO_EDIT_MODEL": "   "},
             {"GENBLAZE_VIDEO_TIMEOUT_SECONDS": 59},
+            {"MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES": 0},
+            {"MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES": 0},
             {"MAX_GENERATED_VIDEO_SIZE_BYTES": 0},
             {"B2_READINESS_TIMEOUT_SECONDS": 0},
             {"GENERATION_WORKER_POLL_SECONDS": 0},

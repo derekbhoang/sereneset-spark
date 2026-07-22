@@ -149,12 +149,20 @@ envVarGroups:
         value: seedream-5.0-lite
       - key: GENBLAZE_VIDEO_MODEL
         value: veo-3.1-fast-generate-001
+      - key: GENBLAZE_VIDEO_EDIT_MODEL
+        value: wan2.7-videoedit
+      - key: GENBLAZE_VIDEO_TO_VIDEO_ENABLED
+        value: "false"
       - key: GENBLAZE_TIMEOUT_SECONDS
         value: "600"
       - key: GENBLAZE_VIDEO_TIMEOUT_SECONDS
         value: "900"
       - key: GENBLAZE_STORAGE_PREFIX
         value: sereneset-spark/genblaze
+      - key: MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES
+        value: "26214400"
+      - key: MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES
+        value: "104857600"
       - key: MAX_GENERATED_VIDEO_SIZE_BYTES
         value: "524288000"
       - key: GENERATION_WORKER_POLL_SECONDS

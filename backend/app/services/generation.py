@@ -512,8 +512,27 @@ def video_source_media_kind(content_type: str) -> VideoSourceMediaKind:
     )
 
 
-def video_to_video_routing_enabled(model: str) -> bool:
-    return model.casefold() in VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS
+def video_to_video_routing_enabled(
+    model: str,
+    *,
+    settings: Settings | None = None,
+) -> bool:
+    if settings is None or not settings.genblaze_video_to_video_enabled:
+        return False
+
+    normalized_model = model.casefold()
+    return (
+        normalized_model == settings.genblaze_video_edit_model.casefold()
+        and normalized_model in VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS
+    )
+
+
+def format_size_limit(size_bytes: int) -> str:
+    mebibyte = 1024 * 1024
+    if size_bytes % mebibyte == 0:
+        return f"{size_bytes // mebibyte} MB"
+
+    return f"{size_bytes} bytes"
 
 
 def validate_video_input_assets(
@@ -521,6 +540,7 @@ def validate_video_input_assets(
     model: str,
     input_assets: list[dict[str, Any]],
     require_download_url: bool = True,
+    settings: Settings | None = None,
 ) -> VideoInputMode:
     if len(input_assets) > 1:
         raise GenerationInputError("Video generation accepts at most one source file")
@@ -576,6 +596,11 @@ def validate_video_input_assets(
         )
 
     if media_kind == VideoSourceMediaKind.video:
+        max_size_bytes = (
+            settings.max_video_source_video_size_bytes
+            if settings is not None
+            else MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES
+        )
         if input_requirement != VideoModelInputRequirement.video_required:
             raise GenerationInputError(
                 f"Video model '{model}' does not support video source inputs"
@@ -587,9 +612,12 @@ def validate_video_input_assets(
             raise GenerationInputError(
                 f"The source video type is not supported. Use one of: {supported_types}"
             )
-        if size_bytes > MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES:
-            raise GenerationInputError("The source video must be 100 MB or smaller")
-        if not video_to_video_routing_enabled(model):
+        if size_bytes > max_size_bytes:
+            raise GenerationInputError(
+                "The source video must be "
+                f"{format_size_limit(max_size_bytes)} or smaller"
+            )
+        if not video_to_video_routing_enabled(model, settings=settings):
             raise GenerationInputError(
                 f"Video-to-video support is verified for model '{model}', but "
                 "backend provider routing is not enabled yet"
@@ -605,8 +633,16 @@ def validate_video_input_assets(
             "The video source image type is not supported. "
             f"Use one of: {supported_types}"
         )
-    if size_bytes > MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES:
-        raise GenerationInputError("The video source image must be 25 MB or smaller")
+    max_size_bytes = (
+        settings.max_video_source_image_size_bytes
+        if settings is not None
+        else MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES
+    )
+    if size_bytes > max_size_bytes:
+        raise GenerationInputError(
+            "The video source image must be "
+            f"{format_size_limit(max_size_bytes)} or smaller"
+        )
 
     return VideoInputMode.image_to_video
 
@@ -616,10 +652,12 @@ def build_video_input_plan(
     model: str,
     source_input_assets: list[dict[str, Any]],
     context_assets: list[dict[str, Any]],
+    settings: Settings | None = None,
 ) -> VideoInputPlan:
     mode = validate_video_input_assets(
         model=model,
         input_assets=source_input_assets,
+        settings=settings,
     )
     return VideoInputPlan(
         mode=mode,
@@ -792,6 +830,7 @@ class GenblazeGenerationService:
             model=model,
             source_input_assets=request.input_assets,
             context_assets=request.context_assets,
+            settings=self.settings,
         )
         pipeline_parameters, input_assets_parameter = build_pipeline_parameters(
             parameters=request.parameters,

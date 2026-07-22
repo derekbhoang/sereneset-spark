@@ -649,6 +649,7 @@ def submit_video_generation(
             model=model,
             input_assets=source_inputs,
             require_download_url=False,
+            settings=settings,
         )
     except GenerationInputError as exc:
         raise HTTPException(

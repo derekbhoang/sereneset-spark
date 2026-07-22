@@ -263,7 +263,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        help="Model slug to inspect. Defaults to GENBLAZE_VIDEO_MODEL.",
+        help="Model slug to inspect. Defaults to GENBLAZE_VIDEO_EDIT_MODEL.",
     )
     parser.add_argument(
         "--base-url",
@@ -319,7 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         print("GMI_API_KEY is not configured")
         return EXIT_NOT_CONFIGURED
 
-    model = (args.model or settings.genblaze_video_model).strip()
+    model = (args.model or settings.genblaze_video_edit_model).strip()
     headers = {"Authorization": f"Bearer {api_key}"}
     if args.org_id.strip():
         headers["X-Organization-ID"] = args.org_id.strip()

@@ -101,9 +101,13 @@ B2_APPLICATION_KEY=your-application-key
 GMI_API_KEY=your-gmi-api-key
 GENBLAZE_IMAGE_MODEL=seedream-5.0-lite
 GENBLAZE_VIDEO_MODEL=veo-3.1-fast-generate-001
+GENBLAZE_VIDEO_EDIT_MODEL=wan2.7-videoedit
+GENBLAZE_VIDEO_TO_VIDEO_ENABLED=false
 GENBLAZE_TIMEOUT_SECONDS=600
 GENBLAZE_VIDEO_TIMEOUT_SECONDS=900
 GENBLAZE_STORAGE_PREFIX=sereneset-spark/genblaze
+MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES=26214400
+MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES=104857600
 
 CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
 ```
@@ -115,12 +119,12 @@ Before enabling a new video input mode, inspect the live GMI model contract. Thi
 ```powershell
 Set-Location backend
 python -m scripts.check_gmi_video_model
-python -m scripts.check_gmi_video_model --model wan2.7-videoedit
+python -m scripts.check_gmi_video_model --model veo-3.1-fast-generate-001
 ```
 
-The configured `veo-3.1-fast-generate-001` model supports text-to-video and image-to-video, but not video-to-video. At the time of verification, `wan2.7-videoedit` reports an active video model with a required `video` input parameter and video output. Upstream model contracts can change, so run the check again before deployment.
+The configured edit model, `wan2.7-videoedit`, reports an active video model with a required `video` input parameter and video output. The ordinary `veo-3.1-fast-generate-001` model supports text-to-video and image-to-video, but not video-to-video. Upstream model contracts can change, so run the check again before deployment.
 
-The API currently fails closed for video source inputs. It recognizes stored video versions, but returns `422` until the backend explicitly maps the source URL to the selected provider model's native video parameter. It never silently converts a video to one frame or submits a job that would ignore the video.
+The API currently fails closed for video source inputs. Keep `GENBLAZE_VIDEO_TO_VIDEO_ENABLED=false` until the backend explicitly maps the source URL to the selected provider model's native video parameter. A separate code allowlist also prevents the flag from enabling an unrouted model. The API never silently converts a video to one frame or submits a job that would ignore the video.
 
 ### 3. Install and migrate the backend
 

@@ -75,6 +75,14 @@ class Settings(BaseSettings):
         default="veo-3.1-fast-generate-001",
         alias="GENBLAZE_VIDEO_MODEL",
     )
+    genblaze_video_edit_model: str = Field(
+        default="wan2.7-videoedit",
+        alias="GENBLAZE_VIDEO_EDIT_MODEL",
+    )
+    genblaze_video_to_video_enabled: bool = Field(
+        default=False,
+        alias="GENBLAZE_VIDEO_TO_VIDEO_ENABLED",
+    )
     genblaze_timeout_seconds: int = Field(
         default=600,
         alias="GENBLAZE_TIMEOUT_SECONDS",
@@ -84,6 +92,16 @@ class Settings(BaseSettings):
         default=900,
         alias="GENBLAZE_VIDEO_TIMEOUT_SECONDS",
         ge=60,
+    )
+    max_video_source_image_size_bytes: int = Field(
+        default=25 * 1024 * 1024,
+        alias="MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES",
+        ge=1,
+    )
+    max_video_source_video_size_bytes: int = Field(
+        default=100 * 1024 * 1024,
+        alias="MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES",
+        ge=1,
     )
     max_generated_video_size_bytes: int = Field(
         default=500 * 1024 * 1024,
@@ -180,12 +198,12 @@ class Settings(BaseSettings):
 
         return value.rstrip("/")
 
-    @field_validator("genblaze_video_model")
+    @field_validator("genblaze_video_model", "genblaze_video_edit_model")
     @classmethod
-    def validate_genblaze_video_model(cls, value: str) -> str:
+    def validate_genblaze_video_models(cls, value: str) -> str:
         normalized_value = value.strip()
         if not normalized_value:
-            raise ValueError("GENBLAZE_VIDEO_MODEL must not be empty")
+            raise ValueError("Genblaze video model names must not be empty")
 
         return normalized_value
 

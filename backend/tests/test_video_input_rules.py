@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch
 
+from app.core.config import Settings
 from app.services.generation import (
     build_video_input_plan,
     GenerationInputError,
@@ -102,6 +103,10 @@ class VideoInputRuleTests(unittest.TestCase):
             )
 
     def test_video_to_video_mode_is_explicit_when_routing_is_enabled(self) -> None:
+        enabled_settings = Settings(
+            _env_file=None,
+            GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+        )
         with patch(
             "app.services.generation.VIDEO_TO_VIDEO_ROUTING_ENABLED_MODELS",
             frozenset({"wan2.7-videoedit"}),
@@ -109,9 +114,50 @@ class VideoInputRuleTests(unittest.TestCase):
             mode = validate_video_input_assets(
                 model="wan2.7-videoedit",
                 input_assets=[source_video()],
+                settings=enabled_settings,
             )
 
         self.assertEqual(mode, VideoInputMode.video_to_video)
+
+    def test_feature_flag_cannot_bypass_the_routing_allowlist(self) -> None:
+        enabled_settings = Settings(
+            _env_file=None,
+            GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+        )
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "backend provider routing is not enabled yet",
+        ):
+            validate_video_input_assets(
+                model="wan2.7-videoedit",
+                input_assets=[source_video()],
+                settings=enabled_settings,
+            )
+
+    def test_uses_configured_source_size_limits(self) -> None:
+        configured_settings = Settings(
+            _env_file=None,
+            MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES=1024 * 1024,
+            MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES=2 * 1024 * 1024,
+        )
+
+        invalid_sources = (
+            ("Veo3-Fast", source_image(size_bytes=1024 * 1024 + 1), "1 MB"),
+            (
+                "wan2.7-videoedit",
+                source_video(size_bytes=2 * 1024 * 1024 + 1),
+                "2 MB",
+            ),
+        )
+        for model, input_asset, expected_limit in invalid_sources:
+            with self.subTest(model=model):
+                with self.assertRaisesRegex(GenerationInputError, expected_limit):
+                    validate_video_input_assets(
+                        model=model,
+                        input_assets=[input_asset],
+                        settings=configured_settings,
+                    )
 
     def test_verified_video_edit_model_requires_a_video_source(self) -> None:
         invalid_inputs = ([], [source_image()])
