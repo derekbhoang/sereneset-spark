@@ -1,6 +1,4 @@
 import unittest
-from dataclasses import replace
-from unittest.mock import patch
 
 from app.core.config import Settings
 from app.services.generation import (
@@ -13,7 +11,6 @@ from app.services.generation import (
     video_model_input_requirement,
     video_source_media_kind,
 )
-from app.services.video_model_capabilities import get_video_model_capability
 
 
 def source_image(**overrides: object) -> dict[str, object]:
@@ -93,7 +90,7 @@ class VideoInputRuleTests(unittest.TestCase):
             VideoSourceMediaKind.video,
         )
 
-    def test_video_sources_fail_closed_until_provider_routing_exists(self) -> None:
+    def test_video_sources_require_a_video_model_and_enabled_feature(self) -> None:
         with self.assertRaisesRegex(
             GenerationInputError,
             "does not support video source inputs",
@@ -105,7 +102,7 @@ class VideoInputRuleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             GenerationInputError,
-            "backend provider routing is not enabled yet",
+            "disabled by configuration",
         ):
             validate_video_input_assets(
                 model="wan2.7-videoedit",
@@ -117,32 +114,24 @@ class VideoInputRuleTests(unittest.TestCase):
             _env_file=None,
             GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
         )
-        capability = get_video_model_capability("wan2.7-videoedit")
-        assert capability is not None
-        with patch(
-            "app.services.generation.get_video_model_capability",
-            return_value=replace(
-                capability,
-                provider_source_routing_implemented=True,
-            ),
-        ):
-            mode = validate_video_input_assets(
-                model="wan2.7-videoedit",
-                input_assets=[source_video()],
-                settings=enabled_settings,
-            )
+        mode = validate_video_input_assets(
+            model="wan2.7-videoedit",
+            input_assets=[source_video()],
+            settings=enabled_settings,
+        )
 
         self.assertEqual(mode, VideoInputMode.video_to_video)
 
-    def test_feature_flag_cannot_bypass_the_routing_allowlist(self) -> None:
+    def test_configured_video_edit_model_must_match(self) -> None:
         enabled_settings = Settings(
             _env_file=None,
             GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+            GENBLAZE_VIDEO_EDIT_MODEL="Veo3-Fast",
         )
 
         with self.assertRaisesRegex(
             GenerationInputError,
-            "backend provider routing is not enabled yet",
+            "is not the configured video edit model",
         ):
             validate_video_input_assets(
                 model="wan2.7-videoedit",

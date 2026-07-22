@@ -4,6 +4,7 @@ import inspect
 import mimetypes
 import os
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from functools import lru_cache
@@ -35,6 +36,19 @@ class GenerationInputError(ValueError):
 
 
 GENBLAZE_EXTERNAL_INPUTS_PARAMETER = "external_inputs"
+GENBLAZE_PIPELINE_RESERVED_PARAMETERS = frozenset(
+    {
+        "expected_duration_sec",
+        GENBLAZE_EXTERNAL_INPUTS_PARAMETER,
+        "fallback_models",
+        "input_from",
+        "model",
+        "modality",
+        "prompt",
+        "provider",
+        "step_type",
+    }
+)
 MAX_VIDEO_SOURCE_IMAGE_SIZE_BYTES = 25 * 1024 * 1024
 MAX_VIDEO_SOURCE_VIDEO_SIZE_BYTES = 100 * 1024 * 1024
 VIDEO_SOURCE_INPUT_ROLE = "source_creative"
@@ -399,12 +413,45 @@ def build_pipeline_parameters(
     input_assets: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], str | None]:
     pipeline_parameters = dict(parameters)
-    pipeline_parameters.pop(GENBLAZE_EXTERNAL_INPUTS_PARAMETER, None)
+    for reserved_parameter in GENBLAZE_PIPELINE_RESERVED_PARAMETERS:
+        pipeline_parameters.pop(reserved_parameter, None)
 
     if not input_assets:
         return pipeline_parameters, None
 
     return pipeline_parameters, GENBLAZE_EXTERNAL_INPUTS_PARAMETER
+
+
+def build_video_pipeline_parameters(
+    *,
+    parameters: dict[str, Any],
+    input_assets: list[dict[str, Any]],
+    capability: VideoModelCapability,
+) -> tuple[dict[str, Any], str | None]:
+    pipeline_parameters, input_assets_parameter = build_pipeline_parameters(
+        parameters=parameters,
+        input_assets=input_assets,
+    )
+
+    source_parameter = capability.provider_source_parameter
+    if source_parameter is not None:
+        pipeline_parameters.pop(source_parameter, None)
+
+    allowed_parameters = capability.provider_allowed_parameters
+    if allowed_parameters is not None:
+        canonical_allowed_parameters = set(allowed_parameters)
+        canonical_allowed_parameters.update(
+            canonical
+            for canonical, native in capability.provider_parameter_aliases
+            if native in allowed_parameters
+        )
+        pipeline_parameters = {
+            key: value
+            for key, value in pipeline_parameters.items()
+            if key in canonical_allowed_parameters
+        }
+
+    return pipeline_parameters, input_assets_parameter
 
 
 def require_video_model_capability(model: str) -> VideoModelCapability:
@@ -466,6 +513,36 @@ def coerce_gmi_duration_seconds(value: Any) -> str:
     return str(int(value))
 
 
+def build_provider_source_input_mapping(
+    capability: VideoModelCapability,
+) -> Callable[[Sequence[Any]], dict[str, str]] | None:
+    source_parameter = capability.provider_source_parameter
+    if (
+        source_parameter is None
+        or not capability.provider_source_routing_implemented
+    ):
+        return None
+
+    accepted_media_prefixes = tuple(
+        f"{media_kind.value}/"
+        for media_kind in capability.accepted_source_media_kinds
+    )
+
+    def route_source_input(inputs: Sequence[Any]) -> dict[str, str]:
+        for input_asset in inputs:
+            media_type = getattr(input_asset, "media_type", "") or ""
+            if not str(media_type).casefold().startswith(accepted_media_prefixes):
+                continue
+
+            url = getattr(input_asset, "url", None)
+            if isinstance(url, str) and url.strip():
+                return {source_parameter: url}
+
+        return {}
+
+    return route_source_input
+
+
 def build_gmicloud_video_models(
     provider_class: Any,
     *,
@@ -480,6 +557,8 @@ def build_gmicloud_video_models(
         parameter_aliases
         or capability.provider_required_parameters
         or capability.provider_integer_string_parameters
+        or capability.provider_allowed_parameters is not None
+        or capability.provider_source_routing_implemented
     ):
         return None
 
@@ -489,12 +568,19 @@ def build_gmicloud_video_models(
 
     models = models_default().fork()
     spec = models.get(model)
-    wire_parameter_names = frozenset(parameter_aliases.values())
-    allowlist = (
-        spec.param_allowlist | wire_parameter_names
-        if spec.param_allowlist is not None
-        else None
+    provider_parameter_names = (
+        frozenset(parameter_aliases.values())
+        | capability.provider_required_parameters
+        | capability.provider_integer_string_parameters
     )
+    if capability.provider_source_parameter is not None:
+        provider_parameter_names |= frozenset(
+            {capability.provider_source_parameter}
+        )
+    allowlist = capability.provider_allowed_parameters
+    if allowlist is None and spec.param_allowlist is not None:
+        allowlist = spec.param_allowlist | provider_parameter_names
+    source_input_mapping = build_provider_source_input_mapping(capability)
     models.register(
         replace(
             spec,
@@ -516,6 +602,7 @@ def build_gmicloud_video_models(
                 spec.param_required | capability.provider_required_parameters
             ),
             param_allowlist=allowlist,
+            input_mapping=source_input_mapping or spec.input_mapping,
         )
     )
     return models
@@ -721,10 +808,18 @@ def validate_video_input_assets(
                 "The source video must be "
                 f"{format_size_limit(max_size_bytes)} or smaller"
             )
-        if not video_to_video_routing_enabled(model, settings=settings):
+        if not capability.provider_source_routing_implemented:
             raise GenerationInputError(
                 f"Video-to-video support is verified for model '{model}', but "
                 "backend provider routing is not enabled yet"
+            )
+        if settings is None or not settings.genblaze_video_to_video_enabled:
+            raise GenerationInputError(
+                "Video-to-video generation is disabled by configuration"
+            )
+        if not video_to_video_routing_enabled(model, settings=settings):
+            raise GenerationInputError(
+                f"Video model '{model}' is not the configured video edit model"
             )
 
         return VideoInputMode.video_to_video
@@ -939,9 +1034,14 @@ class GenblazeGenerationService:
             context_assets=request.context_assets,
             settings=self.settings,
         )
-        pipeline_parameters, input_assets_parameter = build_pipeline_parameters(
+        capability = require_video_model_capability(model)
+        (
+            pipeline_parameters,
+            input_assets_parameter,
+        ) = build_video_pipeline_parameters(
             parameters=request.parameters,
             input_assets=input_plan.provider_input_assets,
+            capability=capability,
         )
         external_inputs = build_external_input_assets(
             input_assets=input_plan.provider_input_assets,
@@ -1023,6 +1123,11 @@ class GenblazeGenerationService:
                     ),
                     "external_input_count": len(external_inputs),
                     "input_assets_parameter": input_assets_parameter,
+                    "provider_source_parameter": (
+                        capability.provider_source_parameter
+                        if input_plan.mode == VideoInputMode.video_to_video
+                        else None
+                    ),
                 },
                 "input_assets": [
                     serialize_input_asset(input_asset)

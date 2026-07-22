@@ -414,10 +414,6 @@ class VideoSubmissionRouteTests(unittest.TestCase):
 
         with (
             patch(
-                "app.api.v1.routes.generation_jobs.validate_video_input_assets",
-                return_value=VideoInputMode.video_to_video,
-            ),
-            patch(
                 "app.api.v1.routes.generation_jobs.campaign_brand_context_assets",
                 return_value=[],
             ),
@@ -431,7 +427,10 @@ class VideoSubmissionRouteTests(unittest.TestCase):
                 payload=video_request(model="wan2.7-videoedit").model_dump_json(),
                 file=uploaded_video(body),
                 db=db,
-                settings=settings(),
+                settings=Settings(
+                    _env_file=None,
+                    GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+                ),
                 storage=storage,
             )
 
@@ -496,7 +495,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
         self.assertIn(
-            "backend provider routing is not enabled yet",
+            "disabled by configuration",
             raised.exception.detail,
         )
         storage.upload_fileobj.assert_not_called()
@@ -711,7 +710,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         db.add.assert_not_called()
         db.commit.assert_not_called()
 
-    def test_verified_video_edit_model_stays_disabled_until_routed(self) -> None:
+    def test_video_edit_model_stays_disabled_until_feature_is_enabled(self) -> None:
         campaign_id = uuid.uuid4()
         source_version = stored_video_source()
         db = MagicMock()
@@ -737,7 +736,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             status.HTTP_422_UNPROCESSABLE_CONTENT,
         )
         self.assertIn(
-            "backend provider routing is not enabled yet",
+            "disabled by configuration",
             raised.exception.detail,
         )
         db.add.assert_not_called()

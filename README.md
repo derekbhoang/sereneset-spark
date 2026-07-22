@@ -124,7 +124,9 @@ python -m scripts.check_gmi_video_model --model veo-3.1-fast-generate-001
 
 The configured edit model, `wan2.7-videoedit`, reports an active video model with a required `video` input parameter and video output. The ordinary `veo-3.1-fast-generate-001` model supports text-to-video and image-to-video, but not video-to-video. Upstream model contracts can change, so run the check again before deployment.
 
-The API currently fails closed for video source inputs. Keep `GENBLAZE_VIDEO_TO_VIDEO_ENABLED=false` until the backend explicitly maps the source URL to the selected provider model's native video parameter. A separate code allowlist also prevents the flag from enabling an unrouted model. The API never silently converts a video to one frame or submits a job that would ignore the video.
+The backend has an exact capability entry for `wan2.7-videoedit`. When video-to-video is enabled, the worker signs the stored B2 MP4 and the Genblaze model spec maps that URL to GMICloud's required `video` payload parameter. The provider payload is restricted to the verified `prompt` and `video` fields; the signed URL is not copied into stored provenance.
+
+`GENBLAZE_VIDEO_TO_VIDEO_ENABLED` remains an operational opt-in. Set it to `true` for both the API and video worker only after rerunning the model-contract check, then redeploy both processes. An unregistered model, a mismatched `GENBLAZE_VIDEO_EDIT_MODEL`, or a disabled flag still returns `422` before a paid job is queued. The API never silently converts a video to one frame or submits a job that would ignore the video.
 
 ### 3. Install and migrate the backend
 

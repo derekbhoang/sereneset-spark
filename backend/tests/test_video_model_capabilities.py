@@ -50,7 +50,15 @@ class VideoModelCapabilityRegistryTests(unittest.TestCase):
             frozenset({VideoSourceMediaKind.video}),
         )
         self.assertEqual(capability.provider_source_parameter, "video")
-        self.assertFalse(capability.provider_source_routing_implemented)
+        self.assertEqual(
+            capability.provider_allowed_parameters,
+            frozenset({"prompt", "video"}),
+        )
+        self.assertEqual(
+            capability.provider_required_parameters,
+            frozenset({"prompt", "video"}),
+        )
+        self.assertTrue(capability.provider_source_routing_implemented)
 
     def test_does_not_infer_capabilities_for_unknown_model_names(self) -> None:
         self.assertIsNone(get_video_model_capability("future-image2video-model"))
@@ -70,6 +78,20 @@ class VideoModelCapabilityRegistryTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Duplicate video model"):
             build_video_model_capability_registry(capabilities)
+
+    def test_rejects_an_incomplete_provider_routing_contract(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "provider source parameter",
+        ):
+            VideoModelCapability(
+                model_id="incomplete-video-edit",
+                input_requirement=VideoModelInputRequirement.video_required,
+                accepted_source_media_kinds=frozenset(
+                    {VideoSourceMediaKind.video}
+                ),
+                provider_source_routing_implemented=True,
+            )
 
 
 if __name__ == "__main__":

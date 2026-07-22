@@ -36,8 +36,33 @@ class VideoModelCapability:
     provider_integer_string_parameters: frozenset[str] = field(
         default_factory=frozenset
     )
+    provider_allowed_parameters: frozenset[str] | None = None
     provider_source_parameter: str | None = None
     provider_source_routing_implemented: bool = False
+
+    def __post_init__(self) -> None:
+        if self.provider_allowed_parameters is not None:
+            missing_required_parameters = (
+                self.provider_required_parameters
+                - self.provider_allowed_parameters
+            )
+            if missing_required_parameters:
+                raise ValueError(
+                    "Required provider parameters must be included in the allowlist"
+                )
+
+        if self.provider_source_routing_implemented:
+            if self.provider_source_parameter is None:
+                raise ValueError(
+                    "Implemented source routing requires a provider source parameter"
+                )
+            if (
+                self.provider_source_parameter
+                not in self.provider_required_parameters
+            ):
+                raise ValueError(
+                    "The routed provider source parameter must be required"
+                )
 
     @property
     def registered_names(self) -> tuple[str, ...]:
@@ -95,8 +120,10 @@ VIDEO_MODEL_CAPABILITIES = (
         model_id="wan2.7-videoedit",
         input_requirement=VideoModelInputRequirement.video_required,
         accepted_source_media_kinds=frozenset({VideoSourceMediaKind.video}),
+        provider_allowed_parameters=frozenset({"prompt", "video"}),
+        provider_required_parameters=frozenset({"prompt", "video"}),
         provider_source_parameter="video",
-        provider_source_routing_implemented=False,
+        provider_source_routing_implemented=True,
     ),
 )
 

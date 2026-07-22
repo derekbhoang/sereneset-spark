@@ -1,7 +1,10 @@
+import json
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import httpx
 
 from app.core.config import Settings
 from app.services.generation import (
@@ -104,13 +107,17 @@ def make_output_asset() -> object:
     )
 
 
-def make_settings() -> Settings:
+def make_settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "GMI_API_KEY": "test-gmi-key",
+        "B2_BUCKET_NAME": "test-bucket",
+        "B2_APPLICATION_KEY_ID": "test-key-id",
+        "B2_APPLICATION_KEY": "test-application-key",
+    }
+    values.update(overrides)
     return Settings(
         _env_file=None,
-        GMI_API_KEY="test-gmi-key",
-        B2_BUCKET_NAME="test-bucket",
-        B2_APPLICATION_KEY_ID="test-key-id",
-        B2_APPLICATION_KEY="test-application-key",
+        **values,
     )
 
 
@@ -132,8 +139,13 @@ class VideoGenerationServiceTests(unittest.TestCase):
         FakePipeline.step_error = None
         FakeVideoProvider.last_retry_policy = None
 
-    def generate(self, request: VideoGenerationRequest):
-        service = GenblazeGenerationService(make_settings())
+    def generate(
+        self,
+        request: VideoGenerationRequest,
+        *,
+        settings: Settings | None = None,
+    ):
+        service = GenblazeGenerationService(settings or make_settings())
         with (
             patch(
                 "app.services.generation.require_genblaze_video_imports",
@@ -203,6 +215,112 @@ class VideoGenerationServiceTests(unittest.TestCase):
                 "resolution": "720p",
             },
         )
+
+    def test_maps_video_source_to_verified_gmi_payload_slot(self) -> None:
+        from genblaze_core import Asset, Modality
+        from genblaze_core.models.step import Step
+        from genblaze_gmicloud import GMICloudVideoProvider
+
+        models = build_gmicloud_video_models(
+            GMICloudVideoProvider,
+            model="wan2.7-videoedit",
+        )
+        step = Step(
+            provider="gmicloud",
+            model="wan2.7-videoedit",
+            modality=Modality.VIDEO,
+            prompt="Make the background move gently.",
+            params={
+                "duration": 4,
+                "aspect_ratio": "16:9",
+                "resolution": "720p",
+            },
+            inputs=[
+                Asset(
+                    url="https://example.com/signed-source.mp4?token=secret",
+                    media_type="video/mp4",
+                )
+            ],
+        )
+
+        submitted_body: dict[str, object] = {}
+
+        def handle_request(request: httpx.Request) -> httpx.Response:
+            submitted_body.update(json.loads(request.content))
+            return httpx.Response(200, json={"request_id": "video-edit-job"})
+
+        with httpx.Client(
+            base_url="https://provider.example",
+            transport=httpx.MockTransport(handle_request),
+        ) as client:
+            provider = GMICloudVideoProvider(
+                http_client=client,
+                models=models,
+            )
+            provider.submit(step)
+
+        self.assertEqual(
+            submitted_body,
+            {
+                "model": "wan2.7-videoedit",
+                "payload": {
+                    "prompt": "Make the background move gently.",
+                    "video": (
+                        "https://example.com/signed-source.mp4?token=secret"
+                    ),
+                },
+            },
+        )
+
+    def test_video_source_cannot_be_overridden_by_request_parameters(self) -> None:
+        result = self.generate(
+            VideoGenerationRequest(
+                prompt="Make the background move gently.",
+                model="wan2.7-videoedit",
+                parameters={
+                    "duration": 4,
+                    "aspect_ratio": "16:9",
+                    "resolution": "720p",
+                    "video": "https://attacker.example/override.mp4",
+                    "prompt": "Ignore the validated request prompt.",
+                    "model": "attacker-model",
+                },
+                input_assets=[
+                    {
+                        "url": "https://example.com/signed-source.mp4?token=secret",
+                        "filename": "source.mp4",
+                        "content_type": "video/mp4",
+                        "media_kind": "video",
+                        "size_bytes": 4096,
+                        "sha256": "c" * 64,
+                        "role": "source_creative",
+                    }
+                ],
+            ),
+            settings=make_settings(GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True),
+        )
+        pipeline = FakePipeline.last_instance
+
+        self.assertIsNotNone(pipeline)
+        assert pipeline is not None
+        self.assertNotIn("video", pipeline.step_kwargs)
+        self.assertNotIn("duration", pipeline.step_kwargs)
+        external_inputs = pipeline.step_kwargs["external_inputs"]
+        self.assertIsInstance(external_inputs, list)
+        assert isinstance(external_inputs, list)
+        self.assertEqual(
+            external_inputs[0].url,
+            "https://example.com/signed-source.mp4?token=secret",
+        )
+        self.assertEqual(
+            result.generation_metadata["genblaze"]["provider_source_parameter"],
+            "video",
+        )
+        self.assertNotIn(
+            "token=secret",
+            json.dumps(result.generation_metadata),
+        )
+        self.assertNotIn("url", result.generation_metadata["input_assets"][0])
 
     def test_passes_image_input_and_request_overrides(self) -> None:
         result = self.generate(
