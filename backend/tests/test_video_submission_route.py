@@ -1,6 +1,7 @@
 import unittest
 import uuid
 from io import BytesIO
+from struct import pack
 from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException, status
@@ -73,11 +74,31 @@ def settings() -> Settings:
     return Settings(_env_file=None)
 
 
-def uploaded_video(body: bytes = b"video-input") -> MagicMock:
+def mp4_box(box_type: bytes, payload: bytes) -> bytes:
+    return pack(">I4s", len(payload) + 8, box_type) + payload
+
+
+def valid_mp4_video() -> bytes:
+    file_type = mp4_box(
+        b"ftyp",
+        b"isom" + bytes(4) + b"isommp42",
+    )
+    handler = mp4_box(
+        b"hdlr",
+        bytes(8) + b"vide",
+    )
+    movie = mp4_box(
+        b"moov",
+        mp4_box(b"trak", mp4_box(b"mdia", handler)),
+    )
+    return file_type + movie + mp4_box(b"mdat", b"video-data")
+
+
+def uploaded_video(body: bytes | None = None) -> MagicMock:
     upload = MagicMock()
     upload.filename = "source.mp4"
     upload.content_type = "video/mp4"
-    upload.file = BytesIO(body)
+    upload.file = BytesIO(body if body is not None else valid_mp4_video())
     return upload
 
 
@@ -250,7 +271,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
 
     def test_streams_uploaded_video_to_owned_version_input(self) -> None:
         campaign_id = uuid.uuid4()
-        body = b"source-video-body"
+        body = valid_mp4_video()
         inspection = FileObjectInspection(
             size=len(body),
             sha256="e" * 64,
@@ -296,11 +317,22 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         upload_arguments = storage.upload_fileobj.call_args.kwargs
         self.assertEqual(upload_arguments["inspection"], inspection)
         self.assertEqual(upload_arguments["content_type"], "video/mp4")
+        self.assertEqual(upload_arguments["metadata"]["container"], "mp4")
+        self.assertEqual(upload_arguments["metadata"]["major_brand"], "isom")
         self.assertIn("/versions/v1/inputs/source_creative/", upload_arguments["key"])
         queued_asset = db.add.call_args.args[0]
         queued_version = queued_asset.versions[0]
         queued_job = queued_version.generation_job
         self.assertEqual(queued_job.parameters["input_mode"], "video_to_video")
+        source_input = queued_job.parameters["source_input_assets"][0]
+        self.assertEqual(
+            source_input["content_validation"]["container"],
+            "mp4",
+        )
+        self.assertEqual(
+            source_input["content_validation"]["video_track_count"],
+            1,
+        )
         self.assertEqual(len(queued_version.inputs), 1)
         version_input = queued_version.inputs[0]
         self.assertEqual(version_input.media_kind, "video")
@@ -311,11 +343,12 @@ class VideoSubmissionRouteTests(unittest.TestCase):
 
     def test_uploaded_video_fails_closed_before_b2_upload(self) -> None:
         campaign_id = uuid.uuid4()
+        body = valid_mp4_video()
         db = MagicMock()
         db.get.return_value = Campaign(id=campaign_id)
         storage = MagicMock()
         storage.inspect_fileobj.return_value = FileObjectInspection(
-            size=1024,
+            size=len(body),
             sha256="f" * 64,
         )
 
@@ -323,7 +356,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             submit_video_generation_with_upload(
                 campaign_id=campaign_id,
                 payload=video_request(model="wan2.7-videoedit").model_dump_json(),
-                file=uploaded_video(),
+                file=uploaded_video(body),
                 db=db,
                 settings=settings(),
                 storage=storage,
@@ -341,10 +374,44 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         db.add.assert_not_called()
         db.commit.assert_not_called()
 
+    def test_rejects_invalid_mp4_before_b2_upload(self) -> None:
+        campaign_id = uuid.uuid4()
+        body = b"this is not an mp4 video"
+        db = MagicMock()
+        db.get.return_value = Campaign(id=campaign_id)
+        storage = MagicMock()
+        storage.inspect_fileobj.return_value = FileObjectInspection(
+            size=len(body),
+            sha256="0" * 64,
+        )
+        upload = uploaded_video(body)
+
+        with self.assertRaises(HTTPException) as raised:
+            submit_video_generation_with_upload(
+                campaign_id=campaign_id,
+                payload=video_request(
+                    model="wan2.7-videoedit"
+                ).model_dump_json(),
+                file=upload,
+                db=db,
+                settings=settings(),
+                storage=storage,
+            )
+
+        self.assertEqual(
+            raised.exception.status_code,
+            status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertIn("not a valid MP4", raised.exception.detail)
+        self.assertEqual(upload.file.tell(), 0)
+        storage.upload_fileobj.assert_not_called()
+        db.add.assert_not_called()
+
     def test_removes_uploaded_video_when_database_commit_fails(self) -> None:
         campaign_id = uuid.uuid4()
+        body = valid_mp4_video()
         inspection = FileObjectInspection(
-            size=1024,
+            size=len(body),
             sha256="1" * 64,
         )
         db = MagicMock()
@@ -370,7 +437,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
                     payload=video_request(
                         model="wan2.7-videoedit"
                     ).model_dump_json(),
-                    file=uploaded_video(),
+                    file=uploaded_video(body),
                     db=db,
                     settings=settings(),
                     storage=storage,

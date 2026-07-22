@@ -60,6 +60,11 @@ from app.services.storage import (
     get_storage_service,
     normalize_artifact_filename,
 )
+from app.services.video_validation import (
+    Mp4ValidationResult,
+    VideoContentValidationError,
+    validate_mp4_contents,
+)
 
 
 router = APIRouter(tags=["generation-jobs"])
@@ -150,6 +155,23 @@ def inspect_video_upload(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
+        ) from exc
+
+
+def validate_video_upload_contents(
+    *,
+    file: UploadFile,
+    inspection: FileObjectInspection,
+) -> Mp4ValidationResult:
+    try:
+        return validate_mp4_contents(
+            fileobj=file.file,
+            size_bytes=inspection.size,
+        )
+    except VideoContentValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Source video is not a valid MP4: {exc}",
         ) from exc
 
 
@@ -463,6 +485,7 @@ def uploaded_video_input_record(
     filename: str,
     content_type: str,
     inspection: FileObjectInspection,
+    content_validation: Mp4ValidationResult,
 ) -> dict[str, object]:
     return {
         "role": VIDEO_SOURCE_INPUT_ROLE,
@@ -474,6 +497,7 @@ def uploaded_video_input_record(
         "sha256": inspection.sha256,
         "source": "user_upload",
         "storage_ownership": "asset_version",
+        "content_validation": content_validation.as_metadata(),
     }
 
 
@@ -887,6 +911,10 @@ def submit_video_generation_with_upload(
         file=file,
         max_size_bytes=settings.max_video_source_video_size_bytes,
     )
+    content_validation = validate_video_upload_contents(
+        file=file,
+        inspection=inspection,
+    )
 
     asset_id = uuid.uuid4()
     version_id = uuid.uuid4()
@@ -903,6 +931,7 @@ def submit_video_generation_with_upload(
         filename=filename,
         content_type=content_type,
         inspection=inspection,
+        content_validation=content_validation,
     )
     model = video_in.model or settings.genblaze_video_edit_model
     input_mode = validate_video_submission(
@@ -943,6 +972,9 @@ def submit_video_generation_with_upload(
                 "role": VIDEO_SOURCE_INPUT_ROLE,
                 "filename": filename,
                 "sha256": inspection.sha256,
+                "container": content_validation.container,
+                "major_brand": content_validation.major_brand,
+                "video_track_count": content_validation.video_track_count,
             },
         )
     except StorageObjectTooLargeError as exc:
