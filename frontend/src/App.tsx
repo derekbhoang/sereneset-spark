@@ -679,6 +679,8 @@ function getVideoContentType(
 
 function getGeneratedPreview(
   metadata: Record<string, unknown>,
+  preferredContentType: string | null = null,
+  preferredFilename: string | null = null,
 ): GeneratedPreview | null {
   const provenance = isRecord(metadata.provenance) ? metadata.provenance : null
   const assetCandidates = [
@@ -693,7 +695,29 @@ function getGeneratedPreview(
     }))
     .filter((asset) => asset.url || asset.storageKey)
 
+  const prefersVideo = Boolean(
+    getVideoContentType(preferredContentType, preferredFilename),
+  )
+  const prefersImage = isImageDescriptor(
+    preferredContentType,
+    preferredFilename,
+  )
+
+  const matchingCandidate = prefersVideo
+    ? assetCandidates.find((asset) =>
+        getVideoContentType(
+          asset.contentType,
+          asset.filename ?? asset.url,
+        ),
+      )
+    : prefersImage
+      ? assetCandidates.find((asset) =>
+          isImageDescriptor(asset.contentType, asset.filename, asset.url),
+        )
+      : null
+
   return (
+    matchingCandidate ??
     assetCandidates.find((asset) =>
       isImageDescriptor(asset.contentType, asset.filename, asset.url),
     ) ??
@@ -805,11 +829,22 @@ function hasImageArtifact(version: AssetVersion): boolean {
 }
 
 function hasVideoArtifact(version: AssetVersion): boolean {
-  return Boolean(
+  if (
     version.artifactStorageKey &&
+    getVideoContentType(
+      version.artifactContentType,
+      version.artifactFilename,
+    )
+  ) {
+    return true
+  }
+
+  const generatedPreview = version.generatedPreview
+  return Boolean(
+    generatedPreview &&
       getVideoContentType(
-        version.artifactContentType,
-        version.artifactFilename,
+        generatedPreview.contentType,
+        generatedPreview.filename ?? generatedPreview.url,
       ),
   )
 }
@@ -832,7 +867,7 @@ function hasRefinableVideoArtifact(version: AssetVersion): boolean {
 
 function getAssetCardPreviewVersion(asset: Asset): AssetVersion | null {
   return asset.versions.reduce<AssetVersion | null>((latestVersion, version) => {
-    if (!hasImageArtifact(version)) {
+    if (!hasImageArtifact(version) && !hasVideoArtifact(version)) {
       return latestVersion
     }
 
@@ -866,11 +901,10 @@ function getAssetGenerationJob(
   return null
 }
 
-function getImagePreviewUrl(
+function getArtifactPreviewUrl(
   version: AssetVersion,
   previewUrls: Record<string, ArtifactPreviewUrl>,
 ): string | null {
-  const generatedPreviewUrl = version.generatedPreview?.url ?? null
   const previewUrl = previewUrls[version.versionId]
 
   if (
@@ -880,7 +914,27 @@ function getImagePreviewUrl(
     return previewUrl.url
   }
 
-  return generatedPreviewUrl
+  const generatedPreview = version.generatedPreview
+  if (!generatedPreview?.url) {
+    return null
+  }
+
+  if (hasVideoArtifact(version)) {
+    return getVideoContentType(
+      generatedPreview.contentType,
+      generatedPreview.filename ?? generatedPreview.url,
+    )
+      ? generatedPreview.url
+      : null
+  }
+
+  return isImageDescriptor(
+    generatedPreview.contentType,
+    generatedPreview.filename,
+    generatedPreview.url,
+  )
+    ? generatedPreview.url
+    : null
 }
 
 function titleCase(value: string): string {
@@ -1056,7 +1110,11 @@ function mapAssetVersionInput(input: AssetVersionInputDto): VersionInputAsset {
 }
 
 function mapAssetVersion(version: AssetVersionDto): AssetVersion {
-  const generatedPreview = getGeneratedPreview(version.generation_metadata)
+  const generatedPreview = getGeneratedPreview(
+    version.generation_metadata,
+    version.artifact_content_type,
+    version.artifact_filename,
+  )
   const metadataInputAssets = getInputAssetsFromMetadata(
     version.generation_metadata,
   )
@@ -3006,15 +3064,21 @@ function App() {
     }
 
     if (hasVideoArtifact(version)) {
-      const previewUrl = artifactPreviewUrls[version.versionId]
-      const videoPreviewUrl =
-        previewUrl?.storageKey === version.artifactStorageKey
-          ? previewUrl.url
-          : null
-      const videoContentType = getVideoContentType(
-        version.artifactContentType,
-        version.artifactFilename,
+      const videoPreviewUrl = getArtifactPreviewUrl(
+        version,
+        artifactPreviewUrls,
       )
+      const videoContentType =
+        getVideoContentType(
+          version.artifactContentType,
+          version.artifactFilename,
+        ) ??
+        getVideoContentType(
+          version.generatedPreview?.contentType ?? null,
+          version.generatedPreview?.filename ??
+            version.generatedPreview?.url ??
+            null,
+        )
 
       if (
         videoPreviewUrl &&
@@ -4652,11 +4716,31 @@ function App() {
                         const cardPreviewVersion =
                           getAssetCardPreviewVersion(asset)
                         const cardPreviewUrl = cardPreviewVersion
-                          ? getImagePreviewUrl(
+                          ? getArtifactPreviewUrl(
                               cardPreviewVersion,
                               artifactPreviewUrls,
                             )
                           : null
+                        const cardPreviewKind = cardPreviewVersion
+                          ? hasVideoArtifact(cardPreviewVersion)
+                            ? 'video'
+                            : hasImageArtifact(cardPreviewVersion)
+                              ? 'image'
+                              : null
+                          : null
+                        const cardPreviewError = cardPreviewVersion
+                          ? artifactPreviewErrors[cardPreviewVersion.versionId]
+                          : null
+                        const isCardPreviewLoading = cardPreviewVersion
+                          ? Boolean(
+                              artifactPreviewLoadingIds[
+                                cardPreviewVersion.versionId
+                              ] ||
+                                (cardPreviewVersion.artifactStorageKey &&
+                                  !cardPreviewUrl &&
+                                  !cardPreviewError),
+                            )
+                          : false
                         const cardGenerationJob = getAssetGenerationJob(
                           asset,
                           generationJobsByVersionId,
@@ -4672,22 +4756,65 @@ function App() {
                             type="button"
                           >
                             <span
-                              className={`asset-preview ${asset.preview} ${
-                                cardPreviewUrl ? 'has-image' : ''
+                              className={`asset-preview ${
+                                cardPreviewUrl && !cardPreviewError
+                                  ? 'has-media'
+                                  : 'is-empty'
                               }`}
                             >
-                              {cardPreviewUrl ? (
+                              {cardPreviewUrl &&
+                              cardPreviewKind === 'image' &&
+                              !cardPreviewError ? (
                                 <img
                                   alt={`${asset.title} generated asset`}
                                   className="asset-preview-image"
+                                  onError={() =>
+                                    cardPreviewVersion &&
+                                    setArtifactPreviewErrors(
+                                      (currentPreviewErrors) => ({
+                                        ...currentPreviewErrors,
+                                        [cardPreviewVersion.versionId]:
+                                          'Image preview could not be loaded',
+                                      }),
+                                    )
+                                  }
                                   src={cardPreviewUrl}
                                 />
-                              ) : (
+                              ) : cardPreviewUrl &&
+                                cardPreviewKind === 'video' &&
+                                !cardPreviewError ? (
                                 <>
-                                  <span className="preview-band" />
-                                  <span className="preview-copy" />
-                                  <span className="preview-chip" />
+                                  <video
+                                    aria-label={`${asset.title} generated video`}
+                                    className="asset-preview-video"
+                                    muted
+                                    onError={() =>
+                                      cardPreviewVersion &&
+                                      setArtifactPreviewErrors(
+                                        (currentPreviewErrors) => ({
+                                          ...currentPreviewErrors,
+                                          [cardPreviewVersion.versionId]:
+                                            'Video preview could not be loaded',
+                                        }),
+                                      )
+                                    }
+                                    playsInline
+                                    preload="metadata"
+                                    src={cardPreviewUrl}
+                                  />
+                                  <span className="asset-media-badge">Video</span>
                                 </>
+                              ) : (
+                                <span className="asset-preview-state">
+                                  <strong>
+                                    {isCardPreviewLoading
+                                      ? 'Loading output'
+                                      : cardPreviewError
+                                        ? 'Preview unavailable'
+                                        : 'No generated output'}
+                                  </strong>
+                                  <span>{asset.format}</span>
+                                </span>
                               )}
                             </span>
                             <span className="asset-card-body">
