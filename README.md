@@ -110,6 +110,16 @@ CORS_ORIGINS=["http://localhost:5173","http://127.0.0.1:5173"]
 
 The B2 endpoint and region must match the bucket. The application key needs read/write access to media objects; readiness checks also require the `listAllBucketNames` capability.
 
+Before enabling a new video input mode, inspect the live GMI model contract. This is a read-only check and does not submit a paid generation request:
+
+```powershell
+Set-Location backend
+python -m scripts.check_gmi_video_model
+python -m scripts.check_gmi_video_model --model wan2.7-videoedit
+```
+
+The configured `veo-3.1-fast-generate-001` model supports text-to-video and image-to-video, but not video-to-video. At the time of verification, `wan2.7-videoedit` reports an active video model with a required `video` input parameter and video output. Upstream model contracts can change, so run the check again before deployment.
+
 ### 3. Install and migrate the backend
 
 ```powershell

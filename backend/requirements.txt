@@ -4,6 +4,7 @@ sqlalchemy
 alembic
 boto3
 genblaze[gmicloud]
+httpx
 python-multipart
 psycopg[binary]
 pydantic-settings
