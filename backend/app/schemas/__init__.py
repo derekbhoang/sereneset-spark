@@ -25,6 +25,7 @@ from app.schemas.generation_job import (
     VideoAspectRatio,
     VideoGenerationCreate,
     VideoGenerationSubmissionRead,
+    VideoRefinementCreate,
     VideoResolution,
 )
 
@@ -53,5 +54,6 @@ __all__ = [
     "VideoAspectRatio",
     "VideoGenerationCreate",
     "VideoGenerationSubmissionRead",
+    "VideoRefinementCreate",
     "VideoResolution",
 ]

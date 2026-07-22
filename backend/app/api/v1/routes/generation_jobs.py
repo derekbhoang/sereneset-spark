@@ -1,3 +1,4 @@
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -69,6 +70,7 @@ from app.services.video_validation import (
     VideoContentValidationError,
     validate_mp4_contents,
 )
+from app.services.video_refinement import VIDEO_REFINEMENT_CONTRACT
 
 
 router = APIRouter(tags=["generation-jobs"])
@@ -154,6 +156,23 @@ class ResolvedVideoSource:
                 else None
             ),
         }
+
+
+@dataclass(frozen=True)
+class LockedVideoRefinementAsset:
+    asset: Asset
+    latest_version: AssetVersion | None
+    generation_jobs: tuple[GenerationJob, ...]
+
+
+@dataclass(frozen=True)
+class ValidatedVideoRefinementSource:
+    version: AssetVersion
+    storage_key: str
+    filename: str
+    content_type: str
+    size_bytes: int
+    sha256: str
 
 
 def metadata_dict(value: object) -> dict[str, object]:
@@ -395,6 +414,52 @@ def get_campaign_or_404(campaign_id: uuid.UUID, db: Session) -> Campaign:
     return campaign
 
 
+def get_video_asset_for_refinement(
+    *,
+    asset_id: uuid.UUID,
+    db: Session,
+) -> LockedVideoRefinementAsset:
+    statement = (
+        select(Asset)
+        .options(
+            selectinload(Asset.campaign),
+            selectinload(Asset.versions).selectinload(
+                AssetVersion.generation_job
+            ),
+        )
+        .where(Asset.id == asset_id)
+        .with_for_update(of=Asset)
+    )
+    asset = db.scalar(statement)
+    if asset is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Asset not found",
+        )
+
+    if asset.format != AssetFormat.video_concept:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Only video concept assets can be refined",
+        )
+
+    latest_version = max(
+        asset.versions,
+        key=lambda version: version.version_number,
+        default=None,
+    )
+    generation_jobs = tuple(
+        version.generation_job
+        for version in asset.versions
+        if version.generation_job is not None
+    )
+    return LockedVideoRefinementAsset(
+        asset=asset,
+        latest_version=latest_version,
+        generation_jobs=generation_jobs,
+    )
+
+
 def get_source_version_or_404(
     *,
     campaign_id: uuid.UUID,
@@ -450,9 +515,10 @@ def get_source_version_or_404(
 def source_version_sha256(source_version: AssetVersion) -> str | None:
     metadata = source_version.generation_metadata or {}
     artifact_flow = metadata_dict(metadata.get("artifact_flow"))
-    source_sha256 = optional_string(artifact_flow.get("source_sha256"))
-    if source_sha256:
-        return source_sha256
+    for field_name in ("source_sha256", "sha256"):
+        artifact_sha256 = optional_string(artifact_flow.get(field_name))
+        if artifact_sha256:
+            return artifact_sha256
 
     for asset in metadata_list(metadata.get("assets")):
         sha256 = optional_string(asset.get("sha256"))
@@ -460,6 +526,107 @@ def source_version_sha256(source_version: AssetVersion) -> str | None:
             return sha256
 
     return None
+
+
+def validate_latest_video_refinement_version(
+    *,
+    locked_asset: LockedVideoRefinementAsset,
+    expected_latest_version_id: uuid.UUID,
+    settings: Settings,
+) -> ValidatedVideoRefinementSource:
+    latest_version = locked_asset.latest_version
+    if latest_version is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Video asset does not have a version to refine",
+        )
+
+    if latest_version.id != expected_latest_version_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Video asset has a newer version; refresh before refining",
+        )
+
+    generation_job = latest_version.generation_job
+    if (
+        generation_job is not None
+        and generation_job.status != GenerationJobStatus.succeeded.value
+    ):
+        if generation_job.status in {
+            GenerationJobStatus.queued.value,
+            GenerationJobStatus.running.value,
+        }:
+            detail = "Latest video version is still generating"
+        else:
+            detail = (
+                "Latest video generation did not succeed; retry it before refining"
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=detail,
+        )
+
+    storage_key = optional_string(latest_version.artifact_storage_key)
+    if storage_key is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Latest video version does not have a stored artifact",
+        )
+
+    filename = optional_string(latest_version.artifact_filename)
+    if filename is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Latest video artifact does not have a filename",
+        )
+
+    content_type = (
+        latest_version.artifact_content_type or ""
+    ).split(";", maxsplit=1)[0].strip().casefold()
+    suffix = PurePosixPath(filename).suffix.casefold()
+    if (
+        content_type not in VIDEO_REFINEMENT_CONTRACT.source_content_types
+        or suffix not in VIDEO_REFINEMENT_CONTRACT.source_suffixes
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Latest video artifact must be an MP4 video",
+        )
+
+    size_bytes = latest_version.artifact_size_bytes
+    if (
+        not isinstance(size_bytes, int)
+        or isinstance(size_bytes, bool)
+        or size_bytes < 1
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Latest video artifact does not have a positive size",
+        )
+    if size_bytes > settings.max_video_source_video_size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Latest video artifact exceeds the configured refinement "
+                "source size limit"
+            ),
+        )
+
+    sha256 = optional_string(source_version_sha256(latest_version))
+    if sha256 is None or re.fullmatch(r"[0-9a-fA-F]{64}", sha256) is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Latest video artifact does not have a valid SHA-256 checksum",
+        )
+
+    return ValidatedVideoRefinementSource(
+        version=latest_version,
+        storage_key=storage_key,
+        filename=filename,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        sha256=sha256.casefold(),
+    )
 
 
 def source_version_input_record(

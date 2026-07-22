@@ -9,6 +9,7 @@ from app.schemas.generation_job import (
     GenerationJobRead,
     VideoAspectRatio,
     VideoGenerationCreate,
+    VideoRefinementCreate,
     VideoResolution,
 )
 
@@ -62,6 +63,71 @@ class VideoGenerationSchemaTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaises(ValidationError):
                     VideoGenerationCreate.model_validate(payload)
+
+    def test_refinement_request_contains_only_prompt_and_version_guard(self) -> None:
+        latest_version_id = uuid.uuid4()
+
+        request = VideoRefinementCreate(
+            prompt="  Preserve the product and move only the background.  ",
+            expected_latest_version_id=latest_version_id,
+        )
+
+        self.assertEqual(
+            request.prompt,
+            "Preserve the product and move only the background.",
+        )
+        self.assertEqual(
+            request.expected_latest_version_id,
+            latest_version_id,
+        )
+        self.assertEqual(
+            set(VideoRefinementCreate.model_json_schema()["properties"]),
+            {"prompt", "expected_latest_version_id"},
+        )
+
+    def test_refinement_request_rejects_missing_or_blank_fields(self) -> None:
+        invalid_payloads = (
+            {"expected_latest_version_id": str(uuid.uuid4())},
+            {
+                "prompt": "",
+                "expected_latest_version_id": str(uuid.uuid4()),
+            },
+            {"prompt": "Move only the background."},
+            {
+                "prompt": "Move only the background.",
+                "expected_latest_version_id": "not-a-uuid",
+            },
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValidationError):
+                    VideoRefinementCreate.model_validate(payload)
+
+    def test_refinement_request_forbids_routing_and_generation_controls(
+        self,
+    ) -> None:
+        base_payload = {
+            "prompt": "Move only the background.",
+            "expected_latest_version_id": str(uuid.uuid4()),
+        }
+        forbidden_fields = {
+            "model": "wan2.7-videoedit",
+            "source_version_id": str(uuid.uuid4()),
+            "source_brand_asset_id": str(uuid.uuid4()),
+            "duration_seconds": 4,
+            "aspect_ratio": "16:9",
+            "resolution": "720p",
+            "channel": "Paid social",
+            "title": "A second asset",
+        }
+
+        for field, value in forbidden_fields.items():
+            with self.subTest(field=field):
+                with self.assertRaises(ValidationError):
+                    VideoRefinementCreate.model_validate(
+                        {**base_payload, field: value}
+                    )
 
     def test_job_read_schema_serializes_model_state(self) -> None:
         now = datetime.now(UTC)

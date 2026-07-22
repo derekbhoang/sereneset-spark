@@ -61,6 +61,18 @@ class VideoGenerationCreate(BaseModel):
         return self
 
 
+class VideoRefinementCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    prompt: str = Field(min_length=1)
+    expected_latest_version_id: uuid.UUID = Field(
+        description=(
+            "Latest version shown to the client. The server rejects the request "
+            "if a newer version exists."
+        ),
+    )
+
+
 class GenerationJobRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
