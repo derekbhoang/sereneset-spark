@@ -40,6 +40,8 @@ from app.schemas.generation_job import (
 from app.services.generation import (
     GenerationInputError,
     VIDEO_SOURCE_INPUT_ROLE,
+    VIDEO_PROVENANCE_SCHEMA,
+    VIDEO_PROVENANCE_SCHEMA_VERSION,
     VideoInputMode,
     format_size_limit,
     infer_asset_media_type,
@@ -793,14 +795,26 @@ def build_queued_video_models(
         "progress_percent": 0,
     }
     provenance = {
+        "schema": VIDEO_PROVENANCE_SCHEMA,
+        "schema_version": VIDEO_PROVENANCE_SCHEMA_VERSION,
         "provider": "gmicloud",
         "model": model,
         "prompt": video_in.prompt,
         "source": "backend_genblaze_video_submission",
+        "input_mode": input_mode.value,
         "generation_parameters": generation_parameters,
         "source_resolution": source_resolution,
+        "source_input_assets": source_inputs,
+        "context_assets": context_assets,
         "input_assets": provenance_inputs,
         "job": job_record,
+        "request": {
+            "input_mode": input_mode.value,
+            "generation_parameters": generation_parameters,
+            "source_resolution": source_resolution,
+            "source_input_assets": source_inputs,
+            "context_assets": context_assets,
+        },
     }
     asset = Asset(
         id=asset_id,
@@ -830,10 +844,13 @@ def build_queued_video_models(
             version_number=1,
         ),
         generation_metadata={
+            "provenance_schema": VIDEO_PROVENANCE_SCHEMA,
+            "provenance_schema_version": VIDEO_PROVENANCE_SCHEMA_VERSION,
             "provider": "gmicloud",
             "model": model,
             "prompt": video_in.prompt,
             "source": "backend_genblaze_video_submission",
+            "input_mode": input_mode.value,
             "generation_parameters": generation_parameters,
             "source_resolution": source_resolution,
             "input_assets": provenance_inputs,

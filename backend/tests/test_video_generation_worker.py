@@ -1,3 +1,4 @@
+import json
 import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -36,6 +37,7 @@ from app.workers.video_generation import (
     select_durable_video_artifact,
     store_video_artifact,
     upload_video_provenance_sidecar,
+    validate_video_execution_provenance,
     video_provider_parameters,
 )
 
@@ -99,12 +101,32 @@ def make_job(
     return job
 
 
-def make_result() -> GenerationResult:
+def make_result(
+    *,
+    model: str = "Veo3-Fast",
+    prompt: str = "Orbit around the product.",
+    input_mode: str | None = None,
+    input_assets_parameter: str | None = None,
+    provider_source_parameter: str | None = None,
+    extra_metadata: dict[str, object] | None = None,
+    manifest_uri: str = "b2://bucket/run/manifest.json",
+) -> GenerationResult:
+    genblaze_metadata: dict[str, object] = {
+        "modality": "video",
+        "asset_count": 1,
+    }
+    if input_mode is not None:
+        genblaze_metadata["input_mode"] = input_mode
+    if input_assets_parameter is not None:
+        genblaze_metadata["input_assets_parameter"] = input_assets_parameter
+    if provider_source_parameter is not None:
+        genblaze_metadata["provider_source_parameter"] = provider_source_parameter
+
     return GenerationResult(
         provider="gmicloud",
-        model="Veo3-Fast",
-        prompt="Orbit around the product.",
-        manifest_uri="b2://bucket/run/manifest.json",
+        model=model,
+        prompt=prompt,
+        manifest_uri=manifest_uri,
         manifest_hash="manifest-hash",
         manifest_verified=True,
         provider_job_id="provider-job-123",
@@ -119,7 +141,8 @@ def make_result() -> GenerationResult:
             )
         ],
         generation_metadata={
-            "genblaze": {"modality": "video", "asset_count": 1}
+            "genblaze": genblaze_metadata,
+            **(extra_metadata or {}),
         },
     )
 
@@ -142,6 +165,12 @@ def make_video_edit_snapshot(
             "aspect_ratio": "16:9",
             "resolution": "720p",
             "input_mode": input_mode,
+            "source_origin": "user_upload",
+            "source_resolution": {
+                "origin": "user_upload",
+                "source_version_id": None,
+                "source_brand_asset_id": None,
+            },
             "source_input_assets": [
                 {
                     "role": "source_creative",
@@ -153,6 +182,11 @@ def make_video_edit_snapshot(
                     "sha256": "b" * 64,
                     "source": "user_upload",
                     "storage_ownership": "asset_version",
+                    "content_validation": {
+                        "container": "mp4",
+                        "video_track_count": 1,
+                        "media_data_box_count": 1,
+                    },
                 }
             ],
             "context_assets": [
@@ -168,9 +202,7 @@ def make_video_edit_snapshot(
         },
         attempt_count=1,
         started_at=datetime(2026, 7, 22, 1, 0, tzinfo=UTC),
-        version_generation_metadata={
-            "source": "backend_genblaze_video_submission"
-        },
+        version_generation_metadata={"source": "backend_genblaze_video_submission"},
     )
 
 
@@ -211,9 +243,7 @@ class VideoGenerationWorkerTests(unittest.TestCase):
 
     def test_claim_statement_uses_postgresql_skip_locked(self) -> None:
         compiled = str(
-            build_video_job_claim_statement().compile(
-                dialect=postgresql.dialect()
-            )
+            build_video_job_claim_statement().compile(dialect=postgresql.dialect())
         )
 
         self.assertIn("FOR UPDATE SKIP LOCKED", compiled)
@@ -362,6 +392,32 @@ class VideoGenerationWorkerTests(unittest.TestCase):
 
         storage.generate_presigned_download_url.assert_not_called()
 
+    def test_rejects_worker_source_provenance_mismatch_before_signing(
+        self,
+    ) -> None:
+        snapshot = make_video_edit_snapshot()
+        snapshot.parameters["source_resolution"] = {
+            "origin": "brand_asset",
+            "source_version_id": None,
+            "source_brand_asset_id": str(uuid.uuid4()),
+        }
+        storage = MagicMock()
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "inconsistent 'source_origin' provenance",
+        ):
+            prepare_video_generation_request(
+                snapshot=snapshot,
+                storage=storage,
+                settings=Settings(
+                    _env_file=None,
+                    GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+                ),
+            )
+
+        storage.generate_presigned_download_url.assert_not_called()
+
     def test_rejects_disabled_video_edit_job_before_signing(self) -> None:
         snapshot = make_video_edit_snapshot()
         storage = MagicMock()
@@ -457,12 +513,21 @@ class VideoGenerationWorkerTests(unittest.TestCase):
     def test_completed_metadata_keeps_inputs_and_omits_signed_urls(self) -> None:
         started_at = datetime(2026, 7, 15, 3, 0, tzinfo=UTC)
         completed_at = started_at + timedelta(minutes=5)
+        source_asset_id = uuid.uuid4()
+        source_version_id = uuid.uuid4()
         source_record = {
             "role": "source_creative",
             "storage_key": "campaigns/source/product.jpg",
             "filename": "product.jpg",
             "content_type": "image/jpeg",
+            "media_kind": "image",
             "size_bytes": 2048,
+            "sha256": "b" * 64,
+            "source": "source_version_artifact",
+            "storage_ownership": "source_asset_version",
+            "source_asset_id": str(source_asset_id),
+            "source_version_id": str(source_version_id),
+            "source_version_number": 3,
         }
         snapshot = VideoJobSnapshot(
             id=uuid.uuid4(),
@@ -478,15 +543,19 @@ class VideoGenerationWorkerTests(unittest.TestCase):
                 "aspect_ratio": "16:9",
                 "resolution": "720p",
                 "input_mode": "image_to_video",
-                "source_version_id": str(uuid.uuid4()),
+                "source_origin": "asset_version",
+                "source_version_id": str(source_version_id),
+                "source_resolution": {
+                    "origin": "asset_version",
+                    "source_version_id": str(source_version_id),
+                    "source_brand_asset_id": None,
+                },
                 "source_input_assets": [source_record],
                 "context_assets": [],
             },
             attempt_count=1,
             started_at=started_at,
-            version_generation_metadata={
-                "provenance": {"source": "submission"}
-            },
+            version_generation_metadata={"provenance": {"source": "submission"}},
         )
         artifact = DurableVideoArtifact(
             storage_key="campaigns/video/artifact/generated.mp4",
@@ -507,8 +576,16 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         )
 
         self.assertEqual(metadata["job"]["status"], "succeeded")
-        self.assertEqual(metadata["provenance_schema_version"], 1)
+        self.assertEqual(metadata["provenance_schema_version"], 2)
+        self.assertEqual(
+            metadata["provenance_schema"],
+            "sereneset.video-generation",
+        )
         self.assertEqual(metadata["input_mode"], "image_to_video")
+        self.assertEqual(
+            metadata["source_resolution"]["source_version_id"],
+            str(source_version_id),
+        )
         self.assertEqual(metadata["input_assets"], [source_record])
         self.assertNotIn("url", metadata["input_assets"][0])
         self.assertEqual(
@@ -531,7 +608,26 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             metadata["sidecar"]["storage_key"],
             sidecar_storage_key,
         )
-        self.assertEqual(metadata["provenance"]["schema_version"], 1)
+        self.assertEqual(metadata["provenance"]["schema_version"], 2)
+        self.assertEqual(
+            metadata["request"]["generation_parameters"],
+            {
+                "duration": 4,
+                "aspect_ratio": "16:9",
+                "resolution": "720p",
+            },
+        )
+        self.assertEqual(
+            metadata["execution"]["parameters"],
+            {
+                "duration": 4,
+                "aspect_ratio": "16:9",
+                "resolution": "720p",
+            },
+        )
+        self.assertFalse(
+            metadata["execution"]["input_routing"]["context_assets_routed_to_provider"]
+        )
         self.assertIn(
             "submission_provenance",
             metadata["provenance"],
@@ -570,6 +666,7 @@ class VideoGenerationWorkerTests(unittest.TestCase):
 
         self.assertEqual(sidecar["campaign"], context.campaign)
         self.assertEqual(sidecar["asset"], context.asset)
+        self.assertEqual(sidecar["schema_version"], 2)
         self.assertEqual(
             sidecar["version"]["generation_metadata"],
             metadata,
@@ -604,6 +701,91 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             upload_args["metadata"]["manifest_hash"],
             "manifest-hash",
         )
+
+    def test_video_edit_provenance_attests_binding_without_signed_url(self) -> None:
+        snapshot = make_video_edit_snapshot()
+        signed_url = "https://s3.example/source.mp4?X-Amz-Signature=secret-token"
+        snapshot.parameters["source_input_assets"][0]["url"] = signed_url
+        result = make_result(
+            model="wan2.7-videoedit",
+            prompt=snapshot.prompt,
+            input_mode="video_to_video",
+            input_assets_parameter="external_inputs",
+            provider_source_parameter="video",
+            extra_metadata={"provider_debug": {"url": signed_url}},
+            manifest_uri=(
+                "https://s3.example/manifest.json?X-Amz-Signature=manifest-secret"
+            ),
+        )
+        artifact = DurableVideoArtifact(
+            storage_key="campaigns/video/artifact/generated.mp4",
+            filename="generated.mp4",
+            content_type="video/mp4",
+            size_bytes=4096,
+            sha256="a" * 64,
+            source_storage_key="sereneset-spark/genblaze/generated.mp4",
+        )
+
+        metadata = build_completed_generation_metadata(
+            snapshot=snapshot,
+            result=result,
+            artifact=artifact,
+            completed_at=datetime(2026, 7, 22, 2, 0, tzinfo=UTC),
+            sidecar_storage_key="campaigns/video/metadata.json",
+        )
+
+        self.assertEqual(metadata["provenance_schema_version"], 2)
+        self.assertEqual(metadata["input_mode"], "video_to_video")
+        self.assertEqual(
+            metadata["source_resolution"],
+            {
+                "origin": "user_upload",
+                "source_version_id": None,
+                "source_brand_asset_id": None,
+            },
+        )
+        self.assertEqual(metadata["execution"]["parameters"], {})
+        routing = metadata["execution"]["input_routing"]
+        self.assertEqual(routing["genblaze_input_parameter"], "external_inputs")
+        self.assertEqual(routing["provider_source_parameter"], "video")
+        self.assertEqual(
+            routing["source_input"]["sha256"],
+            "b" * 64,
+        )
+        self.assertEqual(
+            routing["source_input"]["content_validation"]["container"],
+            "mp4",
+        )
+        self.assertFalse(routing["context_assets_routed_to_provider"])
+        self.assertFalse(routing["temporary_download_url_persisted"])
+        self.assertEqual(
+            metadata["manifest_uri"],
+            "https://s3.example/manifest.json",
+        )
+        self.assertNotIn("url", metadata["assets"][0])
+        serialized_metadata = json.dumps(metadata)
+        self.assertNotIn("X-Amz-Signature", serialized_metadata)
+        self.assertNotIn("secret-token", serialized_metadata)
+        self.assertNotIn("manifest-secret", serialized_metadata)
+
+    def test_rejects_inconsistent_genblaze_provenance_before_storage(self) -> None:
+        snapshot = make_video_edit_snapshot()
+        result = make_result(
+            model="wan2.7-videoedit",
+            prompt=snapshot.prompt,
+            input_mode="image_to_video",
+            input_assets_parameter="external_inputs",
+            provider_source_parameter="video",
+        )
+
+        with self.assertRaisesRegex(
+            GenerationProviderError,
+            "input mode does not match",
+        ):
+            validate_video_execution_provenance(
+                snapshot=snapshot,
+                result=result,
+            )
 
     def test_finalizes_version_and_job_in_one_commit(self) -> None:
         completed_at = datetime(2026, 7, 15, 4, 0, tzinfo=UTC)
@@ -685,9 +867,7 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             content_type="video/mp4",
             size_bytes=500 * 1024 * 1024,
             sha256="a" * 64,
-            source_storage_key=(
-                "sereneset-spark/genblaze/run/generated.mp4"
-            ),
+            source_storage_key=("sereneset-spark/genblaze/run/generated.mp4"),
         )
         destination_key = (
             f"campaigns/{campaign_id}/assets/{asset_id}/versions/"
@@ -737,12 +917,8 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         )
 
         self.assertEqual(storage.delete_object.call_count, 2)
-        storage.delete_object.assert_any_call(
-            key="campaigns/video/artifact.mp4"
-        )
-        storage.delete_object.assert_any_call(
-            key="campaigns/video/metadata.json"
-        )
+        storage.delete_object.assert_any_call(key="campaigns/video/artifact.mp4")
+        storage.delete_object.assert_any_call(key="campaigns/video/metadata.json")
 
     def test_failure_is_safely_persisted(self) -> None:
         failed_at = datetime(2026, 7, 15, 5, 0, tzinfo=UTC)

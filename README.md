@@ -126,6 +126,8 @@ The configured edit model, `wan2.7-videoedit`, reports an active video model wit
 
 The backend has an exact capability entry for `wan2.7-videoedit`. When video-to-video is enabled, the worker revalidates the queued input mode and immutable source metadata, signs the stored B2 MP4 only for the active attempt, then validates the signed input before calling Genblaze. The model spec maps that URL to GMICloud's required `video` payload parameter. The provider payload is restricted to the verified `prompt` and `video` fields; signed URL query strings are not copied into provenance or worker failure metadata.
 
+Completed videos use the `sereneset.video-generation` provenance schema version 2. The record separates the requested controls from the controls actually sent, identifies the source origin and immutable B2 object, attests the Genblaze-to-provider input binding, and records context assets as provenance-only when they were not routed to the provider. The B2 sidecar also includes the output object, SHA-256 values, manifest verification result, provider job ID, worker attempt, and timestamps. Temporary download URLs are excluded; durable storage keys are the public provenance references.
+
 `GENBLAZE_VIDEO_TO_VIDEO_ENABLED` remains an operational opt-in. Set it to `true` for both the API and video worker only after rerunning the model-contract check, then redeploy both processes. An unregistered model, a mismatched `GENBLAZE_VIDEO_EDIT_MODEL`, or a disabled flag still returns `422` before a paid job is queued. The API never silently converts a video to one frame or submits a job that would ignore the video.
 
 ### 3. Install and migrate the backend

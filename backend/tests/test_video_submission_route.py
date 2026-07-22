@@ -153,6 +153,25 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             version.generation_metadata["job"]["id"],
             str(job.id),
         )
+        self.assertEqual(
+            version.generation_metadata["provenance_schema"],
+            "sereneset.video-generation",
+        )
+        self.assertEqual(
+            version.generation_metadata["provenance_schema_version"],
+            2,
+        )
+        provenance = version.generation_metadata["provenance"]
+        self.assertEqual(provenance["schema_version"], 2)
+        self.assertEqual(provenance["input_mode"], "text_to_video")
+        self.assertEqual(
+            provenance["request"]["source_resolution"]["origin"],
+            "none",
+        )
+        self.assertEqual(
+            provenance["request"]["context_assets"],
+            [brand_context],
+        )
         self.assertIn(str(asset.id), version.storage_key)
 
     def test_snapshots_source_version_artifact_without_taking_ownership(self) -> None:
@@ -180,9 +199,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             artifact_filename="product.webp",
             artifact_content_type="application/octet-stream",
             artifact_size_bytes=2048,
-            generation_metadata={
-                "artifact_flow": {"source_sha256": "b" * 64}
-            },
+            generation_metadata={"artifact_flow": {"source_sha256": "b" * 64}},
         )
         source_version.asset = source_asset
 
@@ -461,6 +478,14 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             source_input["content_validation"]["video_track_count"],
             1,
         )
+        queued_provenance = queued_version.generation_metadata["provenance"]
+        self.assertEqual(queued_provenance["input_mode"], "video_to_video")
+        self.assertEqual(
+            queued_provenance["request"]["source_input_assets"][0][
+                "content_validation"
+            ]["container"],
+            "mp4",
+        )
         self.assertEqual(len(queued_version.inputs), 1)
         version_input = queued_version.inputs[0]
         self.assertEqual(version_input.media_kind, "video")
@@ -517,9 +542,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             submit_video_generation_with_upload(
                 campaign_id=campaign_id,
-                payload=video_request(
-                    model="wan2.7-videoedit"
-                ).model_dump_json(),
+                payload=video_request(model="wan2.7-videoedit").model_dump_json(),
                 file=upload,
                 db=db,
                 settings=settings(),
@@ -554,17 +577,14 @@ class VideoSubmissionRouteTests(unittest.TestCase):
                 return_value=VideoInputMode.video_to_video,
             ),
             patch(
-                "app.api.v1.routes.generation_jobs."
-                "campaign_brand_context_assets",
+                "app.api.v1.routes.generation_jobs.campaign_brand_context_assets",
                 return_value=[],
             ),
         ):
             with self.assertRaises(HTTPException) as raised:
                 submit_video_generation_with_upload(
                     campaign_id=campaign_id,
-                    payload=video_request(
-                        model="wan2.7-videoedit"
-                    ).model_dump_json(),
+                    payload=video_request(model="wan2.7-videoedit").model_dump_json(),
                     file=uploaded_video(body),
                     db=db,
                     settings=settings(),
@@ -603,18 +623,15 @@ class VideoSubmissionRouteTests(unittest.TestCase):
 
         with (
             patch(
-                "app.api.v1.routes.generation_jobs."
-                "get_source_brand_asset_link_or_404",
+                "app.api.v1.routes.generation_jobs.get_source_brand_asset_link_or_404",
                 return_value=object(),
             ),
             patch(
-                "app.api.v1.routes.generation_jobs."
-                "campaign_brand_asset_input_record",
+                "app.api.v1.routes.generation_jobs.campaign_brand_asset_input_record",
                 return_value=source_record,
             ),
             patch(
-                "app.api.v1.routes.generation_jobs."
-                "campaign_brand_context_assets",
+                "app.api.v1.routes.generation_jobs.campaign_brand_context_assets",
                 return_value=[],
             ) as context_assets,
             patch(
@@ -667,9 +684,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as raised:
             submit_video_generation(
                 campaign_id=campaign_id,
-                video_in=video_request(
-                    model="Kling-Image2Video-V2.1-Master"
-                ),
+                video_in=video_request(model="Kling-Image2Video-V2.1-Master"),
                 db=db,
                 settings=settings(),
             )
@@ -797,9 +812,9 @@ class VideoSubmissionRouteTests(unittest.TestCase):
 
         self.assertIn("202", operation["responses"])
         self.assertEqual(
-            operation["responses"]["202"]["content"]["application/json"][
-                "schema"
-            ]["$ref"],
+            operation["responses"]["202"]["content"]["application/json"]["schema"][
+                "$ref"
+            ],
             "#/components/schemas/VideoGenerationSubmissionRead",
         )
 

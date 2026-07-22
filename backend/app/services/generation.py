@@ -36,6 +36,8 @@ class GenerationInputError(ValueError):
 
 
 GENBLAZE_EXTERNAL_INPUTS_PARAMETER = "external_inputs"
+VIDEO_PROVENANCE_SCHEMA = "sereneset.video-generation"
+VIDEO_PROVENANCE_SCHEMA_VERSION = 2
 GENBLAZE_PIPELINE_RESERVED_PARAMETERS = frozenset(
     {
         "expected_duration_sec",
@@ -86,6 +88,7 @@ INPUT_ASSET_METADATA_KEYS = (
     "brand_asset_type",
     "brand_asset_name",
     "usage_guidance",
+    "content_validation",
 )
 
 

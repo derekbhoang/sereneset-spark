@@ -25,6 +25,9 @@ from app.models.generation_job import (
     GenerationJobStatus,
 )
 from app.services.generation import (
+    GENBLAZE_EXTERNAL_INPUTS_PARAMETER,
+    VIDEO_PROVENANCE_SCHEMA,
+    VIDEO_PROVENANCE_SCHEMA_VERSION,
     GeneratedAsset,
     GenerationConfigurationError,
     GenerationInputError,
@@ -36,6 +39,7 @@ from app.services.generation import (
     is_video_asset,
     optional_string,
     require_video_model_capability,
+    serialize_input_asset,
     validate_video_input_assets,
 )
 from app.services.storage import (
@@ -56,6 +60,17 @@ SessionFactory = Callable[[], Session]
 VIDEO_PROVIDER_PARAMETER_KEYS = ("duration", "aspect_ratio", "resolution")
 MAX_ERROR_MESSAGE_LENGTH = 2000
 HTTP_URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+")
+VIDEO_SOURCE_ORIGINS = frozenset(
+    {"none", "asset_version", "brand_asset", "user_upload"}
+)
+VIDEO_INPUT_SOURCE_ORIGINS = {
+    "source_version_artifact": "asset_version",
+    "campaign_brand_asset": "brand_asset",
+    "user_upload": "user_upload",
+}
+EPHEMERAL_PROVENANCE_URL_KEYS = frozenset(
+    {"url", "download_url", "presigned_url", "signed_url"}
+)
 
 
 class DownloadUrlSigner(Protocol):
@@ -163,9 +178,7 @@ def job_metadata_record(job: GenerationJob) -> dict[str, object | None]:
         "attempt_count": job.attempt_count,
         "error_message": job.error_message,
         "started_at": job.started_at.isoformat() if job.started_at else None,
-        "completed_at": (
-            job.completed_at.isoformat() if job.completed_at else None
-        ),
+        "completed_at": (job.completed_at.isoformat() if job.completed_at else None),
     }
 
 
@@ -253,9 +266,7 @@ def recover_stale_video_jobs(
             job.provider_job_id = None
             if job.attempt_count >= max_attempts:
                 job.status = GenerationJobStatus.failed.value
-                job.error_message = (
-                    "Generation worker stopped before the job completed"
-                )
+                job.error_message = "Generation worker stopped before the job completed"
                 job.completed_at = recovered_at
                 failed += 1
             else:
@@ -301,9 +312,7 @@ def load_running_video_job(
         parameters=copy.deepcopy(job.parameters or {}),
         attempt_count=job.attempt_count,
         started_at=job.started_at,
-        version_generation_metadata=copy.deepcopy(
-            version.generation_metadata or {}
-        ),
+        version_generation_metadata=copy.deepcopy(version.generation_metadata or {}),
     )
 
 
@@ -354,12 +363,161 @@ def job_asset_records(
     if value is None:
         return []
 
-    if not isinstance(value, list) or any(
-        not isinstance(item, dict) for item in value
-    ):
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
         raise GenerationInputError(f"Generation job '{key}' is malformed")
 
     return [copy.deepcopy(item) for item in value]
+
+
+def job_video_input_mode(parameters: dict[str, Any]) -> VideoInputMode:
+    declared_mode_value = optional_string(parameters.get("input_mode"))
+    try:
+        return VideoInputMode(declared_mode_value)
+    except (TypeError, ValueError) as exc:
+        raise GenerationInputError(
+            "Generation job has an invalid video input mode"
+        ) from exc
+
+
+def consistent_provenance_identifier(
+    *values: object,
+    field_name: str,
+) -> str | None:
+    identifiers = [
+        identifier
+        for value in values
+        if (identifier := optional_string(value)) is not None
+    ]
+    if len(set(identifiers)) > 1:
+        raise GenerationInputError(
+            f"Generation job has inconsistent '{field_name}' provenance"
+        )
+
+    return identifiers[0] if identifiers else None
+
+
+def build_video_source_resolution(
+    *,
+    parameters: dict[str, Any],
+    source_inputs: list[dict[str, Any]],
+) -> dict[str, str | None]:
+    raw_resolution = parameters.get("source_resolution")
+    if raw_resolution is None:
+        resolution: dict[str, Any] = {}
+    elif isinstance(raw_resolution, dict):
+        resolution = raw_resolution
+    else:
+        raise GenerationInputError("Generation job source resolution is malformed")
+
+    if len(source_inputs) > 1:
+        raise GenerationInputError(
+            "Generation job has more than one provider source input"
+        )
+
+    source_input = source_inputs[0] if source_inputs else None
+    input_source = (
+        optional_string(source_input.get("source"))
+        if source_input is not None
+        else None
+    )
+    inferred_origin = VIDEO_INPUT_SOURCE_ORIGINS.get(input_source or "")
+    declared_origin = consistent_provenance_identifier(
+        resolution.get("origin"),
+        parameters.get("source_origin"),
+        inferred_origin,
+        field_name="source_origin",
+    )
+    origin = declared_origin or ("none" if source_input is None else None)
+    if origin not in VIDEO_SOURCE_ORIGINS:
+        raise GenerationInputError("Generation job has an invalid source origin")
+    if (origin == "none") != (source_input is None):
+        raise GenerationInputError(
+            "Generation job source origin does not match its stored input"
+        )
+
+    source_version_id = consistent_provenance_identifier(
+        resolution.get("source_version_id"),
+        parameters.get("source_version_id"),
+        source_input.get("source_version_id") if source_input else None,
+        field_name="source_version_id",
+    )
+    source_brand_asset_id = consistent_provenance_identifier(
+        resolution.get("source_brand_asset_id"),
+        parameters.get("source_brand_asset_id"),
+        source_input.get("brand_asset_id") if source_input else None,
+        field_name="source_brand_asset_id",
+    )
+
+    expected_input_provenance = {
+        "asset_version": (
+            "source_version_artifact",
+            "source_asset_version",
+        ),
+        "brand_asset": ("campaign_brand_asset", "brand_asset"),
+        "user_upload": ("user_upload", "asset_version"),
+    }
+    if source_input is not None:
+        expected_source, expected_ownership = expected_input_provenance[origin]
+        if (
+            input_source != expected_source
+            or optional_string(source_input.get("storage_ownership"))
+            != expected_ownership
+        ):
+            raise GenerationInputError(
+                "Generation job source input has inconsistent ownership provenance"
+            )
+
+    if origin == "asset_version":
+        if source_version_id is None or source_brand_asset_id is not None:
+            raise GenerationInputError(
+                "Asset-version video source provenance is incomplete"
+            )
+    elif origin == "brand_asset":
+        if source_brand_asset_id is None or source_version_id is not None:
+            raise GenerationInputError(
+                "Brand-asset video source provenance is incomplete"
+            )
+    elif source_version_id is not None or source_brand_asset_id is not None:
+        raise GenerationInputError(
+            "Video source provenance includes IDs for the wrong source origin"
+        )
+
+    return {
+        "origin": origin,
+        "source_version_id": source_version_id,
+        "source_brand_asset_id": source_brand_asset_id,
+    }
+
+
+def provenance_input_asset_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [copy.deepcopy(serialize_input_asset(record)) for record in records]
+
+
+def provenance_safe_copy(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: provenance_safe_copy(item)
+            for key, item in value.items()
+            if key not in EPHEMERAL_PROVENANCE_URL_KEYS
+        }
+    if isinstance(value, list):
+        return [provenance_safe_copy(item) for item in value]
+    if isinstance(value, str):
+        parsed_url = urlsplit(value)
+        if parsed_url.scheme.casefold() in {"http", "https"} and parsed_url.netloc:
+            return urlunsplit(
+                (
+                    parsed_url.scheme,
+                    parsed_url.netloc,
+                    parsed_url.path,
+                    "",
+                    parsed_url.fragment,
+                )
+            )
+
+    return copy.deepcopy(value)
 
 
 def prepare_source_input_assets(
@@ -425,13 +583,7 @@ def validate_worker_video_input_mode(
     settings: Settings,
     require_download_url: bool,
 ) -> VideoInputMode:
-    declared_mode_value = optional_string(snapshot.parameters.get("input_mode"))
-    try:
-        declared_mode = VideoInputMode(declared_mode_value)
-    except (TypeError, ValueError) as exc:
-        raise GenerationInputError(
-            "Generation job has an invalid video input mode"
-        ) from exc
+    declared_mode = job_video_input_mode(snapshot.parameters)
 
     actual_mode = validate_video_input_assets(
         model=snapshot.model,
@@ -458,6 +610,10 @@ def prepare_video_generation_request(
         "source_input_assets",
     )
     context_assets = job_asset_records(snapshot.parameters, "context_assets")
+    build_video_source_resolution(
+        parameters=snapshot.parameters,
+        source_inputs=source_inputs,
+    )
     validate_worker_video_input_mode(
         snapshot=snapshot,
         source_inputs=source_inputs,
@@ -527,9 +683,7 @@ def select_durable_video_artifact(
     storage_key = normalize_storage_key(artifact.storage_key)
     fallback_filename = PurePosixPath(storage_key).name or "generated-video.mp4"
     try:
-        filename = normalize_artifact_filename(
-            artifact.filename or fallback_filename
-        )
+        filename = normalize_artifact_filename(artifact.filename or fallback_filename)
     except ValueError:
         filename = "generated-video.mp4"
 
@@ -597,13 +751,146 @@ def store_video_artifact(
 
 def generated_asset_metadata(asset: GeneratedAsset) -> dict[str, object | None]:
     return {
-        "url": asset.url,
         "storage_key": asset.storage_key,
         "sha256": asset.sha256,
         "content_type": asset.content_type,
         "size_bytes": asset.size_bytes,
         "filename": asset.filename,
     }
+
+
+def build_video_provider_execution(
+    *,
+    snapshot: VideoJobSnapshot,
+    result: GenerationResult,
+    source_inputs: list[dict[str, Any]],
+    context_assets: list[dict[str, Any]],
+    generation_parameters: dict[str, Any],
+) -> dict[str, Any]:
+    capability = require_video_model_capability(snapshot.model)
+    result_capability = require_video_model_capability(result.model)
+    if result_capability.model_id != capability.model_id:
+        raise GenerationProviderError(
+            "Video generation result model does not match the queued model"
+        )
+    if (
+        result.provider.casefold() != snapshot.provider.casefold()
+        or result.provider.casefold() != capability.provider.casefold()
+    ):
+        raise GenerationProviderError(
+            "Video generation result provider does not match the queued provider"
+        )
+    if result.prompt != snapshot.prompt:
+        raise GenerationProviderError(
+            "Video generation result prompt does not match the queued prompt"
+        )
+
+    input_mode = job_video_input_mode(snapshot.parameters)
+    raw_genblaze = result.generation_metadata.get("genblaze")
+    if raw_genblaze is None:
+        genblaze: dict[str, Any] = {}
+    elif isinstance(raw_genblaze, dict):
+        genblaze = raw_genblaze
+    else:
+        raise GenerationProviderError(
+            "Video generation result contains malformed Genblaze metadata"
+        )
+
+    reported_input_mode = optional_string(genblaze.get("input_mode"))
+    if reported_input_mode is not None and reported_input_mode != input_mode.value:
+        raise GenerationProviderError(
+            "Genblaze input mode does not match the queued video input mode"
+        )
+
+    expected_genblaze_parameter = (
+        GENBLAZE_EXTERNAL_INPUTS_PARAMETER if source_inputs else None
+    )
+    reported_genblaze_parameter = optional_string(
+        genblaze.get("input_assets_parameter")
+    )
+    if (
+        reported_genblaze_parameter is not None
+        and reported_genblaze_parameter != expected_genblaze_parameter
+    ):
+        raise GenerationProviderError(
+            "Genblaze input binding does not match the queued source input"
+        )
+
+    expected_provider_source_parameter = (
+        capability.provider_source_parameter
+        if input_mode == VideoInputMode.video_to_video
+        else None
+    )
+    reported_provider_source_parameter = optional_string(
+        genblaze.get("provider_source_parameter")
+    )
+    if (
+        reported_provider_source_parameter is not None
+        and reported_provider_source_parameter != expected_provider_source_parameter
+    ):
+        raise GenerationProviderError(
+            "Provider source binding does not match the registered model contract"
+        )
+
+    source_binding = (
+        provenance_input_asset_records(source_inputs)[0] if source_inputs else None
+    )
+    return {
+        "provider": result.provider,
+        "requested_model": snapshot.model,
+        "resolved_model": result.model,
+        "provider_job_id": result.provider_job_id,
+        "parameters": generation_parameters,
+        "model_contract": {
+            "model_id": capability.model_id,
+            "provider": capability.provider,
+            "input_requirement": capability.input_requirement.value,
+            "accepted_source_media_kinds": sorted(
+                media_kind.value
+                for media_kind in capability.accepted_source_media_kinds
+            ),
+            "provider_source_parameter": expected_provider_source_parameter,
+            "provider_source_routing_implemented": (
+                capability.provider_source_routing_implemented
+            ),
+        },
+        "input_routing": {
+            "input_mode": input_mode.value,
+            "genblaze_input_parameter": expected_genblaze_parameter,
+            "provider_source_parameter": expected_provider_source_parameter,
+            "source_input": source_binding,
+            "source_input_count": len(source_inputs),
+            "context_asset_count": len(context_assets),
+            "context_assets_routed_to_provider": False,
+            "temporary_download_url_persisted": False,
+        },
+    }
+
+
+def validate_video_execution_provenance(
+    *,
+    snapshot: VideoJobSnapshot,
+    result: GenerationResult,
+) -> None:
+    source_inputs = job_asset_records(
+        snapshot.parameters,
+        "source_input_assets",
+    )
+    context_assets = job_asset_records(snapshot.parameters, "context_assets")
+    build_video_source_resolution(
+        parameters=snapshot.parameters,
+        source_inputs=source_inputs,
+    )
+    build_video_provider_execution(
+        snapshot=snapshot,
+        result=result,
+        source_inputs=source_inputs,
+        context_assets=context_assets,
+        generation_parameters=video_provider_parameters(
+            snapshot.parameters,
+            model=snapshot.model,
+        ),
+    )
 
 
 def build_completed_generation_metadata(
@@ -614,14 +901,40 @@ def build_completed_generation_metadata(
     completed_at: datetime,
     sidecar_storage_key: str | None = None,
 ) -> dict[str, Any]:
-    source_inputs = job_asset_records(snapshot.parameters, "source_input_assets")
-    context_assets = job_asset_records(snapshot.parameters, "context_assets")
+    raw_source_inputs = job_asset_records(
+        snapshot.parameters,
+        "source_input_assets",
+    )
+    raw_context_assets = job_asset_records(
+        snapshot.parameters,
+        "context_assets",
+    )
+    source_resolution = build_video_source_resolution(
+        parameters=snapshot.parameters,
+        source_inputs=raw_source_inputs,
+    )
+    input_mode = job_video_input_mode(snapshot.parameters)
+    source_inputs = provenance_input_asset_records(raw_source_inputs)
+    context_assets = provenance_input_asset_records(raw_context_assets)
     input_assets = [*source_inputs, *context_assets]
+    requested_generation_parameters = {
+        key: snapshot.parameters[key]
+        for key in VIDEO_PROVIDER_PARAMETER_KEYS
+        if snapshot.parameters.get(key) is not None
+    }
     generation_parameters = video_provider_parameters(
         snapshot.parameters,
         model=snapshot.model,
     )
+    provider_execution = build_video_provider_execution(
+        snapshot=snapshot,
+        result=result,
+        source_inputs=raw_source_inputs,
+        context_assets=raw_context_assets,
+        generation_parameters=generation_parameters,
+    )
     asset_records = [generated_asset_metadata(asset) for asset in result.assets]
+    manifest_uri = provenance_safe_copy(result.manifest_uri)
     job_record: dict[str, object | None] = {
         "id": str(snapshot.id),
         "kind": GenerationJobKind.video.value,
@@ -642,9 +955,7 @@ def build_completed_generation_metadata(
         "size_bytes": artifact.size_bytes,
         "source": "genblaze_b2_server_side_copy",
         "storage_strategy": "server_side_copy",
-        "source_storage_key": (
-            artifact.source_storage_key or artifact.storage_key
-        ),
+        "source_storage_key": (artifact.source_storage_key or artifact.storage_key),
         "sha256": artifact.sha256,
         "source_sha256": artifact.sha256,
     }
@@ -652,52 +963,81 @@ def build_completed_generation_metadata(
         "storage_key": sidecar_storage_key,
         "content_type": "application/json",
     }
-    submission_provenance = snapshot.version_generation_metadata.get(
-        "provenance"
-    )
+    submission_provenance = snapshot.version_generation_metadata.get("provenance")
     provenance: dict[str, Any] = {
-        "schema_version": 1,
+        "schema": VIDEO_PROVENANCE_SCHEMA,
+        "schema_version": VIDEO_PROVENANCE_SCHEMA_VERSION,
         "provider": result.provider,
         "model": result.model,
         "prompt": result.prompt,
         "source": "backend_genblaze_video_worker",
         "based_on_version_id": snapshot.parameters.get("source_version_id"),
-        "input_mode": snapshot.parameters.get("input_mode"),
+        "input_mode": input_mode.value,
+        "source_resolution": source_resolution,
         "generation_parameters": generation_parameters,
-        "manifest_uri": result.manifest_uri,
+        "manifest_uri": manifest_uri,
         "manifest_hash": result.manifest_hash,
         "manifest_verified": result.manifest_verified,
         "provider_job_id": result.provider_job_id,
+        "source_input_assets": source_inputs,
+        "context_assets": context_assets,
         "input_assets": input_assets,
         "assets": asset_records,
         "artifact_flow": artifact_flow,
         "sidecar": sidecar_record,
         "job": job_record,
+        "request": {
+            "input_mode": input_mode.value,
+            "generation_parameters": requested_generation_parameters,
+            "source_resolution": source_resolution,
+            "source_input_assets": source_inputs,
+            "context_assets": context_assets,
+        },
+        "execution": provider_execution,
+        "output": {
+            "manifest": {
+                "uri": manifest_uri,
+                "hash": result.manifest_hash,
+                "verified": result.manifest_verified,
+            },
+            "generated_assets": asset_records,
+            "artifact": artifact_flow,
+            "sidecar": sidecar_record,
+        },
         "recorded_at": completed_at.isoformat(),
     }
     if isinstance(submission_provenance, dict):
-        provenance["submission_provenance"] = submission_provenance
+        provenance["submission_provenance"] = provenance_safe_copy(
+            submission_provenance
+        )
 
     return {
-        **snapshot.version_generation_metadata,
-        **copy.deepcopy(result.generation_metadata),
-        "provenance_schema_version": 1,
+        **provenance_safe_copy(snapshot.version_generation_metadata),
+        **provenance_safe_copy(result.generation_metadata),
+        "provenance_schema": VIDEO_PROVENANCE_SCHEMA,
+        "provenance_schema_version": VIDEO_PROVENANCE_SCHEMA_VERSION,
         "provider": result.provider,
         "model": result.model,
         "prompt": result.prompt,
         "source": "backend_genblaze_video_worker",
         "based_on_version_id": snapshot.parameters.get("source_version_id"),
-        "input_mode": snapshot.parameters.get("input_mode"),
+        "input_mode": input_mode.value,
+        "source_resolution": source_resolution,
         "generation_parameters": generation_parameters,
-        "manifest_uri": result.manifest_uri,
+        "manifest_uri": manifest_uri,
         "manifest_hash": result.manifest_hash,
         "manifest_verified": result.manifest_verified,
         "provider_job_id": result.provider_job_id,
+        "source_input_assets": source_inputs,
+        "context_assets": context_assets,
         "input_assets": input_assets,
         "assets": asset_records,
         "artifact_flow": artifact_flow,
         "sidecar": sidecar_record,
         "job": job_record,
+        "request": provenance["request"],
+        "execution": provider_execution,
+        "output": provenance["output"],
         "provenance": provenance,
     }
 
@@ -716,6 +1056,8 @@ def build_video_provenance_sidecar(
         input_assets = []
 
     return {
+        "schema": f"{VIDEO_PROVENANCE_SCHEMA}.sidecar",
+        "schema_version": VIDEO_PROVENANCE_SCHEMA_VERSION,
         "campaign": copy.deepcopy(context.campaign),
         "asset": copy.deepcopy(context.asset),
         "version": {
@@ -820,9 +1162,7 @@ def finalize_video_job_success(
 ) -> bool:
     finished_at = completed_at or utc_now()
     statement = (
-        select(GenerationJob)
-        .where(GenerationJob.id == snapshot.id)
-        .with_for_update()
+        select(GenerationJob).where(GenerationJob.id == snapshot.id).with_for_update()
     )
 
     try:
@@ -922,9 +1262,7 @@ def mark_video_job_failed(
 ) -> bool:
     failed_at = completed_at or utc_now()
     statement = (
-        select(GenerationJob)
-        .where(GenerationJob.id == job_id)
-        .with_for_update()
+        select(GenerationJob).where(GenerationJob.id == job_id).with_for_update()
     )
 
     try:
@@ -964,6 +1302,10 @@ def execute_video_job(
         settings=settings,
     )
     result = generation.generate_video(request)
+    validate_video_execution_provenance(
+        snapshot=snapshot,
+        result=result,
+    )
     generated_artifact = select_durable_video_artifact(
         result,
         max_size_bytes=settings.max_generated_video_size_bytes,
@@ -1148,9 +1490,7 @@ def main() -> None:
         kwargs={
             "session_factory": SessionLocal,
             "stop_event": heartbeat_stop_event,
-            "interval_seconds": (
-                worker_settings.worker_heartbeat_interval_seconds
-            ),
+            "interval_seconds": (worker_settings.worker_heartbeat_interval_seconds),
         },
         name="video-worker-heartbeat",
         daemon=True,

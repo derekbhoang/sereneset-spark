@@ -265,9 +265,7 @@ class VideoGenerationServiceTests(unittest.TestCase):
                 "model": "wan2.7-videoedit",
                 "payload": {
                     "prompt": "Make the background move gently.",
-                    "video": (
-                        "https://example.com/signed-source.mp4?token=secret"
-                    ),
+                    "video": ("https://example.com/signed-source.mp4?token=secret"),
                 },
             },
         )
@@ -294,6 +292,11 @@ class VideoGenerationServiceTests(unittest.TestCase):
                         "size_bytes": 4096,
                         "sha256": "c" * 64,
                         "role": "source_creative",
+                        "content_validation": {
+                            "container": "mp4",
+                            "video_track_count": 1,
+                            "media_data_box_count": 1,
+                        },
                     }
                 ],
             ),
@@ -321,6 +324,12 @@ class VideoGenerationServiceTests(unittest.TestCase):
             json.dumps(result.generation_metadata),
         )
         self.assertNotIn("url", result.generation_metadata["input_assets"][0])
+        self.assertEqual(
+            result.generation_metadata["input_assets"][0]["content_validation"][
+                "container"
+            ],
+            "mp4",
+        )
 
     def test_passes_image_input_and_request_overrides(self) -> None:
         result = self.generate(
