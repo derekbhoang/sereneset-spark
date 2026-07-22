@@ -2733,6 +2733,106 @@ code {
   padding: 7px;
 }
 
+@media (min-width: 1281px) {
+  .app-shell {
+    display: flex;
+    height: 100svh;
+    min-height: 0;
+    overflow: hidden;
+    flex-direction: column;
+  }
+
+  .topbar,
+  .system-banner {
+    flex: 0 0 auto;
+  }
+
+  .workspace {
+    min-height: 0;
+    overflow: hidden;
+    flex: 1 1 auto;
+  }
+
+  .campaign-rail {
+    position: static;
+    top: auto;
+    height: auto;
+    min-height: 0;
+    overscroll-behavior: contain;
+  }
+
+  .campaign-stage {
+    display: grid;
+    min-height: 0;
+    overflow: hidden;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .work-grid {
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .creation-panel,
+  .asset-board,
+  .detail-panel {
+    height: 100%;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-color: #aab9b3 transparent;
+    scrollbar-gutter: stable;
+    scrollbar-width: thin;
+  }
+
+  .creation-panel::-webkit-scrollbar,
+  .asset-board::-webkit-scrollbar,
+  .detail-panel::-webkit-scrollbar {
+    width: 10px;
+  }
+
+  .creation-panel::-webkit-scrollbar-thumb,
+  .asset-board::-webkit-scrollbar-thumb,
+  .detail-panel::-webkit-scrollbar-thumb {
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background: #aab9b3;
+    background-clip: content-box;
+  }
+
+  .creation-panel > .column-toolbar,
+  .asset-board > .board-toolbar,
+  .detail-panel > .panel-heading {
+    position: sticky;
+    top: 0;
+    z-index: 4;
+    margin: -22px -22px 18px;
+    padding: 18px 22px 14px;
+    border-bottom: 1px solid var(--border);
+    box-shadow: 0 8px 14px rgba(21, 28, 32, 0.04);
+  }
+
+  .creation-panel > .column-toolbar {
+    background: rgba(248, 250, 249, 0.97);
+  }
+
+  .asset-board > .board-toolbar {
+    background: rgba(255, 255, 255, 0.97);
+  }
+
+  .detail-panel > .panel-heading {
+    background: rgba(245, 247, 246, 0.97);
+  }
+
+  .creation-panel:focus-visible,
+  .asset-board:focus-visible,
+  .detail-panel:focus-visible {
+    outline: 3px solid rgba(23, 107, 93, 0.22);
+    outline-offset: -3px;
+  }
+}
+
 @media (max-height: 680px) and (min-width: 821px) {
   .asset-preview-stage {
     min-height: 320px;

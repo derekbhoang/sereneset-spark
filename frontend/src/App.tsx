@@ -1281,6 +1281,9 @@ function App() {
   const videoSourceUploadRef = useRef<VideoSourceUpload | null>(null)
   const videoSourceFileInputRef = useRef<HTMLInputElement>(null)
   const brandAssetFileInputRef = useRef<HTMLInputElement>(null)
+  const creationPanelRef = useRef<HTMLElement>(null)
+  const assetBoardRef = useRef<HTMLElement>(null)
+  const detailPanelRef = useRef<HTMLElement>(null)
 
   useEffect(() => {
     let isCancelled = false
@@ -1423,6 +1426,30 @@ function App() {
       ? `${selectedCampaign.name} | SereneSet Spark`
       : 'SereneSet Spark'
   }, [selectedCampaign])
+
+  useEffect(() => {
+    if (creationPanelRef.current) {
+      creationPanelRef.current.scrollTop = 0
+    }
+    if (assetBoardRef.current) {
+      assetBoardRef.current.scrollTop = 0
+    }
+    if (detailPanelRef.current) {
+      detailPanelRef.current.scrollTop = 0
+    }
+  }, [selectedCampaignId])
+
+  useEffect(() => {
+    if (detailPanelRef.current) {
+      detailPanelRef.current.scrollTop = 0
+    }
+  }, [selectedAssetId])
+
+  useEffect(() => {
+    if (assetBoardRef.current) {
+      assetBoardRef.current.scrollTop = 0
+    }
+  }, [channelFilter, statusFilter])
 
   useEffect(() => {
     if (!isCreateCampaignOpen) {
@@ -4765,18 +4792,20 @@ function App() {
               <aside
                 className="creation-panel"
                 aria-label="Campaign context and asset generation"
+                ref={creationPanelRef}
+                tabIndex={0}
               >
+                <div className="panel-heading column-toolbar">
+                  <div>
+                    <span className="eyebrow">Context</span>
+                    <h2 id="brief-heading">Campaign brief</h2>
+                  </div>
+                </div>
+
                 <section
                   className="campaign-context"
                   aria-labelledby="brief-heading"
                 >
-                  <div className="panel-heading">
-                    <div>
-                      <span className="eyebrow">Context</span>
-                      <h2 id="brief-heading">Campaign brief</h2>
-                    </div>
-                  </div>
-
                   <dl className="brief-summary">
                     <div>
                       <dt>Audience</dt>
@@ -5195,6 +5224,8 @@ function App() {
               <section
                 className="asset-board"
                 aria-labelledby="assets-heading"
+                ref={assetBoardRef}
+                tabIndex={0}
               >
                 <div className="board-toolbar">
                   <div>
@@ -5390,7 +5421,12 @@ function App() {
                 )}
               </section>
 
-              <aside className="detail-panel" aria-label="Selected asset">
+              <aside
+                className="detail-panel"
+                aria-label="Selected asset"
+                ref={detailPanelRef}
+                tabIndex={0}
+              >
                 {selectedAsset ? (
                   <>
                     <div className="panel-heading">
