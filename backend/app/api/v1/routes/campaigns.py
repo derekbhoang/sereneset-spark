@@ -3,15 +3,16 @@ import json
 import re
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from shutil import copyfileobj
 from tempfile import NamedTemporaryFile, SpooledTemporaryFile
 from typing import BinaryIO
 from urllib.error import URLError
-from urllib.parse import unquote, urlparse
+from urllib.parse import ParseResult, unquote, urlparse
 from urllib.request import Request, urlopen
 from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile, ZipInfo
 
@@ -41,9 +42,14 @@ from app.services.storage import (
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 MAX_EXPORT_ARTIFACT_SIZE_BYTES = 25 * 1024 * 1024
 DEFAULT_MAX_EXPORTED_VIDEO_SIZE_BYTES = 500 * 1024 * 1024
+DEFAULT_MAX_EXPORTED_VIDEO_INPUT_SIZE_BYTES = 100 * 1024 * 1024
+MAX_EXPORT_METADATA_SIZE_BYTES = 2 * 1024 * 1024
 EXPORT_STREAM_CHUNK_SIZE_BYTES = 1024 * 1024
 EXPORT_SPOOL_MEMORY_LIMIT_BYTES = 1024 * 1024
 VIDEO_ARTIFACT_SUFFIXES = {".m4v", ".mov", ".mp4", ".webm"}
+EPHEMERAL_EXPORT_URL_KEYS = frozenset(
+    {"url", "download_url", "presigned_url", "signed_url"}
+)
 
 
 @dataclass(frozen=True)
@@ -53,6 +59,7 @@ class ExportArtifactReference:
     filename: str | None
     content_type: str | None
     size_bytes: int | None
+    sha256: str | None
     source: str
 
 
@@ -79,6 +86,19 @@ class ExportInputReference:
     brand_asset_type: str | None = None
     brand_asset_name: str | None = None
     usage_guidance: str | None = None
+    content_validation: dict[str, object] | None = None
+
+
+@dataclass(frozen=True)
+class ExportedFileResult:
+    size_bytes: int
+    sha256: str
+    size_verified: bool | None
+    sha256_verified: bool | None
+
+    @property
+    def integrity_verified(self) -> bool:
+        return self.size_verified is True and self.sha256_verified is True
 
 
 @dataclass(frozen=True)
@@ -163,6 +183,70 @@ def safe_export_filename(filename: str | None, fallback: str) -> str:
         return fallback
 
 
+def parse_https_export_url(url: str) -> ParseResult:
+    parsed_url = urlparse(url)
+    if (
+        parsed_url.scheme.lower() != "https"
+        or not parsed_url.hostname
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+    ):
+        raise ValueError("Export source URL must be an HTTPS URL without credentials")
+
+    hostname = parsed_url.hostname.casefold()
+    if (
+        hostname == "localhost"
+        or hostname.endswith(".localhost")
+        or hostname.endswith(".local")
+        or hostname.endswith(".internal")
+    ):
+        raise ValueError("Export source URL must use a public host")
+
+    try:
+        host_address = ip_address(hostname)
+    except ValueError:
+        host_address = None
+
+    if host_address is not None and not host_address.is_global:
+        raise ValueError("Export source URL must use a public host")
+
+    return parsed_url
+
+
+def durable_export_url(url: str | None) -> str | None:
+    if not url:
+        return None
+
+    try:
+        parsed_url = parse_https_export_url(url)
+    except ValueError:
+        return None
+
+    return parsed_url._replace(query="", fragment="").geturl()
+
+
+def sanitize_export_metadata(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: sanitize_export_metadata(item)
+            for key, item in value.items()
+            if not (
+                isinstance(key, str)
+                and key.casefold() in EPHEMERAL_EXPORT_URL_KEYS
+            )
+        }
+
+    if isinstance(value, list):
+        return [sanitize_export_metadata(item) for item in value]
+
+    if isinstance(value, str):
+        parsed_url = urlparse(value)
+        if parsed_url.scheme.lower() in {"http", "https"} and parsed_url.hostname:
+            return parsed_url._replace(query="", fragment="").geturl()
+
+    return value
+
+
 def campaign_brand_asset_links(
     campaign: Campaign,
 ) -> list[CampaignBrandAsset]:
@@ -239,7 +323,7 @@ def build_campaign_brand_asset_manifest(
             "size_bytes": brand_asset.size_bytes,
             "sha256": brand_asset.sha256,
             "tags": brand_asset.tags,
-            "source_url": brand_asset.source_url,
+            "source_url": sanitize_export_metadata(brand_asset.source_url),
             "is_active": brand_asset.is_active,
             "created_at": brand_asset.created_at.isoformat(),
             "updated_at": brand_asset.updated_at.isoformat(),
@@ -317,12 +401,13 @@ def export_input_record(
     *,
     zip_path: str | None = None,
     export_error: str | None = None,
+    exported_file: ExportedFileResult | None = None,
 ) -> dict[str, object]:
     return {
         "id": str(reference.id) if reference.id is not None else None,
         "role": reference.role,
         "storage_key": reference.storage_key,
-        "url": reference.url,
+        "url": durable_export_url(reference.url),
         "filename": reference.filename,
         "content_type": reference.content_type,
         "media_kind": reference.media_kind,
@@ -340,7 +425,25 @@ def export_input_record(
         "brand_asset_type": reference.brand_asset_type,
         "brand_asset_name": reference.brand_asset_name,
         "usage_guidance": reference.usage_guidance,
+        "content_validation": reference.content_validation,
         "zip_path": zip_path,
+        "exported_size_bytes": (
+            exported_file.size_bytes if exported_file is not None else None
+        ),
+        "exported_sha256": (
+            exported_file.sha256 if exported_file is not None else None
+        ),
+        "size_verified": (
+            exported_file.size_verified if exported_file is not None else None
+        ),
+        "sha256_verified": (
+            exported_file.sha256_verified if exported_file is not None else None
+        ),
+        "integrity_verified": (
+            exported_file.integrity_verified
+            if exported_file is not None
+            else False
+        ),
         "export_error": export_error,
     }
 
@@ -355,6 +458,7 @@ def build_campaign_export_manifest(
     metadata_export_errors: dict[uuid.UUID, str],
     artifact_paths: dict[uuid.UUID, str],
     artifact_sources: dict[uuid.UUID, str],
+    artifact_export_results: dict[uuid.UUID, ExportedFileResult],
     artifact_export_errors: dict[uuid.UUID, str],
     input_exports: dict[uuid.UUID, list[dict[str, object]]],
 ) -> dict[str, object]:
@@ -408,11 +512,40 @@ def build_campaign_export_manifest(
                         "artifact_size_bytes": version.artifact_size_bytes,
                         "artifact_zip_path": artifact_paths.get(version.id),
                         "artifact_export_source": artifact_sources.get(version.id),
+                        "artifact_exported_size_bytes": (
+                            artifact_export_results[version.id].size_bytes
+                            if version.id in artifact_export_results
+                            else None
+                        ),
+                        "artifact_exported_sha256": (
+                            artifact_export_results[version.id].sha256
+                            if version.id in artifact_export_results
+                            else None
+                        ),
+                        "artifact_size_verified": (
+                            artifact_export_results[version.id].size_verified
+                            if version.id in artifact_export_results
+                            else None
+                        ),
+                        "artifact_sha256_verified": (
+                            artifact_export_results[version.id].sha256_verified
+                            if version.id in artifact_export_results
+                            else None
+                        ),
+                        "artifact_integrity_verified": (
+                            artifact_export_results[
+                                version.id
+                            ].integrity_verified
+                            if version.id in artifact_export_results
+                            else False
+                        ),
                         "artifact_export_error": artifact_export_errors.get(
                             version.id
                         ),
                         "input_assets": input_exports.get(version.id, []),
-                        "generation_metadata": version.generation_metadata,
+                        "generation_metadata": sanitize_export_metadata(
+                            version.generation_metadata
+                        ),
                     }
                     for version in sorted(
                         asset.versions,
@@ -474,13 +607,15 @@ def build_version_metadata_sidecar(
                     key=lambda item: item.created_at,
                 )
             ],
-            "generation_metadata": version.generation_metadata,
+            "generation_metadata": sanitize_export_metadata(
+                version.generation_metadata
+            ),
         },
         "exported_at": datetime.now(UTC).isoformat(),
     }
 
 
-def encode_pretty_json(data: dict[str, object]) -> bytes:
+def encode_pretty_json(data: object) -> bytes:
     return json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
 
 
@@ -517,6 +652,8 @@ def optional_asset_metadata_list(value: object) -> list[dict[str, object]]:
 
 def asset_version_input_reference(
     version_input: AssetVersionInput,
+    *,
+    content_validation: dict[str, object] | None = None,
 ) -> ExportInputReference:
     return ExportInputReference(
         id=version_input.id,
@@ -556,6 +693,7 @@ def asset_version_input_reference(
         brand_asset_type=version_input.brand_asset_type,
         brand_asset_name=version_input.brand_asset_name,
         usage_guidance=version_input.usage_guidance,
+        content_validation=content_validation,
     )
 
 
@@ -564,6 +702,8 @@ def metadata_input_asset_references(
 ) -> list[ExportInputReference]:
     metadata = version.generation_metadata or {}
     provenance = optional_metadata_dict(metadata.get("provenance"))
+    request = optional_metadata_dict(metadata.get("request"))
+    provenance_request = optional_metadata_dict(provenance.get("request"))
     references: list[ExportInputReference] = []
 
     for source_name, input_items in (
@@ -574,6 +714,40 @@ def metadata_input_asset_references(
         (
             "generation_provenance_input_asset",
             optional_asset_metadata_list(provenance.get("input_assets")),
+        ),
+        (
+            "generation_metadata_source_input_asset",
+            optional_asset_metadata_list(metadata.get("source_input_assets")),
+        ),
+        (
+            "generation_metadata_context_asset",
+            optional_asset_metadata_list(metadata.get("context_assets")),
+        ),
+        (
+            "generation_request_source_input_asset",
+            optional_asset_metadata_list(request.get("source_input_assets")),
+        ),
+        (
+            "generation_request_context_asset",
+            optional_asset_metadata_list(request.get("context_assets")),
+        ),
+        (
+            "generation_provenance_source_input_asset",
+            optional_asset_metadata_list(provenance.get("source_input_assets")),
+        ),
+        (
+            "generation_provenance_context_asset",
+            optional_asset_metadata_list(provenance.get("context_assets")),
+        ),
+        (
+            "generation_provenance_request_source_input_asset",
+            optional_asset_metadata_list(
+                provenance_request.get("source_input_assets")
+            ),
+        ),
+        (
+            "generation_provenance_request_context_asset",
+            optional_asset_metadata_list(provenance_request.get("context_assets")),
         ),
     ):
         for input_item in input_items:
@@ -624,36 +798,60 @@ def metadata_input_asset_references(
                     usage_guidance=optional_string(
                         input_item.get("usage_guidance")
                     ),
+                    content_validation=(
+                        optional_metadata_dict(
+                            input_item.get("content_validation")
+                        )
+                        or None
+                    ),
                 )
             )
 
     return references
 
 
-def input_reference_identity(reference: ExportInputReference) -> tuple[str, str]:
-    if reference.id is not None:
-        return ("id", str(reference.id))
-
+def input_reference_identity(
+    reference: ExportInputReference,
+) -> tuple[str, str, str]:
     if reference.storage_key:
-        return ("storage_key", reference.storage_key)
+        return ("storage_key", reference.storage_key, reference.role or "")
 
     if reference.url:
-        return ("url", reference.url)
+        return ("url", durable_export_url(reference.url) or "", reference.role or "")
 
-    return ("filename", reference.filename or "")
+    if reference.id is not None:
+        return ("id", str(reference.id), reference.role or "")
+
+    return ("filename", reference.filename or "", reference.role or "")
 
 
 def version_input_references(version: AssetVersion) -> list[ExportInputReference]:
     references: list[ExportInputReference] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
+    metadata_references = metadata_input_asset_references(version)
+    metadata_by_identity = {
+        input_reference_identity(reference): reference
+        for reference in metadata_references
+    }
 
     for version_input in sorted(version.inputs, key=lambda item: item.created_at):
-        reference = asset_version_input_reference(version_input)
+        raw_reference = asset_version_input_reference(version_input)
+        metadata_reference = metadata_by_identity.get(
+            input_reference_identity(raw_reference)
+        )
+        reference = (
+            replace(
+                raw_reference,
+                content_validation=metadata_reference.content_validation,
+            )
+            if metadata_reference is not None
+            else raw_reference
+        )
         seen.add(input_reference_identity(reference))
         if reference.storage_key or reference.url:
             references.append(reference)
 
-    for reference in metadata_input_asset_references(version):
+    for reference in metadata_references:
         identity = input_reference_identity(reference)
         if identity in seen:
             continue
@@ -687,6 +885,7 @@ def generated_artifact_references(
                 filename=optional_string(artifact_flow.get("filename")),
                 content_type=optional_string(artifact_flow.get("content_type")),
                 size_bytes=optional_int(artifact_flow.get("size_bytes")),
+                sha256=optional_string(artifact_flow.get("sha256")),
                 source="generation_metadata_artifact_flow",
             )
         )
@@ -697,13 +896,17 @@ def generated_artifact_references(
                 filename=optional_string(artifact_flow.get("filename")),
                 content_type=optional_string(artifact_flow.get("content_type")),
                 size_bytes=None,
+                sha256=optional_string(artifact_flow.get("source_sha256")),
                 source="genblaze_source_artifact",
             )
         )
 
     provenance = optional_metadata_dict(metadata.get("provenance"))
     for source_name, asset_items in (
-        ("generation_metadata_asset", optional_asset_metadata_list(metadata.get("assets"))),
+        (
+            "generation_metadata_asset",
+            optional_asset_metadata_list(metadata.get("assets")),
+        ),
         (
             "generation_provenance_asset",
             optional_asset_metadata_list(provenance.get("assets")),
@@ -723,6 +926,7 @@ def generated_artifact_references(
                     or filename_from_url(url),
                     content_type=optional_string(asset_item.get("content_type")),
                     size_bytes=optional_int(asset_item.get("size_bytes")),
+                    sha256=optional_string(asset_item.get("sha256")),
                     source=source_name,
                 )
             )
@@ -736,12 +940,21 @@ def generated_artifact_references(
 
 def version_artifact_reference(version: AssetVersion) -> ExportArtifactReference | None:
     if version.artifact_storage_key:
+        artifact_flow = optional_metadata_dict(
+            (version.generation_metadata or {}).get("artifact_flow")
+        )
+        artifact_flow_key = optional_string(artifact_flow.get("storage_key"))
         return ExportArtifactReference(
             storage_key=version.artifact_storage_key,
             url=None,
             filename=version.artifact_filename,
             content_type=version.artifact_content_type,
             size_bytes=version.artifact_size_bytes,
+            sha256=(
+                optional_string(artifact_flow.get("sha256"))
+                if artifact_flow_key in {None, version.artifact_storage_key}
+                else None
+            ),
             source="asset_version_artifact",
         )
 
@@ -766,32 +979,12 @@ def safe_artifact_filename(
         return f"artifact-{version.id}"
 
 
-def download_url_bytes(url: str) -> bytes:
-    request = Request(
-        url,
-        headers={"User-Agent": "SereneSet-Spark/1.0"},
-    )
-
-    with urlopen(request, timeout=60) as response:
-        body = response.read(MAX_EXPORT_ARTIFACT_SIZE_BYTES + 1)
-
-    if not body:
-        raise ValueError("Generated artifact URL returned an empty body")
-
-    if len(body) > MAX_EXPORT_ARTIFACT_SIZE_BYTES:
-        raise ValueError("Generated artifact is larger than 25 MB")
-
-    return body
-
-
 def iter_download_url_chunks(
     *,
     url: str,
     max_size_bytes: int,
 ) -> Iterator[bytes]:
-    parsed_url = urlparse(url)
-    if parsed_url.scheme.lower() != "https" or not parsed_url.hostname:
-        raise ValueError("Generated artifact URL must use HTTPS")
+    parse_https_export_url(url)
 
     request = Request(
         url,
@@ -799,6 +992,7 @@ def iter_download_url_chunks(
     )
 
     with urlopen(request, timeout=60) as response:
+        parse_https_export_url(response.geturl())
         raw_content_length = response.headers.get("Content-Length")
         content_length = (
             int(raw_content_length)
@@ -856,28 +1050,108 @@ def is_video_export_artifact(
     return PurePosixPath(filename.lower()).suffix in VIDEO_ARTIFACT_SUFFIXES
 
 
-def iter_artifact_chunks(
+def iter_export_source_chunks(
     *,
     storage: B2StorageService,
-    reference: ExportArtifactReference,
+    storage_key: str | None,
+    url: str | None,
     max_size_bytes: int,
 ) -> Iterator[bytes]:
-    if reference.storage_key:
+    if storage_key:
         yield from storage.iter_download_chunks(
-            key=reference.storage_key,
+            key=storage_key,
             chunk_size_bytes=EXPORT_STREAM_CHUNK_SIZE_BYTES,
             max_size_bytes=max_size_bytes,
         )
         return
 
-    if reference.url:
+    if url:
         yield from iter_download_url_chunks(
-            url=reference.url,
+            url=url,
             max_size_bytes=max_size_bytes,
         )
         return
 
-    raise ValueError("Artifact reference did not include a B2 key or URL")
+    raise ValueError("Export reference did not include a B2 key or URL")
+
+
+def write_chunks_to_zip(
+    *,
+    export_zip: ZipFile,
+    zip_path: str,
+    chunks: Iterator[bytes],
+    compression: int,
+    expected_size_bytes: int | None,
+    expected_sha256: str | None,
+) -> ExportedFileResult:
+    if expected_size_bytes is not None and expected_size_bytes < 1:
+        raise ValueError("Expected export size must be greater than zero")
+
+    expected_checksum = (
+        expected_sha256.strip().lower() if expected_sha256 is not None else None
+    )
+    if expected_checksum is not None and not re.fullmatch(
+        r"[0-9a-f]{64}",
+        expected_checksum,
+    ):
+        raise ValueError("Expected export SHA-256 is invalid")
+
+    with SpooledTemporaryFile(
+        max_size=EXPORT_SPOOL_MEMORY_LIMIT_BYTES,
+        mode="w+b",
+    ) as staged_file:
+        exported_size_bytes = 0
+        exported_checksum = hashlib.sha256()
+        for chunk in chunks:
+            if not isinstance(chunk, bytes):
+                raise ValueError("Export source returned non-binary data")
+
+            staged_file.write(chunk)
+            exported_checksum.update(chunk)
+            exported_size_bytes += len(chunk)
+
+        if exported_size_bytes == 0:
+            raise ValueError("Export source was empty")
+
+        size_verified = (
+            exported_size_bytes == expected_size_bytes
+            if expected_size_bytes is not None
+            else None
+        )
+        if size_verified is False:
+            raise ValueError("Export source size did not match stored metadata")
+
+        exported_sha256 = exported_checksum.hexdigest()
+        sha256_verified = (
+            exported_sha256 == expected_checksum
+            if expected_checksum is not None
+            else None
+        )
+        if sha256_verified is False:
+            raise ValueError("Export source checksum did not match stored metadata")
+
+        staged_file.seek(0)
+        zip_info = ZipInfo(
+            filename=zip_path,
+            date_time=datetime.now(UTC).timetuple()[:6],
+        )
+        zip_info.compress_type = compression
+        zip_info.external_attr = 0o600 << 16
+        zip_info.file_size = exported_size_bytes
+
+        with export_zip.open(zip_info, mode="w") as zip_entry:
+            copyfileobj(
+                staged_file,
+                zip_entry,
+                length=EXPORT_STREAM_CHUNK_SIZE_BYTES,
+            )
+
+    return ExportedFileResult(
+        size_bytes=exported_size_bytes,
+        sha256=exported_sha256,
+        size_verified=size_verified,
+        sha256_verified=sha256_verified,
+    )
 
 
 def write_artifact_to_zip(
@@ -888,7 +1162,7 @@ def write_artifact_to_zip(
     version: AssetVersion,
     reference: ExportArtifactReference,
     max_size_bytes: int,
-) -> None:
+) -> ExportedFileResult:
     if (
         reference.size_bytes is not None
         and reference.size_bytes > max_size_bytes
@@ -897,66 +1171,73 @@ def write_artifact_to_zip(
             "Generated artifact exceeds the configured export size limit"
         )
 
-    with SpooledTemporaryFile(
-        max_size=EXPORT_SPOOL_MEMORY_LIMIT_BYTES,
-        mode="w+b",
-    ) as staged_artifact:
-        downloaded_bytes = 0
-        for chunk in iter_artifact_chunks(
+    return write_chunks_to_zip(
+        export_zip=export_zip,
+        zip_path=zip_path,
+        chunks=iter_export_source_chunks(
             storage=storage,
-            reference=reference,
+            storage_key=reference.storage_key,
+            url=reference.url,
             max_size_bytes=max_size_bytes,
-        ):
-            staged_artifact.write(chunk)
-            downloaded_bytes += len(chunk)
-
-        if downloaded_bytes == 0:
-            raise ValueError("Generated artifact was empty")
-
-        if (
-            reference.size_bytes is not None
-            and downloaded_bytes != reference.size_bytes
-        ):
-            raise ValueError(
-                "Generated artifact size did not match stored metadata"
-            )
-
-        staged_artifact.seek(0)
-        zip_info = ZipInfo(
-            filename=zip_path,
-            date_time=datetime.now(UTC).timetuple()[:6],
-        )
-        zip_info.compress_type = (
+        ),
+        compression=(
             ZIP_STORED
             if is_video_export_artifact(
                 version=version,
                 reference=reference,
             )
             else ZIP_DEFLATED
-        )
-        zip_info.external_attr = 0o600 << 16
-        zip_info.file_size = downloaded_bytes
-
-        with export_zip.open(zip_info, mode="w") as zip_entry:
-            copyfileobj(
-                staged_artifact,
-                zip_entry,
-                length=EXPORT_STREAM_CHUNK_SIZE_BYTES,
-            )
+        ),
+        expected_size_bytes=reference.size_bytes,
+        expected_sha256=reference.sha256,
+    )
 
 
-def download_input_bytes(
+def is_video_export_input(reference: ExportInputReference) -> bool:
+    if (reference.media_kind or "").strip().casefold() == "video":
+        return True
+
+    content_type = (reference.content_type or "").split(";", maxsplit=1)[0]
+    if content_type.strip().casefold().startswith("video/"):
+        return True
+
+    filename = reference.filename or reference.storage_key or filename_from_url(
+        reference.url
+    )
+    return PurePosixPath((filename or "").casefold()).suffix in VIDEO_ARTIFACT_SUFFIXES
+
+
+def write_input_to_zip(
     *,
+    export_zip: ZipFile,
+    zip_path: str,
     storage: B2StorageService,
     reference: ExportInputReference,
-) -> bytes:
-    if reference.storage_key:
-        return storage.download_bytes(key=reference.storage_key)
+    max_non_video_size_bytes: int,
+    max_video_size_bytes: int,
+) -> ExportedFileResult:
+    is_video = is_video_export_input(reference)
+    max_size_bytes = (
+        max_video_size_bytes if is_video else max_non_video_size_bytes
+    )
+    if reference.size_bytes is not None and reference.size_bytes > max_size_bytes:
+        raise StorageObjectTooLargeError(
+            "Input asset exceeds the configured export size limit"
+        )
 
-    if reference.url:
-        return download_url_bytes(reference.url)
-
-    raise ValueError("Input reference did not include a B2 key or URL")
+    return write_chunks_to_zip(
+        export_zip=export_zip,
+        zip_path=zip_path,
+        chunks=iter_export_source_chunks(
+            storage=storage,
+            storage_key=reference.storage_key,
+            url=reference.url,
+            max_size_bytes=max_size_bytes,
+        ),
+        compression=ZIP_STORED if is_video else ZIP_DEFLATED,
+        expected_size_bytes=reference.size_bytes,
+        expected_sha256=reference.sha256,
+    )
 
 
 def make_input_zip_path(
@@ -978,15 +1259,42 @@ def make_input_zip_path(
     )
 
 
+def download_sanitized_metadata_sidecar(
+    *,
+    storage: B2StorageService,
+    storage_key: str,
+) -> bytes:
+    body = b"".join(
+        storage.iter_download_chunks(
+            key=storage_key,
+            chunk_size_bytes=EXPORT_STREAM_CHUNK_SIZE_BYTES,
+            max_size_bytes=MAX_EXPORT_METADATA_SIZE_BYTES,
+        )
+    )
+    parsed_sidecar = json.loads(body.decode("utf-8"))
+    if not isinstance(parsed_sidecar, dict):
+        raise ValueError("Stored metadata sidecar must contain a JSON object")
+
+    return encode_pretty_json(sanitize_export_metadata(parsed_sidecar))
+
+
 def write_campaign_export_zip(
     *,
     campaign: Campaign,
     storage: B2StorageService,
     destination: BinaryIO | str,
     max_video_artifact_size_bytes: int,
+    max_non_video_input_size_bytes: int,
+    max_video_input_size_bytes: int,
 ) -> None:
     if max_video_artifact_size_bytes < 1:
         raise ValueError("Maximum exported video size must be greater than zero")
+    if max_non_video_input_size_bytes < 1:
+        raise ValueError(
+            "Maximum exported non-video input size must be greater than zero"
+        )
+    if max_video_input_size_bytes < 1:
+        raise ValueError("Maximum exported video input size must be greater than zero")
 
     approved_assets = sorted(
         (
@@ -1001,6 +1309,7 @@ def write_campaign_export_zip(
     metadata_export_errors: dict[uuid.UUID, str] = {}
     artifact_paths: dict[uuid.UUID, str] = {}
     artifact_sources: dict[uuid.UUID, str] = {}
+    artifact_export_results: dict[uuid.UUID, ExportedFileResult] = {}
     artifact_export_errors: dict[uuid.UUID, str] = {}
     input_exports: dict[uuid.UUID, list[dict[str, object]]] = {}
     used_input_paths: set[str] = set()
@@ -1067,10 +1376,22 @@ def write_campaign_export_zip(
                 try:
                     export_zip.writestr(
                         metadata_path,
-                        storage.download_bytes(key=version.storage_key),
+                        download_sanitized_metadata_sidecar(
+                            storage=storage,
+                            storage_key=version.storage_key,
+                        ),
                     )
                     metadata_sources[version.id] = "b2_sidecar"
-                except (StorageConfigurationError, BotoCoreError, ClientError):
+                except (
+                    StorageConfigurationError,
+                    BotoCoreError,
+                    ClientError,
+                    OSError,
+                    StorageObjectTooLargeError,
+                    StorageOperationError,
+                    UnicodeDecodeError,
+                    ValueError,
+                ):
                     export_zip.writestr(
                         metadata_path,
                         encode_pretty_json(generated_metadata),
@@ -1097,7 +1418,7 @@ def write_campaign_export_zip(
                             )
                             else MAX_EXPORT_ARTIFACT_SIZE_BYTES
                         )
-                        write_artifact_to_zip(
+                        artifact_export_results[version.id] = write_artifact_to_zip(
                             export_zip=export_zip,
                             zip_path=artifact_path,
                             storage=storage,
@@ -1130,17 +1451,21 @@ def write_campaign_export_zip(
                         used_paths=used_input_paths,
                     )
                     try:
-                        export_zip.writestr(
-                            input_path,
-                            download_input_bytes(
-                                storage=storage,
-                                reference=input_reference,
+                        exported_file = write_input_to_zip(
+                            export_zip=export_zip,
+                            zip_path=input_path,
+                            storage=storage,
+                            reference=input_reference,
+                            max_non_video_size_bytes=(
+                                max_non_video_input_size_bytes
                             ),
+                            max_video_size_bytes=max_video_input_size_bytes,
                         )
                         input_exports.setdefault(version.id, []).append(
                             export_input_record(
                                 input_reference,
                                 zip_path=input_path,
+                                exported_file=exported_file,
                             )
                         )
                     except (
@@ -1148,6 +1473,8 @@ def write_campaign_export_zip(
                         BotoCoreError,
                         ClientError,
                         OSError,
+                        StorageObjectTooLargeError,
+                        StorageOperationError,
                         URLError,
                         ValueError,
                     ):
@@ -1170,6 +1497,7 @@ def write_campaign_export_zip(
             metadata_export_errors=metadata_export_errors,
             artifact_paths=artifact_paths,
             artifact_sources=artifact_sources,
+            artifact_export_results=artifact_export_results,
             artifact_export_errors=artifact_export_errors,
             input_exports=input_exports,
         )
@@ -1184,6 +1512,8 @@ def make_campaign_export_zip(
     campaign: Campaign,
     storage: B2StorageService,
     max_video_artifact_size_bytes: int = DEFAULT_MAX_EXPORTED_VIDEO_SIZE_BYTES,
+    max_non_video_input_size_bytes: int = MAX_EXPORT_ARTIFACT_SIZE_BYTES,
+    max_video_input_size_bytes: int = DEFAULT_MAX_EXPORTED_VIDEO_INPUT_SIZE_BYTES,
 ) -> bytes:
     zip_buffer = BytesIO()
     write_campaign_export_zip(
@@ -1191,6 +1521,8 @@ def make_campaign_export_zip(
         storage=storage,
         destination=zip_buffer,
         max_video_artifact_size_bytes=max_video_artifact_size_bytes,
+        max_non_video_input_size_bytes=max_non_video_input_size_bytes,
+        max_video_input_size_bytes=max_video_input_size_bytes,
     )
     return zip_buffer.getvalue()
 
@@ -1250,6 +1582,12 @@ def export_campaign_pack(
             destination=export_path,
             max_video_artifact_size_bytes=(
                 settings.max_generated_video_size_bytes
+            ),
+            max_non_video_input_size_bytes=(
+                settings.max_video_source_image_size_bytes
+            ),
+            max_video_input_size_bytes=(
+                settings.max_video_source_video_size_bytes
             ),
         )
     except (

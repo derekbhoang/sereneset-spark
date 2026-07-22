@@ -493,6 +493,12 @@ def main() -> None:
                 storage=storage,
                 destination=str(export_path),
                 max_video_artifact_size_bytes=(settings.max_generated_video_size_bytes),
+                max_non_video_input_size_bytes=(
+                    settings.max_video_source_image_size_bytes
+                ),
+                max_video_input_size_bytes=(
+                    settings.max_video_source_video_size_bytes
+                ),
             )
 
     print("Seed complete")

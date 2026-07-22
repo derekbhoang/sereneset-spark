@@ -4,6 +4,7 @@ import unittest
 import uuid
 from datetime import UTC, datetime
 from io import BytesIO
+from unittest.mock import patch
 from zipfile import ZIP_STORED, ZipFile
 
 from app.api.v1.routes.campaigns import make_campaign_export_zip
@@ -253,6 +254,40 @@ class CampaignVideoExportTests(unittest.TestCase):
                 created_at=datetime.now(UTC),
             )
         ]
+        content_validation = {
+            "container": "mp4",
+            "video_track_count": 1,
+            "validated_at": datetime.now(UTC).isoformat(),
+        }
+        metadata_input = {
+            "role": "source_creative",
+            "storage_key": source_storage_key,
+            "filename": "source.mp4",
+            "content_type": "video/mp4",
+            "media_kind": "video",
+            "size_bytes": len(source_body),
+            "sha256": hashlib.sha256(source_body).hexdigest(),
+            "source": "source_version_artifact",
+            "storage_ownership": "source_asset_version",
+            "source_asset_id": str(source_asset_id),
+            "source_version_id": str(source_version_id),
+            "source_version_number": 2,
+            "content_validation": content_validation,
+        }
+        version.generation_metadata = {
+            "artifact_flow": {
+                "storage_key": version.artifact_storage_key,
+                "size_bytes": len(video_body),
+                "sha256": hashlib.sha256(video_body).hexdigest(),
+            },
+            "input_assets": [metadata_input],
+            "source_input_assets": [metadata_input],
+            "provenance": {
+                "schema_version": 2,
+                "input_assets": [metadata_input],
+                "request": {"source_input_assets": [metadata_input]},
+            },
+        }
         storage = StubStorage(
             {
                 version.storage_key: b'{"stored":true}',
@@ -277,15 +312,315 @@ class CampaignVideoExportTests(unittest.TestCase):
             input_record = manifest["assets"][0]["versions"][0][
                 "input_assets"
             ][0]
+            version_record = manifest["assets"][0]["versions"][0]
+            input_path = input_record["zip_path"]
+            input_info = export_zip.getinfo(input_path)
+            exported_source = export_zip.read(input_path)
 
         self.assertEqual(exported_video, video_body)
+        self.assertEqual(exported_source, source_body)
         self.assertEqual(artifact_info.compress_type, ZIP_STORED)
-        self.assertEqual(storage.streams, [version.artifact_storage_key])
+        self.assertEqual(input_info.compress_type, ZIP_STORED)
+        self.assertEqual(
+            storage.streams,
+            [
+                version.storage_key,
+                version.artifact_storage_key,
+                source_storage_key,
+            ],
+        )
         self.assertNotIn(version.artifact_storage_key, storage.downloads)
+        self.assertNotIn(source_storage_key, storage.downloads)
+        self.assertEqual(
+            len(manifest["assets"][0]["versions"][0]["input_assets"]),
+            1,
+        )
         self.assertEqual(input_record["media_kind"], "video")
         self.assertEqual(input_record["source_asset_id"], str(source_asset_id))
         self.assertEqual(input_record["source_version_id"], str(source_version_id))
         self.assertEqual(input_record["source_version_number"], 2)
+        self.assertEqual(input_record["content_validation"], content_validation)
+        self.assertEqual(input_record["exported_size_bytes"], len(source_body))
+        self.assertEqual(
+            input_record["exported_sha256"],
+            hashlib.sha256(source_body).hexdigest(),
+        )
+        self.assertTrue(input_record["size_verified"])
+        self.assertTrue(input_record["sha256_verified"])
+        self.assertTrue(input_record["integrity_verified"])
+        self.assertEqual(
+            version_record["artifact_exported_sha256"],
+            hashlib.sha256(video_body).hexdigest(),
+        )
+        self.assertTrue(version_record["artifact_size_verified"])
+        self.assertTrue(version_record["artifact_sha256_verified"])
+        self.assertTrue(version_record["artifact_integrity_verified"])
+
+    def test_omits_video_input_when_its_checksum_does_not_match(self) -> None:
+        output_body = b"generated-video"
+        source_body = b"corrupted-source-video"
+        campaign = make_campaign()
+        version = add_approved_video(campaign=campaign, body=output_body)
+        source_storage_key = f"campaigns/{campaign.id}/source.mp4"
+        version.inputs = [
+            AssetVersionInput(
+                id=uuid.uuid4(),
+                asset_version_id=version.id,
+                role="source_creative",
+                storage_key=source_storage_key,
+                filename="source.mp4",
+                content_type="video/mp4",
+                media_kind="video",
+                size_bytes=len(source_body),
+                sha256=hashlib.sha256(b"expected-source-video").hexdigest(),
+                source="user_upload",
+                storage_ownership="asset_version",
+                created_at=datetime.now(UTC),
+            )
+        ]
+        storage = StubStorage(
+            {
+                version.storage_key: b'{"stored":true}',
+                version.artifact_storage_key: output_body,
+                source_storage_key: source_body,
+            }
+        )
+
+        archive = make_campaign_export_zip(
+            campaign=campaign,
+            storage=storage,
+            max_video_artifact_size_bytes=len(output_body),
+        )
+
+        with ZipFile(BytesIO(archive)) as export_zip:
+            manifest = json.loads(export_zip.read("manifest.json"))
+            input_record = manifest["assets"][0]["versions"][0][
+                "input_assets"
+            ][0]
+            exported_inputs = [
+                name for name in export_zip.namelist() if name.startswith("inputs/")
+            ]
+
+        self.assertEqual(exported_inputs, [])
+        self.assertIsNone(input_record["zip_path"])
+        self.assertFalse(input_record["integrity_verified"])
+        self.assertIsNotNone(input_record["export_error"])
+        self.assertIn(source_storage_key, storage.streams)
+
+    def test_rejects_oversized_video_input_before_downloading_it(self) -> None:
+        output_body = b"generated-video"
+        source_body = b"source-video-that-is-over-the-test-limit"
+        campaign = make_campaign()
+        version = add_approved_video(campaign=campaign, body=output_body)
+        source_storage_key = f"campaigns/{campaign.id}/source.mp4"
+        version.inputs = [
+            AssetVersionInput(
+                id=uuid.uuid4(),
+                asset_version_id=version.id,
+                role="source_creative",
+                storage_key=source_storage_key,
+                filename="source.mp4",
+                content_type="video/mp4",
+                media_kind="video",
+                size_bytes=len(source_body),
+                sha256=hashlib.sha256(source_body).hexdigest(),
+                source="user_upload",
+                storage_ownership="asset_version",
+                created_at=datetime.now(UTC),
+            )
+        ]
+        storage = StubStorage(
+            {
+                version.storage_key: b'{"stored":true}',
+                version.artifact_storage_key: output_body,
+                source_storage_key: source_body,
+            }
+        )
+
+        archive = make_campaign_export_zip(
+            campaign=campaign,
+            storage=storage,
+            max_video_artifact_size_bytes=len(output_body),
+            max_video_input_size_bytes=len(source_body) - 1,
+        )
+
+        with ZipFile(BytesIO(archive)) as export_zip:
+            manifest = json.loads(export_zip.read("manifest.json"))
+            input_record = manifest["assets"][0]["versions"][0][
+                "input_assets"
+            ][0]
+
+        self.assertIsNone(input_record["zip_path"])
+        self.assertIsNotNone(input_record["export_error"])
+        self.assertNotIn(source_storage_key, storage.streams)
+
+    def test_omits_generated_artifact_when_its_checksum_does_not_match(
+        self,
+    ) -> None:
+        output_body = b"corrupted-generated-video"
+        campaign = make_campaign()
+        version = add_approved_video(campaign=campaign, body=output_body)
+        version.generation_metadata = {
+            "artifact_flow": {
+                "storage_key": version.artifact_storage_key,
+                "sha256": hashlib.sha256(b"expected-generated-video").hexdigest(),
+            }
+        }
+        storage = StubStorage(
+            {
+                version.storage_key: b'{"stored":true}',
+                version.artifact_storage_key: output_body,
+            }
+        )
+
+        archive = make_campaign_export_zip(
+            campaign=campaign,
+            storage=storage,
+            max_video_artifact_size_bytes=len(output_body),
+        )
+
+        with ZipFile(BytesIO(archive)) as export_zip:
+            manifest = json.loads(export_zip.read("manifest.json"))
+            version_record = manifest["assets"][0]["versions"][0]
+            exported_artifacts = [
+                name
+                for name in export_zip.namelist()
+                if name.startswith("artifacts/")
+            ]
+
+        self.assertEqual(exported_artifacts, [])
+        self.assertIsNone(version_record["artifact_zip_path"])
+        self.assertIsNotNone(version_record["artifact_export_error"])
+
+    def test_scrubs_temporary_urls_from_manifest_and_stored_sidecar(self) -> None:
+        output_body = b"generated-video"
+        source_body = b"source-video"
+        campaign = make_campaign()
+        version = add_approved_video(campaign=campaign, body=output_body)
+        source_storage_key = f"campaigns/{campaign.id}/source.mp4"
+        source_sha256 = hashlib.sha256(source_body).hexdigest()
+        version.inputs = [
+            AssetVersionInput(
+                id=uuid.uuid4(),
+                asset_version_id=version.id,
+                role="source_creative",
+                storage_key=source_storage_key,
+                filename="source.mp4",
+                content_type="video/mp4",
+                media_kind="video",
+                size_bytes=len(source_body),
+                sha256=source_sha256,
+                source="user_upload",
+                storage_ownership="asset_version",
+                created_at=datetime.now(UTC),
+            )
+        ]
+        signed_url = (
+            "https://s3.example.com/source.mp4?X-Amz-Signature=secret-token"
+        )
+        version.generation_metadata = {
+            "manifest_uri": (
+                "https://s3.example.com/manifest.json?token=secret-token"
+            ),
+            "provider_debug": {"signed_url": signed_url},
+            "input_assets": [
+                {
+                    "role": "source_creative",
+                    "storage_key": source_storage_key,
+                    "url": signed_url,
+                    "filename": "source.mp4",
+                    "content_type": "video/mp4",
+                    "media_kind": "video",
+                    "size_bytes": len(source_body),
+                    "sha256": source_sha256,
+                }
+            ],
+        }
+        storage = StubStorage(
+            {
+                version.storage_key: json.dumps(
+                    version.generation_metadata
+                ).encode("utf-8"),
+                version.artifact_storage_key: output_body,
+                source_storage_key: source_body,
+            }
+        )
+
+        archive = make_campaign_export_zip(
+            campaign=campaign,
+            storage=storage,
+            max_video_artifact_size_bytes=len(output_body),
+        )
+
+        with ZipFile(BytesIO(archive)) as export_zip:
+            manifest_body = export_zip.read("manifest.json").decode("utf-8")
+            manifest = json.loads(manifest_body)
+            version_record = manifest["assets"][0]["versions"][0]
+            sidecar_body = export_zip.read(
+                version_record["metadata_zip_path"]
+            ).decode("utf-8")
+            sidecar = json.loads(sidecar_body)
+
+        self.assertNotIn("secret-token", manifest_body)
+        self.assertNotIn("secret-token", sidecar_body)
+        self.assertEqual(
+            version_record["generation_metadata"]["manifest_uri"],
+            "https://s3.example.com/manifest.json",
+        )
+        self.assertNotIn(
+            "url",
+            version_record["generation_metadata"]["input_assets"][0],
+        )
+        self.assertEqual(
+            sidecar["manifest_uri"],
+            "https://s3.example.com/manifest.json",
+        )
+        self.assertNotIn("signed_url", sidecar["provider_debug"])
+
+    def test_rejects_private_network_input_urls_without_requesting_them(
+        self,
+    ) -> None:
+        output_body = b"generated-video"
+        campaign = make_campaign()
+        version = add_approved_video(campaign=campaign, body=output_body)
+        version.generation_metadata = {
+            "input_assets": [
+                {
+                    "role": "source_creative",
+                    "url": "https://127.0.0.1/internal/source.mp4",
+                    "filename": "source.mp4",
+                    "content_type": "video/mp4",
+                    "media_kind": "video",
+                    "size_bytes": 1024,
+                }
+            ]
+        }
+        storage = StubStorage(
+            {
+                version.storage_key: b'{"stored":true}',
+                version.artifact_storage_key: output_body,
+            }
+        )
+
+        with patch(
+            "app.api.v1.routes.campaigns.urlopen"
+        ) as mocked_urlopen:
+            archive = make_campaign_export_zip(
+                campaign=campaign,
+                storage=storage,
+                max_video_artifact_size_bytes=len(output_body),
+            )
+
+        with ZipFile(BytesIO(archive)) as export_zip:
+            manifest = json.loads(export_zip.read("manifest.json"))
+            input_record = manifest["assets"][0]["versions"][0][
+                "input_assets"
+            ][0]
+
+        mocked_urlopen.assert_not_called()
+        self.assertIsNone(input_record["url"])
+        self.assertIsNone(input_record["zip_path"])
+        self.assertIsNotNone(input_record["export_error"])
 
 
 if __name__ == "__main__":
