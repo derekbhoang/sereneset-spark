@@ -25,7 +25,13 @@ from starlette.background import BackgroundTask
 
 from app.core.config import Settings, get_settings
 from app.db.session import get_db
-from app.models.asset import Asset, AssetVersion, AssetVersionInput, ReviewStatus
+from app.models.asset import (
+    Asset,
+    AssetFormat,
+    AssetVersion,
+    AssetVersionInput,
+    ReviewStatus,
+)
 from app.models.brand_asset import BrandAsset, CampaignBrandAsset
 from app.models.campaign import Campaign
 from app.schemas.campaign import CampaignCreate, CampaignRead, CampaignUpdate
@@ -36,6 +42,10 @@ from app.services.storage import (
     StorageOperationError,
     get_storage_service,
     normalize_artifact_filename,
+)
+from app.services.video_refinement import (
+    VIDEO_REFINEMENT_CONTRACT,
+    VideoGenerationOperation,
 )
 
 
@@ -105,6 +115,23 @@ class ExportedFileResult:
 class ExportBrandAssetResult:
     zip_path: str | None = None
     export_error: str | None = None
+
+
+@dataclass(frozen=True)
+class ExportLineageSnapshot:
+    operation: str
+    based_on_version_id: uuid.UUID | None = None
+    source_input_id: uuid.UUID | None = None
+    source_asset_id: uuid.UUID | None = None
+    source_version_id: uuid.UUID | None = None
+    source_version_number: int | None = None
+    source_storage_key: str | None = None
+    source_filename: str | None = None
+    source_content_type: str | None = None
+    source_size_bytes: int | None = None
+    source_sha256: str | None = None
+    snapshot_verified: bool = False
+    validation_error: str | None = None
 
 
 def get_campaign_or_404(campaign_id: uuid.UUID, db: Session) -> Campaign:
@@ -461,6 +488,7 @@ def build_campaign_export_manifest(
     artifact_export_results: dict[uuid.UUID, ExportedFileResult],
     artifact_export_errors: dict[uuid.UUID, str],
     input_exports: dict[uuid.UUID, list[dict[str, object]]],
+    lineage_snapshots: dict[uuid.UUID, ExportLineageSnapshot],
 ) -> dict[str, object]:
     return {
         "exported_at": datetime.now(UTC).isoformat(),
@@ -543,6 +571,14 @@ def build_campaign_export_manifest(
                             version.id
                         ),
                         "input_assets": input_exports.get(version.id, []),
+                        "export_lineage": build_export_lineage_record(
+                            version=version,
+                            lineage=lineage_snapshots.get(version.id),
+                            metadata_paths=metadata_paths,
+                            artifact_paths=artifact_paths,
+                            artifact_export_results=artifact_export_results,
+                            input_exports=input_exports,
+                        ),
                         "generation_metadata": sanitize_export_metadata(
                             version.generation_metadata
                         ),
@@ -648,6 +684,329 @@ def optional_asset_metadata_list(value: object) -> list[dict[str, object]]:
         return []
 
     return [item for item in value if isinstance(item, dict)]
+
+
+def normalized_content_type(value: str | None) -> str | None:
+    content_type = optional_string(value)
+    if content_type is None:
+        return None
+
+    return content_type.split(";", maxsplit=1)[0].strip().casefold()
+
+
+def version_artifact_sha256(version: AssetVersion) -> str | None:
+    metadata = version.generation_metadata or {}
+    artifact_flow = optional_metadata_dict(metadata.get("artifact_flow"))
+    artifact_flow_key = optional_string(artifact_flow.get("storage_key"))
+    if artifact_flow_key in {None, version.artifact_storage_key}:
+        for field_name in ("source_sha256", "sha256"):
+            checksum = optional_string(artifact_flow.get(field_name))
+            if checksum and re.fullmatch(r"[0-9a-fA-F]{64}", checksum):
+                return checksum.casefold()
+
+    for asset_record in optional_asset_metadata_list(metadata.get("assets")):
+        storage_key = optional_string(asset_record.get("storage_key"))
+        if storage_key != version.artifact_storage_key:
+            continue
+
+        checksum = optional_string(asset_record.get("sha256"))
+        if checksum and re.fullmatch(r"[0-9a-fA-F]{64}", checksum):
+            return checksum.casefold()
+
+    return None
+
+
+def build_video_refinement_export_lineage(
+    *,
+    asset: Asset,
+    version: AssetVersion,
+) -> ExportLineageSnapshot | None:
+    if asset.format != AssetFormat.video_concept:
+        return None
+
+    metadata = version.generation_metadata or {}
+    provenance = optional_metadata_dict(metadata.get("provenance"))
+    request = optional_metadata_dict(metadata.get("request"))
+    provenance_request = optional_metadata_dict(provenance.get("request"))
+    operation = VideoGenerationOperation.refinement.value
+    operation_values = tuple(
+        value
+        for value in (
+            optional_string(metadata.get("operation")),
+            optional_string(provenance.get("operation")),
+            optional_string(request.get("operation")),
+            optional_string(provenance_request.get("operation")),
+        )
+        if value is not None
+    )
+    if operation not in operation_values:
+        return None
+
+    source_inputs = [
+        version_input
+        for version_input in version.inputs
+        if version_input.role == VIDEO_REFINEMENT_CONTRACT.source_role
+        and (
+            version_input.source == "source_version_artifact"
+            or version_input.source_version_id is not None
+        )
+    ]
+    source_input = source_inputs[0] if len(source_inputs) == 1 else None
+    snapshot = ExportLineageSnapshot(
+        operation=operation,
+        source_input_id=source_input.id if source_input is not None else None,
+        source_asset_id=(
+            source_input.source_asset_id if source_input is not None else None
+        ),
+        source_version_id=(
+            source_input.source_version_id if source_input is not None else None
+        ),
+        source_version_number=(
+            source_input.source_version_number if source_input is not None else None
+        ),
+        source_storage_key=(
+            source_input.storage_key if source_input is not None else None
+        ),
+        source_filename=(
+            source_input.filename if source_input is not None else None
+        ),
+        source_content_type=(
+            source_input.content_type if source_input is not None else None
+        ),
+        source_size_bytes=(
+            source_input.size_bytes if source_input is not None else None
+        ),
+        source_sha256=(
+            source_input.sha256.casefold()
+            if source_input is not None and source_input.sha256 is not None
+            else None
+        ),
+    )
+
+    def invalid(detail: str) -> ExportLineageSnapshot:
+        return replace(snapshot, validation_error=detail)
+
+    if any(value != operation for value in operation_values):
+        return invalid("Video refinement operation metadata is inconsistent")
+    if len(source_inputs) != 1:
+        return invalid("Video refinement must have one canonical source snapshot")
+
+    based_on_version = optional_string(metadata.get("based_on_version_id"))
+    if based_on_version is None:
+        return invalid("Video refinement is missing its parent version identifier")
+    try:
+        based_on_version_id = uuid.UUID(based_on_version)
+    except ValueError:
+        return invalid("Video refinement parent version identifier is invalid")
+    snapshot = replace(snapshot, based_on_version_id=based_on_version_id)
+
+    lineage_identifiers = [
+        optional_string(provenance.get("based_on_version_id")),
+        optional_string(request.get("based_on_version_id")),
+        optional_string(provenance_request.get("based_on_version_id")),
+    ]
+    for container in (
+        optional_metadata_dict(metadata.get("source_resolution")),
+        optional_metadata_dict(provenance.get("source_resolution")),
+        optional_metadata_dict(request.get("source_resolution")),
+        optional_metadata_dict(provenance_request.get("source_resolution")),
+    ):
+        lineage_identifiers.append(
+            optional_string(container.get("source_version_id"))
+        )
+    if any(
+        identifier != based_on_version
+        for identifier in lineage_identifiers
+        if identifier is not None
+    ):
+        return invalid("Video refinement parent version metadata is inconsistent")
+
+    parent_version = next(
+        (
+            asset_version
+            for asset_version in asset.versions
+            if asset_version.id == based_on_version_id
+        ),
+        None,
+    )
+    if parent_version is None:
+        return invalid("Video refinement parent version is not part of this asset")
+    if (
+        version.version_number < 2
+        or parent_version.version_number != version.version_number - 1
+    ):
+        return invalid("Video refinement parent must be the previous version")
+    if source_input is None:
+        return invalid("Video refinement source snapshot is missing")
+    if source_input.source != "source_version_artifact":
+        return invalid("Video refinement source snapshot has an invalid origin")
+    if source_input.storage_ownership != "source_asset_version":
+        return invalid("Video refinement source snapshot has invalid ownership")
+    if source_input.source_asset_id != asset.id:
+        return invalid("Video refinement source belongs to a different asset")
+    if source_input.source_version_id != based_on_version_id:
+        return invalid("Video refinement source version does not match its parent")
+    if source_input.source_version_number != parent_version.version_number:
+        return invalid("Video refinement source version number is inconsistent")
+    if source_input.storage_key != parent_version.artifact_storage_key:
+        return invalid("Video refinement source storage key does not match its parent")
+    if source_input.filename != parent_version.artifact_filename:
+        return invalid("Video refinement source filename does not match its parent")
+    if (
+        normalized_content_type(source_input.content_type)
+        != normalized_content_type(parent_version.artifact_content_type)
+    ):
+        return invalid("Video refinement source content type is inconsistent")
+    if source_input.size_bytes != parent_version.artifact_size_bytes:
+        return invalid("Video refinement source size does not match its parent")
+
+    parent_sha256 = version_artifact_sha256(parent_version)
+    if parent_sha256 is None or snapshot.source_sha256 != parent_sha256:
+        return invalid("Video refinement source checksum does not match its parent")
+
+    return replace(snapshot, snapshot_verified=True)
+
+
+def refinement_source_export_error(
+    *,
+    lineage: ExportLineageSnapshot | None,
+    reference: ExportInputReference,
+) -> str | None:
+    if lineage is None or reference.role != VIDEO_REFINEMENT_CONTRACT.source_role:
+        return None
+    if (
+        reference.brand_asset_id is not None
+        and reference.input_source == "campaign_brand_asset"
+    ):
+        return None
+    if not lineage.snapshot_verified:
+        return "Video refinement source was not exported because lineage is invalid"
+
+    reference_sha256 = (
+        reference.sha256.casefold() if reference.sha256 is not None else None
+    )
+    if (
+        reference.storage_key != lineage.source_storage_key
+        or reference.input_source != "source_version_artifact"
+        or reference.storage_ownership != "source_asset_version"
+        or reference.source_asset_id != str(lineage.source_asset_id)
+        or reference.source_version_id != str(lineage.source_version_id)
+        or reference.source_version_number != lineage.source_version_number
+        or reference.filename != lineage.source_filename
+        or normalized_content_type(reference.content_type)
+        != normalized_content_type(lineage.source_content_type)
+        or reference.size_bytes != lineage.source_size_bytes
+        or reference_sha256 != lineage.source_sha256
+    ):
+        return "Video refinement source was not exported because lineage changed"
+
+    return None
+
+
+def build_export_lineage_record(
+    *,
+    version: AssetVersion,
+    lineage: ExportLineageSnapshot | None,
+    metadata_paths: dict[uuid.UUID, str],
+    artifact_paths: dict[uuid.UUID, str],
+    artifact_export_results: dict[uuid.UUID, ExportedFileResult],
+    input_exports: dict[uuid.UUID, list[dict[str, object]]],
+) -> dict[str, object] | None:
+    if lineage is None:
+        return None
+
+    parent_version_id = lineage.based_on_version_id
+    parent_artifact_result = (
+        artifact_export_results.get(parent_version_id)
+        if parent_version_id is not None
+        else None
+    )
+    source_export = None
+    if (
+        lineage.source_storage_key is not None
+        and lineage.source_version_id is not None
+    ):
+        source_export = next(
+            (
+                input_record
+                for input_record in input_exports.get(version.id, [])
+                if input_record.get("storage_key")
+                == lineage.source_storage_key
+                and input_record.get("source_version_id")
+                == str(lineage.source_version_id)
+            ),
+            None,
+        )
+    parent_integrity_verified = bool(
+        parent_artifact_result is not None
+        and parent_artifact_result.integrity_verified
+    )
+    source_integrity_verified = bool(
+        source_export is not None
+        and source_export.get("integrity_verified") is True
+    )
+    errors: list[str] = []
+    if lineage.validation_error is not None:
+        errors.append(lineage.validation_error)
+    if lineage.snapshot_verified and not parent_integrity_verified:
+        errors.append("Parent artifact was not integrity-verified during export")
+    if lineage.snapshot_verified and not source_integrity_verified:
+        source_error = (
+            optional_string(source_export.get("export_error"))
+            if source_export is not None
+            else None
+        )
+        errors.append(
+            source_error
+            or "Refinement source was not integrity-verified during export"
+        )
+
+    return {
+        "operation": lineage.operation,
+        "based_on_version_id": (
+            str(parent_version_id) if parent_version_id is not None else None
+        ),
+        "source_input_id": (
+            str(lineage.source_input_id)
+            if lineage.source_input_id is not None
+            else None
+        ),
+        "source_asset_id": (
+            str(lineage.source_asset_id)
+            if lineage.source_asset_id is not None
+            else None
+        ),
+        "source_version_id": (
+            str(lineage.source_version_id)
+            if lineage.source_version_id is not None
+            else None
+        ),
+        "source_version_number": lineage.source_version_number,
+        "source_storage_key": lineage.source_storage_key,
+        "source_sha256": lineage.source_sha256,
+        "parent_metadata_zip_path": (
+            metadata_paths.get(parent_version_id)
+            if parent_version_id is not None
+            else None
+        ),
+        "parent_artifact_zip_path": (
+            artifact_paths.get(parent_version_id)
+            if parent_version_id is not None
+            else None
+        ),
+        "source_input_zip_path": (
+            source_export.get("zip_path") if source_export is not None else None
+        ),
+        "snapshot_verified": lineage.snapshot_verified,
+        "parent_artifact_integrity_verified": parent_integrity_verified,
+        "source_input_integrity_verified": source_integrity_verified,
+        "integrity_verified": (
+            lineage.snapshot_verified
+            and parent_integrity_verified
+            and source_integrity_verified
+        ),
+        "export_error": "; ".join(errors) if errors else None,
+    }
 
 
 def asset_version_input_reference(
@@ -1304,6 +1663,16 @@ def write_campaign_export_zip(
         ),
         key=lambda asset: (asset.channel, asset.title),
     )
+    lineage_snapshots: dict[uuid.UUID, ExportLineageSnapshot] = {}
+    for asset in approved_assets:
+        for version in asset.versions:
+            lineage = build_video_refinement_export_lineage(
+                asset=asset,
+                version=version,
+            )
+            if lineage is not None:
+                lineage_snapshots[version.id] = lineage
+
     metadata_paths: dict[uuid.UUID, str] = {}
     metadata_sources: dict[uuid.UUID, str] = {}
     metadata_export_errors: dict[uuid.UUID, str] = {}
@@ -1444,6 +1813,19 @@ def write_campaign_export_zip(
                         )
 
                 for input_reference in version_input_references(version):
+                    lineage_error = refinement_source_export_error(
+                        lineage=lineage_snapshots.get(version.id),
+                        reference=input_reference,
+                    )
+                    if lineage_error is not None:
+                        input_exports.setdefault(version.id, []).append(
+                            export_input_record(
+                                input_reference,
+                                export_error=lineage_error,
+                            )
+                        )
+                        continue
+
                     input_path = make_input_zip_path(
                         asset=asset,
                         version=version,
@@ -1500,6 +1882,7 @@ def write_campaign_export_zip(
             artifact_export_results=artifact_export_results,
             artifact_export_errors=artifact_export_errors,
             input_exports=input_exports,
+            lineage_snapshots=lineage_snapshots,
         )
         export_zip.writestr(
             "manifest.json",

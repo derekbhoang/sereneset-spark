@@ -147,6 +147,150 @@ def add_approved_video(
     return version
 
 
+def add_approved_video_refinement(
+    *,
+    campaign: Campaign,
+    parent_body: bytes,
+    refined_body: bytes,
+) -> tuple[AssetVersion, AssetVersion, AssetVersionInput]:
+    now = datetime.now(UTC)
+    asset_id = uuid.uuid4()
+    parent_id = uuid.uuid4()
+    refined_id = uuid.uuid4()
+    parent_sha256 = hashlib.sha256(parent_body).hexdigest()
+    refined_sha256 = hashlib.sha256(refined_body).hexdigest()
+    parent_storage_key = (
+        f"campaigns/{campaign.id}/assets/{asset_id}/versions/v1/artifact/parent.mp4"
+    )
+    refined_storage_key = (
+        f"campaigns/{campaign.id}/assets/{asset_id}/versions/v2/artifact/refined.mp4"
+    )
+    parent = AssetVersion(
+        id=parent_id,
+        asset_id=asset_id,
+        version_number=1,
+        label="Genblaze video 1",
+        prompt="Create the launch video",
+        model="wan2.7-videoedit",
+        provider="gmicloud",
+        storage_key=(
+            f"campaigns/{campaign.id}/assets/{asset_id}/versions/v1/metadata.json"
+        ),
+        artifact_storage_key=parent_storage_key,
+        artifact_filename="parent.mp4",
+        artifact_content_type="video/mp4",
+        artifact_size_bytes=len(parent_body),
+        generation_metadata={
+            "operation": "video_generation",
+            "artifact_flow": {
+                "storage_key": parent_storage_key,
+                "size_bytes": len(parent_body),
+                "sha256": parent_sha256,
+                "source_sha256": parent_sha256,
+            },
+        },
+    )
+    source_input = AssetVersionInput(
+        id=uuid.uuid4(),
+        asset_version_id=refined_id,
+        role="source_creative",
+        storage_key=parent_storage_key,
+        filename="parent.mp4",
+        content_type="video/mp4",
+        media_kind="video",
+        size_bytes=len(parent_body),
+        sha256=parent_sha256,
+        source="source_version_artifact",
+        storage_ownership="source_asset_version",
+        source_asset_id=asset_id,
+        source_version_id=parent_id,
+        source_version_number=1,
+        created_at=now,
+    )
+    source_record = {
+        "role": source_input.role,
+        "storage_key": source_input.storage_key,
+        "filename": source_input.filename,
+        "content_type": source_input.content_type,
+        "media_kind": source_input.media_kind,
+        "size_bytes": source_input.size_bytes,
+        "sha256": source_input.sha256,
+        "source": source_input.source,
+        "storage_ownership": source_input.storage_ownership,
+        "source_asset_id": str(source_input.source_asset_id),
+        "source_version_id": str(source_input.source_version_id),
+        "source_version_number": source_input.source_version_number,
+    }
+    source_resolution = {
+        "origin": "asset_version",
+        "source_version_id": str(parent_id),
+        "source_brand_asset_id": None,
+    }
+    refined = AssetVersion(
+        id=refined_id,
+        asset_id=asset_id,
+        version_number=2,
+        label="Video refinement 2",
+        prompt="Make the background move more slowly",
+        model="wan2.7-videoedit",
+        provider="gmicloud",
+        storage_key=(
+            f"campaigns/{campaign.id}/assets/{asset_id}/versions/v2/metadata.json"
+        ),
+        artifact_storage_key=refined_storage_key,
+        artifact_filename="refined.mp4",
+        artifact_content_type="video/mp4",
+        artifact_size_bytes=len(refined_body),
+        generation_metadata={
+            "operation": "video_refinement",
+            "based_on_version_id": str(parent_id),
+            "source_resolution": source_resolution,
+            "input_assets": [source_record],
+            "artifact_flow": {
+                "storage_key": refined_storage_key,
+                "size_bytes": len(refined_body),
+                "sha256": refined_sha256,
+                "source_sha256": refined_sha256,
+            },
+            "provenance": {
+                "operation": "video_refinement",
+                "based_on_version_id": str(parent_id),
+                "source_resolution": source_resolution,
+                "input_assets": [source_record],
+                "request": {
+                    "operation": "video_refinement",
+                    "based_on_version_id": str(parent_id),
+                    "source_resolution": source_resolution,
+                },
+            },
+            "request": {
+                "operation": "video_refinement",
+                "based_on_version_id": str(parent_id),
+                "source_resolution": source_resolution,
+            },
+        },
+    )
+    parent.inputs = []
+    refined.inputs = [source_input]
+    asset = Asset(
+        id=asset_id,
+        campaign_id=campaign.id,
+        created_at=now,
+        updated_at=now,
+        title="Refined launch video",
+        format=AssetFormat.video_concept,
+        channel="Paid social",
+        status=ReviewStatus.approved,
+        reviewer=None,
+        tags=["video", "refinement"],
+        summary="Approved refined video",
+    )
+    asset.versions = [parent, refined]
+    campaign.assets = [asset]
+    campaign.brand_asset_links = []
+    return parent, refined, source_input
+
+
 class CampaignBrandAssetExportTests(unittest.TestCase):
     def test_exports_one_verified_file_for_multiple_role_attachments(self) -> None:
         body = b"verified-brand-asset"
@@ -227,6 +371,123 @@ class CampaignBrandAssetExportTests(unittest.TestCase):
 
 
 class CampaignVideoExportTests(unittest.TestCase):
+    def test_verifies_and_exports_video_refinement_lineage(self) -> None:
+        parent_body = b"parent-video"
+        refined_body = b"refined-video"
+        campaign = make_campaign()
+        parent, refined, source_input = add_approved_video_refinement(
+            campaign=campaign,
+            parent_body=parent_body,
+            refined_body=refined_body,
+        )
+        storage = StubStorage(
+            {
+                parent.storage_key: b'{"version":1}',
+                parent.artifact_storage_key: parent_body,
+                refined.storage_key: b'{"version":2}',
+                refined.artifact_storage_key: refined_body,
+            }
+        )
+
+        archive = make_campaign_export_zip(
+            campaign=campaign,
+            storage=storage,
+            max_video_artifact_size_bytes=max(
+                len(parent_body),
+                len(refined_body),
+            ),
+        )
+
+        with ZipFile(BytesIO(archive)) as export_zip:
+            manifest = json.loads(export_zip.read("manifest.json"))
+            parent_record, refined_record = manifest["assets"][0]["versions"]
+            lineage = refined_record["export_lineage"]
+            exported_source = export_zip.read(lineage["source_input_zip_path"])
+
+        self.assertIsNone(parent_record["export_lineage"])
+        self.assertEqual(lineage["operation"], "video_refinement")
+        self.assertEqual(lineage["based_on_version_id"], str(parent.id))
+        self.assertEqual(lineage["source_input_id"], str(source_input.id))
+        self.assertEqual(lineage["source_asset_id"], str(parent.asset_id))
+        self.assertEqual(lineage["source_version_id"], str(parent.id))
+        self.assertEqual(lineage["source_version_number"], 1)
+        self.assertEqual(
+            lineage["parent_metadata_zip_path"],
+            parent_record["metadata_zip_path"],
+        )
+        self.assertEqual(
+            lineage["parent_artifact_zip_path"],
+            parent_record["artifact_zip_path"],
+        )
+        self.assertEqual(
+            lineage["source_input_zip_path"],
+            refined_record["input_assets"][0]["zip_path"],
+        )
+        self.assertTrue(lineage["snapshot_verified"])
+        self.assertTrue(lineage["parent_artifact_integrity_verified"])
+        self.assertTrue(lineage["source_input_integrity_verified"])
+        self.assertTrue(lineage["integrity_verified"])
+        self.assertIsNone(lineage["export_error"])
+        self.assertEqual(exported_source, parent_body)
+
+    def test_does_not_export_a_tampered_refinement_source(self) -> None:
+        parent_body = b"parent-video"
+        refined_body = b"refined-video"
+        untrusted_body = b"untrusted-video"
+        campaign = make_campaign()
+        parent, refined, source_input = add_approved_video_refinement(
+            campaign=campaign,
+            parent_body=parent_body,
+            refined_body=refined_body,
+        )
+        untrusted_storage_key = f"campaigns/{campaign.id}/untrusted.mp4"
+        source_input.storage_key = untrusted_storage_key
+        storage = StubStorage(
+            {
+                parent.storage_key: b'{"version":1}',
+                parent.artifact_storage_key: parent_body,
+                refined.storage_key: b'{"version":2}',
+                refined.artifact_storage_key: refined_body,
+                untrusted_storage_key: untrusted_body,
+            }
+        )
+
+        archive = make_campaign_export_zip(
+            campaign=campaign,
+            storage=storage,
+            max_video_artifact_size_bytes=max(
+                len(parent_body),
+                len(refined_body),
+            ),
+        )
+
+        with ZipFile(BytesIO(archive)) as export_zip:
+            manifest = json.loads(export_zip.read("manifest.json"))
+            refined_record = manifest["assets"][0]["versions"][1]
+            lineage = refined_record["export_lineage"]
+            input_paths = [
+                name
+                for name in export_zip.namelist()
+                if name.startswith("inputs/")
+            ]
+
+        self.assertEqual(input_paths, [])
+        self.assertNotIn(untrusted_storage_key, storage.streams)
+        self.assertFalse(lineage["snapshot_verified"])
+        self.assertTrue(lineage["parent_artifact_integrity_verified"])
+        self.assertFalse(lineage["source_input_integrity_verified"])
+        self.assertFalse(lineage["integrity_verified"])
+        self.assertIn("storage key", lineage["export_error"])
+        self.assertTrue(refined_record["artifact_integrity_verified"])
+        self.assertTrue(refined_record["input_assets"])
+        self.assertTrue(
+            all(
+                input_record["zip_path"] is None
+                and "lineage" in input_record["export_error"]
+                for input_record in refined_record["input_assets"]
+            )
+        )
+
     def test_streams_video_into_an_uncompressed_zip_entry(self) -> None:
         video_body = b"video-data" * 220_000
         source_body = b"source-video"

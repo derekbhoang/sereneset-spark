@@ -2527,20 +2527,9 @@ function App() {
                 selectedCampaign.id,
                 videoPayload,
               )
-        const existingJobs =
-          generationJobsCampaignId === selectedCampaign.id
-            ? generationJobsRef.current
-            : []
-        const nextJobs = [
-          submission.job,
-          ...existingJobs.filter((job) => job.id !== submission.job.id),
-        ]
 
         createdAssetDto = submission.asset
-        generationJobsRef.current = nextJobs
-        setGenerationJobsCampaignId(selectedCampaign.id)
-        setGenerationJobs(nextJobs)
-        setGenerationJobsError(null)
+        storeGenerationJob(submission.job, selectedCampaign.id)
       } else {
         const assetPayload: AssetGenerationCreateDto = {
           title: `${requestChannel} ${requestFormat.toLowerCase()} draft`,
@@ -2608,6 +2597,7 @@ function App() {
     generationJobsRef.current = nextJobs
     setGenerationJobsCampaignId(campaignId)
     setGenerationJobs(nextJobs)
+    setGenerationJobsError(null)
   }
 
   async function refreshGenerationJobAsset(job: GenerationJobDto) {
@@ -2667,7 +2657,6 @@ function App() {
         job.id,
       )
       storeGenerationJob(updatedJob)
-      setGenerationJobsError(null)
       await refreshGenerationJobAsset(updatedJob)
     } catch (error) {
       setErrorMessage(getErrorMessage(error))
@@ -2767,7 +2756,6 @@ function App() {
       setSelectedAssetId(refreshedAsset.id)
       setStatusFilter('all')
       storeGenerationJob(submission.job, campaignId)
-      setGenerationJobsError(null)
       setRefinePrompts((currentPrompts) => {
         const nextPrompts = { ...currentPrompts }
         delete nextPrompts[assetId]
