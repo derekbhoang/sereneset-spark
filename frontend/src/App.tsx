@@ -3509,28 +3509,9 @@ function App() {
           </div>
         </div>
 
-        <nav className="top-nav" aria-label="Primary">
-          <a href="#campaigns" aria-current="page">
-            Campaigns
-          </a>
-          <a href="#assets">Assets</a>
-          <a href="#library">Brand library</a>
-          <a href="#exports">Exports</a>
-        </nav>
-
-        <div className="top-actions">
-          <label className="search-field">
-            <span>Search</span>
-            <input type="search" placeholder="Asset, channel, tag" />
-          </label>
-          <button
-            className="button button-secondary"
-            disabled={!selectedCampaign}
-            onClick={downloadCampaignExport}
-            type="button"
-          >
-            Export pack
-          </button>
+        <div className="topbar-context" aria-label="Current campaign">
+          <span>Campaign</span>
+          <strong>{selectedCampaign?.name ?? 'No campaign selected'}</strong>
         </div>
       </header>
 
@@ -4040,10 +4021,10 @@ function App() {
         </div>
       )}
 
-      <div className="workspace" id="campaigns">
+      <div className="workspace">
         <aside className="campaign-rail" aria-label="Campaigns">
           <div className="rail-heading">
-            <span>Campaigns</span>
+            <h2>Campaigns</h2>
             <div className="rail-actions">
               <strong>{isLoadingCampaigns ? '...' : campaigns.length}</strong>
               <button
@@ -4099,9 +4080,6 @@ function App() {
                     <span>{campaign.due}</span>
                     <span>{campaign.owner}</span>
                   </span>
-                  <span className="health-track" aria-hidden="true">
-                    <span style={{ width: `${campaign.health}%` }} />
-                  </span>
                 </a>
 
                 <div className="campaign-menu">
@@ -4147,81 +4125,102 @@ function App() {
         {selectedCampaign ? (
           <main className="campaign-stage">
             <section className="campaign-header" aria-labelledby="campaign-title">
-              <div>
+              <div className="campaign-header-copy">
                 <span className="eyebrow">{selectedCampaign.product}</span>
                 <h1 id="campaign-title">{selectedCampaign.name}</h1>
                 <p>{selectedCampaign.goal}</p>
+                <div className="campaign-header-meta">
+                  <span className="campaign-state-pill">
+                    {selectedCampaign.status}
+                  </span>
+                  <span>{selectedCampaign.owner}</span>
+                  <span>Due {selectedCampaign.due}</span>
+                </div>
               </div>
 
-              <dl className="campaign-stats" aria-label="Campaign status">
-                <div>
-                  <dt>Assets</dt>
-                  <dd>{campaignAssets.length}</dd>
+              <div className="campaign-header-side">
+                <dl className="campaign-stats" aria-label="Campaign status">
+                  <div>
+                    <dt>Assets</dt>
+                    <dd>{campaignAssets.length}</dd>
+                  </div>
+                  <div>
+                    <dt>Approved</dt>
+                    <dd>{approvedCount}</dd>
+                  </div>
+                  <div>
+                    <dt>Brand assets</dt>
+                    <dd>{campaignBrandAssets.length}</dd>
+                  </div>
+                </dl>
+                <div className="campaign-header-actions">
+                  <button
+                    className="button button-tertiary"
+                    onClick={() => setIsBrandAssetModalOpen(true)}
+                    type="button"
+                  >
+                    Manage brand assets
+                  </button>
+                  <button
+                    className="button button-secondary"
+                    onClick={downloadCampaignExport}
+                    type="button"
+                  >
+                    Export pack
+                  </button>
                 </div>
-                <div>
-                  <dt>Approved</dt>
-                  <dd>{approvedCount}</dd>
-                </div>
-                <div>
-                  <dt>Due</dt>
-                  <dd>{selectedCampaign.due}</dd>
-                </div>
-              </dl>
+              </div>
             </section>
 
             <div className="work-grid">
-              <section className="brief-panel" aria-labelledby="brief-heading">
-                <div className="panel-heading">
-                  <div>
-                    <span className="eyebrow">Brief</span>
-                    <h2 id="brief-heading">Campaign context</h2>
+              <aside
+                className="creation-panel"
+                aria-label="Campaign context and asset generation"
+              >
+                <section
+                  className="campaign-context"
+                  aria-labelledby="brief-heading"
+                >
+                  <div className="panel-heading">
+                    <div>
+                      <span className="eyebrow">Context</span>
+                      <h2 id="brief-heading">Campaign brief</h2>
+                    </div>
                   </div>
-                </div>
 
-                <label className="field">
-                  <span>Audience</span>
-                  <input
-                    defaultValue={selectedCampaign.audience}
-                    key={`${selectedCampaign.id}-audience`}
-                  />
-                </label>
+                  <dl className="brief-summary">
+                    <div>
+                      <dt>Audience</dt>
+                      <dd>{selectedCampaign.audience}</dd>
+                    </div>
+                    <div>
+                      <dt>Tone</dt>
+                      <dd>{selectedCampaign.tone}</dd>
+                    </div>
+                    <div className="brief-summary-wide">
+                      <dt>Brief</dt>
+                      <dd>{selectedCampaign.brief}</dd>
+                    </div>
+                  </dl>
 
-                <label className="field">
-                  <span>Tone</span>
-                  <input
-                    defaultValue={selectedCampaign.tone}
-                    key={`${selectedCampaign.id}-tone`}
-                  />
-                </label>
+                  {selectedCampaign.brandInputs.length > 0 && (
+                    <div className="brand-input-summary">
+                      <span>Brand notes</span>
+                      <div className="brand-inputs">
+                        {selectedCampaign.brandInputs.map((input) => (
+                          <span key={input}>{input}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </section>
 
-                <label className="field">
-                  <span>Brief</span>
-                  <textarea
-                    defaultValue={selectedCampaign.brief}
-                    key={`${selectedCampaign.id}-brief`}
-                    rows={5}
-                  />
-                </label>
-
-                <div className="brand-inputs">
-                  {selectedCampaign.brandInputs.map((input) => (
-                    <span key={input}>{input}</span>
-                  ))}
-                </div>
-
-                <section className="campaign-brand-panel" id="library">
+                <section className="campaign-brand-panel">
                   <div className="campaign-brand-heading">
                     <div>
                       <span>Brand assets</span>
                       <strong>{campaignBrandAssets.length} attached</strong>
                     </div>
-                    <button
-                      className="metadata-button"
-                      onClick={() => setIsBrandAssetModalOpen(true)}
-                      type="button"
-                    >
-                      Manage
-                    </button>
                   </div>
 
                   {isLoadingBrandAssets ? (
@@ -4290,11 +4289,11 @@ function App() {
                   )}
                 </section>
 
-                <div className="generator">
+                <section className="generator" aria-labelledby="generate-heading">
                   <div className="panel-heading">
                     <div>
-                      <span className="eyebrow">Generate</span>
-                      <h2>New asset</h2>
+                      <span className="eyebrow">Create</span>
+                      <h2 id="generate-heading">Generate asset</h2>
                     </div>
                   </div>
 
@@ -4601,18 +4600,17 @@ function App() {
                           : 'Queue video'
                         : 'Generate asset'}
                   </button>
-                </div>
-              </section>
+                </section>
+              </aside>
 
               <section
                 className="asset-board"
-                id="assets"
                 aria-labelledby="assets-heading"
               >
                 <div className="board-toolbar">
                   <div>
-                    <span className="eyebrow">Assets</span>
-                    <h2 id="assets-heading">Review queue</h2>
+                    <span className="eyebrow">Review</span>
+                    <h2 id="assets-heading">Campaign assets</h2>
                   </div>
 
                   <div className="filters">
@@ -4744,7 +4742,7 @@ function App() {
                   <>
                     <div className="panel-heading">
                       <div>
-                        <span className="eyebrow">Selected</span>
+                        <span className="eyebrow">Asset details</span>
                         <h2>{selectedAsset.title}</h2>
                       </div>
                       <span className={`status-pill ${selectedAsset.status}`}>
@@ -4975,7 +4973,7 @@ function App() {
                     )}
 
                     <div className="version-list">
-                      <h3>Previous Version</h3>
+                      <h3>Previous versions</h3>
                       {previousSelectedVersions.length > 0 ? (
                         previousSelectedVersions.map((version) => (
                           <div className="version-row" key={version.versionId}>
@@ -5067,9 +5065,23 @@ function App() {
         ) : (
           <main className="campaign-stage">
             <div className="empty-state workspace-empty">
-              {isLoadingCampaigns
-                ? 'Loading workspace...'
-                : 'No campaigns yet. Create one through the API to begin.'}
+              {isLoadingCampaigns ? (
+                'Loading workspace...'
+              ) : campaigns.length === 0 ? (
+                <>
+                  <strong>No campaigns yet</strong>
+                  <span>Create a campaign to start building assets.</span>
+                  <button
+                    className="button button-primary"
+                    onClick={() => setIsCreateCampaignOpen(true)}
+                    type="button"
+                  >
+                    Create campaign
+                  </button>
+                </>
+              ) : (
+                'Choose a campaign to open its workspace.'
+              )}
             </div>
           </main>
         )}
