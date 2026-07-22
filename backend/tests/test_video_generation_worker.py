@@ -206,6 +206,61 @@ def make_video_edit_snapshot(
     )
 
 
+def make_video_refinement_snapshot() -> VideoJobSnapshot:
+    asset_id = uuid.uuid4()
+    source_version_id = uuid.uuid4()
+    operation = "video_refinement"
+    return VideoJobSnapshot(
+        id=uuid.uuid4(),
+        asset_version_id=uuid.uuid4(),
+        campaign_id=uuid.uuid4(),
+        asset_id=asset_id,
+        version_number=4,
+        provider="gmicloud",
+        model="wan2.7-videoedit",
+        prompt="Keep the product fixed and move only the background.",
+        parameters={
+            "operation": operation,
+            "input_mode": "video_to_video",
+            "source_origin": "asset_version",
+            "source_version_id": str(source_version_id),
+            "source_resolution": {
+                "origin": "asset_version",
+                "source_version_id": str(source_version_id),
+                "source_brand_asset_id": None,
+            },
+            "source_input_assets": [
+                {
+                    "role": "source_creative",
+                    "storage_key": "campaigns/source/source.mp4",
+                    "filename": "source.mp4",
+                    "content_type": "video/mp4",
+                    "media_kind": "video",
+                    "size_bytes": 4096,
+                    "sha256": "b" * 64,
+                    "source": "source_version_artifact",
+                    "storage_ownership": "source_asset_version",
+                    "source_asset_id": str(asset_id),
+                    "source_version_id": str(source_version_id),
+                    "source_version_number": 3,
+                }
+            ],
+            "context_assets": [],
+        },
+        attempt_count=1,
+        started_at=datetime(2026, 7, 22, 3, 0, tzinfo=UTC),
+        version_generation_metadata={
+            "operation": operation,
+            "based_on_version_id": str(source_version_id),
+            "provenance": {
+                "operation": operation,
+                "based_on_version_id": str(source_version_id),
+                "request": {"operation": operation},
+            },
+        },
+    )
+
+
 class VideoGenerationWorkerTests(unittest.TestCase):
     def test_worker_stops_claiming_jobs_after_shutdown_is_requested(self) -> None:
         stop_event = Event()
@@ -675,6 +730,7 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             sidecar["version"]["artifact_storage_key"],
             artifact.storage_key,
         )
+        self.assertEqual(sidecar["version"]["label"], "Genblaze video 1")
         self.assertEqual(sidecar["stored_at"], completed_at.isoformat())
 
         storage = MagicMock()
@@ -768,6 +824,130 @@ class VideoGenerationWorkerTests(unittest.TestCase):
         self.assertNotIn("secret-token", serialized_metadata)
         self.assertNotIn("manifest-secret", serialized_metadata)
 
+    def test_refinement_completion_preserves_canonical_lineage(self) -> None:
+        snapshot = make_video_refinement_snapshot()
+        source_record = snapshot.parameters["source_input_assets"][0]
+        based_on_version_id = source_record["source_version_id"]
+        completed_at = datetime(2026, 7, 22, 4, 0, tzinfo=UTC)
+        result = make_result(
+            model=snapshot.model,
+            prompt=snapshot.prompt,
+            input_mode="video_to_video",
+            input_assets_parameter="external_inputs",
+            provider_source_parameter="video",
+        )
+        artifact = DurableVideoArtifact(
+            storage_key="campaigns/video/artifact/refined.mp4",
+            filename="refined.mp4",
+            content_type="video/mp4",
+            size_bytes=4096,
+            sha256="c" * 64,
+            source_storage_key="sereneset-spark/genblaze/refined.mp4",
+        )
+
+        metadata = build_completed_generation_metadata(
+            snapshot=snapshot,
+            result=result,
+            artifact=artifact,
+            completed_at=completed_at,
+            sidecar_storage_key="campaigns/video/metadata.json",
+        )
+
+        self.assertEqual(metadata["operation"], "video_refinement")
+        self.assertEqual(
+            metadata["based_on_version_id"],
+            based_on_version_id,
+        )
+        self.assertEqual(
+            metadata["provenance"]["operation"],
+            "video_refinement",
+        )
+        self.assertEqual(
+            metadata["provenance"]["based_on_version_id"],
+            based_on_version_id,
+        )
+        self.assertEqual(
+            metadata["request"]["operation"],
+            "video_refinement",
+        )
+        self.assertEqual(
+            metadata["request"]["based_on_version_id"],
+            based_on_version_id,
+        )
+        self.assertEqual(metadata["job"]["operation"], "video_refinement")
+        self.assertEqual(
+            metadata["execution"]["operation"],
+            "video_refinement",
+        )
+        self.assertEqual(metadata["source_input_assets"], [source_record])
+        self.assertNotIn("url", metadata["source_input_assets"][0])
+
+        context = VideoProvenanceContext(
+            version_storage_key="campaigns/video/metadata.json",
+            campaign={"id": str(snapshot.campaign_id)},
+            asset={"id": str(snapshot.asset_id)},
+        )
+        sidecar = build_video_provenance_sidecar(
+            context=context,
+            snapshot=snapshot,
+            result=result,
+            artifact=artifact,
+            generation_metadata=metadata,
+            stored_at=completed_at,
+        )
+
+        self.assertEqual(sidecar["operation"], "video_refinement")
+        self.assertEqual(
+            sidecar["based_on_version_id"],
+            based_on_version_id,
+        )
+        self.assertEqual(sidecar["version"]["label"], "Video refinement 4")
+        self.assertNotIn("url", sidecar["version"]["input_assets"][0])
+
+    def test_refinement_rejects_cross_asset_lineage_before_signing(self) -> None:
+        snapshot = make_video_refinement_snapshot()
+        snapshot.parameters["source_input_assets"][0]["source_asset_id"] = str(
+            uuid.uuid4()
+        )
+        storage = MagicMock()
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "does not belong to the refined asset",
+        ):
+            prepare_video_generation_request(
+                snapshot=snapshot,
+                storage=storage,
+                settings=Settings(
+                    _env_file=None,
+                    GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+                    GENBLAZE_VIDEO_EDIT_MODEL="wan2.7-videoedit",
+                ),
+            )
+
+        storage.generate_presigned_download_url.assert_not_called()
+
+    def test_refinement_rejects_generation_controls_before_signing(self) -> None:
+        snapshot = make_video_refinement_snapshot()
+        snapshot.parameters["duration"] = 4
+        storage = MagicMock()
+
+        with self.assertRaisesRegex(
+            GenerationInputError,
+            "cannot include generation controls",
+        ):
+            prepare_video_generation_request(
+                snapshot=snapshot,
+                storage=storage,
+                settings=Settings(
+                    _env_file=None,
+                    GENBLAZE_VIDEO_TO_VIDEO_ENABLED=True,
+                    GENBLAZE_VIDEO_EDIT_MODEL="wan2.7-videoedit",
+                ),
+            )
+
+        storage.generate_presigned_download_url.assert_not_called()
+
     def test_rejects_inconsistent_genblaze_provenance_before_storage(self) -> None:
         snapshot = make_video_edit_snapshot()
         result = make_result(
@@ -840,6 +1020,70 @@ class VideoGenerationWorkerTests(unittest.TestCase):
             final_metadata,
         )
         self.assertEqual(job.asset_version.storage_key, sidecar_storage_key)
+        self.assertEqual(job.asset_version.label, "Genblaze video 1")
+        db.commit.assert_called_once_with()
+
+    def test_finalizes_refinement_with_operation_aware_label(self) -> None:
+        snapshot = make_video_refinement_snapshot()
+        asset = Asset(
+            id=snapshot.asset_id,
+            campaign_id=snapshot.campaign_id,
+            title="Launch video",
+            format=AssetFormat.video_concept,
+            channel="Paid social",
+            status=ReviewStatus.draft,
+            reviewer=None,
+            tags=["video"],
+            summary="Video refinement",
+        )
+        version = AssetVersion(
+            id=snapshot.asset_version_id,
+            asset_id=asset.id,
+            version_number=snapshot.version_number,
+            label="Queued video refinement 4",
+            prompt=snapshot.prompt,
+            model=snapshot.model,
+            provider=snapshot.provider,
+            storage_key="campaigns/video/metadata.json",
+            generation_metadata=snapshot.version_generation_metadata,
+        )
+        version.asset = asset
+        job = GenerationJob(
+            id=snapshot.id,
+            asset_version_id=version.id,
+            kind="video",
+            status=GenerationJobStatus.running.value,
+            provider=snapshot.provider,
+            model=snapshot.model,
+            prompt=snapshot.prompt,
+            parameters=snapshot.parameters,
+            progress_percent=5,
+            attempt_count=1,
+        )
+        job.asset_version = version
+        artifact = DurableVideoArtifact(
+            storage_key="campaigns/video/artifact/refined.mp4",
+            filename="refined.mp4",
+            content_type="video/mp4",
+            size_bytes=4096,
+            sha256="c" * 64,
+        )
+        db = MagicMock()
+        db.scalar.return_value = job
+
+        finalized = finalize_video_job_success(
+            db,
+            snapshot=snapshot,
+            result=make_result(
+                model=snapshot.model,
+                prompt=snapshot.prompt,
+            ),
+            artifact=artifact,
+            generation_metadata={"operation": "video_refinement"},
+        )
+
+        self.assertTrue(finalized)
+        self.assertEqual(version.label, "Video refinement 4")
         db.commit.assert_called_once_with()
 
     def test_stores_video_with_b2_server_side_copy(self) -> None:

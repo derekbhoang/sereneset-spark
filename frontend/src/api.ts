@@ -243,6 +243,11 @@ export type VideoGenerationCreateDto = {
   source_brand_asset_id?: string | null
 }
 
+export type VideoRefinementCreateDto = {
+  prompt: string
+  expected_latest_version_id: string
+}
+
 export type GenerationJobDto = {
   id: string
   asset_version_id: string
@@ -589,6 +594,19 @@ export function submitVideoGenerationWithInput(
   return uploadRequest<VideoGenerationSubmissionDto>(
     `/campaigns/${campaignId}/assets/generate-video-with-input`,
     formData,
+  )
+}
+
+export function submitVideoRefinement(
+  assetId: string,
+  refinement: VideoRefinementCreateDto,
+): Promise<VideoGenerationSubmissionDto> {
+  return request<VideoGenerationSubmissionDto>(
+    `/assets/${assetId}/refine-video`,
+    {
+      method: 'POST',
+      body: JSON.stringify(refinement),
+    },
   )
 }
 

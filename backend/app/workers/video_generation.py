@@ -51,6 +51,11 @@ from app.services.storage import (
     normalize_artifact_filename,
     normalize_storage_key,
 )
+from app.services.video_refinement import (
+    VideoGenerationOperation,
+    VideoRefinementLabelState,
+    video_refinement_version_label,
+)
 from app.services.worker_heartbeat import run_worker_heartbeat_loop
 
 
@@ -396,6 +401,46 @@ def consistent_provenance_identifier(
     return identifiers[0] if identifiers else None
 
 
+def job_video_operation(snapshot: VideoJobSnapshot) -> VideoGenerationOperation:
+    metadata = snapshot.version_generation_metadata
+    raw_provenance = metadata.get("provenance")
+    provenance = raw_provenance if isinstance(raw_provenance, dict) else {}
+    raw_request = provenance.get("request")
+    request = raw_request if isinstance(raw_request, dict) else {}
+    operation_value = consistent_provenance_identifier(
+        snapshot.parameters.get("operation"),
+        metadata.get("operation"),
+        provenance.get("operation"),
+        request.get("operation"),
+        field_name="operation",
+    )
+    if operation_value is None:
+        return VideoGenerationOperation.generation
+
+    try:
+        return VideoGenerationOperation(operation_value)
+    except ValueError as exc:
+        raise GenerationInputError(
+            "Generation job has an invalid video operation"
+        ) from exc
+
+
+def completed_video_version_label(
+    *,
+    operation: VideoGenerationOperation,
+    version_number: int,
+) -> str:
+    if version_number < 1:
+        raise ValueError("Video version number must be positive")
+    if operation == VideoGenerationOperation.refinement:
+        return video_refinement_version_label(
+            version_number=version_number,
+            state=VideoRefinementLabelState.completed,
+        )
+
+    return f"Genblaze video {version_number}"
+
+
 def build_video_source_resolution(
     *,
     parameters: dict[str, Any],
@@ -599,6 +644,69 @@ def validate_worker_video_input_mode(
     return actual_mode
 
 
+def validate_video_operation_provenance(
+    *,
+    snapshot: VideoJobSnapshot,
+    operation: VideoGenerationOperation,
+    input_mode: VideoInputMode,
+    source_resolution: dict[str, str | None],
+    source_inputs: list[dict[str, Any]],
+) -> str | None:
+    based_on_version_id = consistent_provenance_identifier(
+        source_resolution.get("source_version_id"),
+        snapshot.version_generation_metadata.get("based_on_version_id"),
+        field_name="based_on_version_id",
+    )
+    if operation != VideoGenerationOperation.refinement:
+        return based_on_version_id
+
+    if input_mode != VideoInputMode.video_to_video:
+        raise GenerationInputError(
+            "Video refinement provenance requires video-to-video input mode"
+        )
+    if source_resolution.get("origin") != "asset_version":
+        raise GenerationInputError(
+            "Video refinement provenance requires an asset-version source"
+        )
+    if based_on_version_id is None or len(source_inputs) != 1:
+        raise GenerationInputError(
+            "Video refinement provenance is missing its source version"
+        )
+
+    source_input = source_inputs[0]
+    if optional_string(source_input.get("source_asset_id")) != str(
+        snapshot.asset_id
+    ):
+        raise GenerationInputError(
+            "Video refinement source does not belong to the refined asset"
+        )
+    if optional_string(source_input.get("source_version_id")) != (
+        based_on_version_id
+    ):
+        raise GenerationInputError(
+            "Video refinement source version provenance is inconsistent"
+        )
+
+    source_version_number = source_input.get("source_version_number")
+    if (
+        not isinstance(source_version_number, int)
+        or isinstance(source_version_number, bool)
+        or source_version_number != snapshot.version_number - 1
+    ):
+        raise GenerationInputError(
+            "Video refinement must be based on the immediately previous version"
+        )
+    if any(
+        snapshot.parameters.get(key) is not None
+        for key in VIDEO_PROVIDER_PARAMETER_KEYS
+    ):
+        raise GenerationInputError(
+            "Video refinement provenance cannot include generation controls"
+        )
+
+    return based_on_version_id
+
+
 def prepare_video_generation_request(
     *,
     snapshot: VideoJobSnapshot,
@@ -610,15 +718,22 @@ def prepare_video_generation_request(
         "source_input_assets",
     )
     context_assets = job_asset_records(snapshot.parameters, "context_assets")
-    build_video_source_resolution(
+    source_resolution = build_video_source_resolution(
         parameters=snapshot.parameters,
         source_inputs=source_inputs,
     )
-    validate_worker_video_input_mode(
+    input_mode = validate_worker_video_input_mode(
         snapshot=snapshot,
         source_inputs=source_inputs,
         settings=settings,
         require_download_url=False,
+    )
+    validate_video_operation_provenance(
+        snapshot=snapshot,
+        operation=job_video_operation(snapshot),
+        input_mode=input_mode,
+        source_resolution=source_resolution,
+        source_inputs=source_inputs,
     )
 
     presigned_url_ttl = max(
@@ -786,6 +901,7 @@ def build_video_provider_execution(
         )
 
     input_mode = job_video_input_mode(snapshot.parameters)
+    operation = job_video_operation(snapshot)
     raw_genblaze = result.generation_metadata.get("genblaze")
     if raw_genblaze is None:
         genblaze: dict[str, Any] = {}
@@ -836,6 +952,7 @@ def build_video_provider_execution(
         provenance_input_asset_records(source_inputs)[0] if source_inputs else None
     )
     return {
+        "operation": operation.value,
         "provider": result.provider,
         "requested_model": snapshot.model,
         "resolved_model": result.model,
@@ -877,8 +994,16 @@ def validate_video_execution_provenance(
         "source_input_assets",
     )
     context_assets = job_asset_records(snapshot.parameters, "context_assets")
-    build_video_source_resolution(
+    source_resolution = build_video_source_resolution(
         parameters=snapshot.parameters,
+        source_inputs=source_inputs,
+    )
+    input_mode = job_video_input_mode(snapshot.parameters)
+    validate_video_operation_provenance(
+        snapshot=snapshot,
+        operation=job_video_operation(snapshot),
+        input_mode=input_mode,
+        source_resolution=source_resolution,
         source_inputs=source_inputs,
     )
     build_video_provider_execution(
@@ -914,6 +1039,14 @@ def build_completed_generation_metadata(
         source_inputs=raw_source_inputs,
     )
     input_mode = job_video_input_mode(snapshot.parameters)
+    operation = job_video_operation(snapshot)
+    based_on_version_id = validate_video_operation_provenance(
+        snapshot=snapshot,
+        operation=operation,
+        input_mode=input_mode,
+        source_resolution=source_resolution,
+        source_inputs=raw_source_inputs,
+    )
     source_inputs = provenance_input_asset_records(raw_source_inputs)
     context_assets = provenance_input_asset_records(raw_context_assets)
     input_assets = [*source_inputs, *context_assets]
@@ -940,6 +1073,7 @@ def build_completed_generation_metadata(
         "kind": GenerationJobKind.video.value,
         "status": GenerationJobStatus.succeeded.value,
         "progress_percent": 100,
+        "operation": operation.value,
         "provider_job_id": result.provider_job_id,
         "attempt_count": snapshot.attempt_count,
         "error_message": None,
@@ -971,7 +1105,8 @@ def build_completed_generation_metadata(
         "model": result.model,
         "prompt": result.prompt,
         "source": "backend_genblaze_video_worker",
-        "based_on_version_id": snapshot.parameters.get("source_version_id"),
+        "operation": operation.value,
+        "based_on_version_id": based_on_version_id,
         "input_mode": input_mode.value,
         "source_resolution": source_resolution,
         "generation_parameters": generation_parameters,
@@ -987,6 +1122,8 @@ def build_completed_generation_metadata(
         "sidecar": sidecar_record,
         "job": job_record,
         "request": {
+            "operation": operation.value,
+            "based_on_version_id": based_on_version_id,
             "input_mode": input_mode.value,
             "generation_parameters": requested_generation_parameters,
             "source_resolution": source_resolution,
@@ -1020,7 +1157,8 @@ def build_completed_generation_metadata(
         "model": result.model,
         "prompt": result.prompt,
         "source": "backend_genblaze_video_worker",
-        "based_on_version_id": snapshot.parameters.get("source_version_id"),
+        "operation": operation.value,
+        "based_on_version_id": based_on_version_id,
         "input_mode": input_mode.value,
         "source_resolution": source_resolution,
         "generation_parameters": generation_parameters,
@@ -1054,16 +1192,30 @@ def build_video_provenance_sidecar(
     input_assets = generation_metadata.get("input_assets")
     if not isinstance(input_assets, list):
         input_assets = []
+    operation = job_video_operation(snapshot)
+    metadata_operation = optional_string(generation_metadata.get("operation"))
+    if metadata_operation is not None and metadata_operation != operation.value:
+        raise GenerationInputError(
+            "Completed video metadata operation does not match the queued job"
+        )
+    based_on_version_id = optional_string(
+        generation_metadata.get("based_on_version_id")
+    )
 
     return {
         "schema": f"{VIDEO_PROVENANCE_SCHEMA}.sidecar",
         "schema_version": VIDEO_PROVENANCE_SCHEMA_VERSION,
+        "operation": operation.value,
+        "based_on_version_id": based_on_version_id,
         "campaign": copy.deepcopy(context.campaign),
         "asset": copy.deepcopy(context.asset),
         "version": {
             "id": str(snapshot.asset_version_id),
             "version_number": snapshot.version_number,
-            "label": f"Genblaze video {snapshot.version_number}",
+            "label": completed_video_version_label(
+                operation=operation,
+                version_number=snapshot.version_number,
+            ),
             "prompt": result.prompt,
             "model": result.model,
             "provider": result.provider,
@@ -1090,6 +1242,27 @@ def upload_video_provenance_sidecar(
     stored_at: datetime,
 ) -> StoredObject:
     expected_storage_key = normalize_storage_key(context.version_storage_key)
+    operation = optional_string(generation_metadata.get("operation")) or (
+        VideoGenerationOperation.generation.value
+    )
+    object_metadata: dict[str, Any] = {
+        "campaign_id": str(snapshot.campaign_id),
+        "asset_id": str(snapshot.asset_id),
+        "version_id": str(snapshot.asset_version_id),
+        "version_number": snapshot.version_number,
+        "generation_job_id": str(snapshot.id),
+        "provider": result.provider,
+        "model": result.model,
+        "manifest_hash": result.manifest_hash,
+        "content_kind": "asset-version-sidecar",
+        "operation": operation,
+    }
+    based_on_version_id = optional_string(
+        generation_metadata.get("based_on_version_id")
+    )
+    if based_on_version_id is not None:
+        object_metadata["based_on_version_id"] = based_on_version_id
+
     stored_object = storage.upload_json(
         key=expected_storage_key,
         data=build_video_provenance_sidecar(
@@ -1100,17 +1273,7 @@ def upload_video_provenance_sidecar(
             generation_metadata=generation_metadata,
             stored_at=stored_at,
         ),
-        metadata={
-            "campaign_id": str(snapshot.campaign_id),
-            "asset_id": str(snapshot.asset_id),
-            "version_id": str(snapshot.asset_version_id),
-            "version_number": snapshot.version_number,
-            "generation_job_id": str(snapshot.id),
-            "provider": result.provider,
-            "model": result.model,
-            "manifest_hash": result.manifest_hash,
-            "content_kind": "asset-version-sidecar",
-        },
+        metadata=object_metadata,
     )
     if stored_object.key != expected_storage_key:
         raise StorageOperationError(
@@ -1172,7 +1335,10 @@ def finalize_video_job_success(
             return False
 
         version = job.asset_version
-        version.label = f"Genblaze video {version.version_number}"
+        version.label = completed_video_version_label(
+            operation=job_video_operation(snapshot),
+            version_number=version.version_number,
+        )
         version.provider = result.provider
         version.model = result.model
         version.prompt = result.prompt

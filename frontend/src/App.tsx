@@ -28,6 +28,7 @@ import {
   retryCampaignGenerationJob,
   submitVideoGeneration,
   submitVideoGenerationWithInput,
+  submitVideoRefinement,
   updateAssetStatus as patchAssetStatus,
   uploadBrandAsset,
   uploadAssetVersionArtifact,
@@ -762,6 +763,22 @@ function hasVideoArtifact(version: AssetVersion): boolean {
   )
 }
 
+function hasRefinableVideoArtifact(version: AssetVersion): boolean {
+  const contentType = version.artifactContentType
+    ?.split(';', 1)[0]
+    .trim()
+    .toLowerCase()
+
+  return Boolean(
+    version.artifactStorageKey &&
+      version.artifactFilename &&
+      getFileExtension(version.artifactFilename) === 'mp4' &&
+      contentType === 'video/mp4' &&
+      version.artifactSizeBytes &&
+      version.artifactSizeBytes > 0,
+  )
+}
+
 function getAssetCardPreviewVersion(asset: Asset): AssetVersion | null {
   return asset.versions.reduce<AssetVersion | null>((latestVersion, version) => {
     if (!hasImageArtifact(version)) {
@@ -932,6 +949,10 @@ function referenceImagesToGenerationInputs(
 }
 
 function buildRefinePrompt(asset: Asset): string {
+  if (asset.format === 'Video concept') {
+    return `Preserve the subject, composition, branding, and timing of "${asset.title}". Improve the background motion without changing the product.`
+  }
+
   return `Refine "${asset.title}" for ${asset.channel}. Keep the strongest idea, improve clarity, and make the next version more production-ready.`
 }
 
@@ -1577,6 +1598,36 @@ function App() {
   const refinePrompt = selectedAsset
     ? (refinePrompts[selectedAsset.id] ?? buildRefinePrompt(selectedAsset))
     : ''
+  const selectedAssetHasActiveGenerationJob = Boolean(
+    selectedAsset?.versions.some((version) => {
+      const job = generationJobsByVersionId.get(version.versionId)
+      return job ? isActiveGenerationJobStatus(job.status) : false
+    }),
+  )
+  const isSelectedAssetJobStateReady = Boolean(
+    selectedAsset &&
+      generationJobsCampaignId === selectedAsset.campaignId &&
+      !isLoadingGenerationJobs,
+  )
+  const videoRefinementUnavailableReason =
+    selectedAsset?.format !== 'Video concept'
+      ? null
+      : !latestSelectedVersion
+        ? 'No source version is available.'
+        : !isSelectedAssetJobStateReady
+          ? 'Checking video job status...'
+          : selectedAssetHasActiveGenerationJob
+            ? 'A video generation job is already in progress.'
+            : selectedGenerationJob && selectedGenerationJob.status !== 'succeeded'
+              ? 'Retry the latest video job before refining.'
+              : !hasRefinableVideoArtifact(latestSelectedVersion)
+                ? 'The latest version does not have a refinable MP4 artifact.'
+                : null
+  const canRefineSelectedVideo = Boolean(
+    selectedAsset?.format === 'Video concept' &&
+      latestSelectedVersion &&
+      videoRefinementUnavailableReason === null,
+  )
 
   const approvedCount = campaignAssets.filter(
     (asset) => asset.status === 'approved',
@@ -2541,15 +2592,21 @@ function App() {
     }
   }
 
-  function storeGenerationJob(job: GenerationJobDto) {
+  function storeGenerationJob(
+    job: GenerationJobDto,
+    campaignId = selectedCampaignId,
+  ) {
+    const currentJobs =
+      generationJobsCampaignId === campaignId
+        ? generationJobsRef.current
+        : []
     const nextJobs = [
       job,
-      ...generationJobsRef.current.filter(
-        (currentJob) => currentJob.id !== job.id,
-      ),
+      ...currentJobs.filter((currentJob) => currentJob.id !== job.id),
     ]
 
     generationJobsRef.current = nextJobs
+    setGenerationJobsCampaignId(campaignId)
     setGenerationJobs(nextJobs)
   }
 
@@ -2674,6 +2731,55 @@ function App() {
       setIsRefining(false)
     }
   }
+
+  async function refineVideoAsset() {
+    if (
+      !selectedAsset ||
+      !latestSelectedVersion ||
+      !canRefineSelectedVideo
+    ) {
+      return
+    }
+
+    const trimmedPrompt = refinePrompt.trim()
+    if (!trimmedPrompt) {
+      return
+    }
+
+    const assetId = selectedAsset.id
+    const campaignId = selectedAsset.campaignId
+    const expectedLatestVersionId = latestSelectedVersion.versionId
+    setIsRefining(true)
+    setErrorMessage(null)
+
+    try {
+      const submission = await submitVideoRefinement(assetId, {
+        prompt: trimmedPrompt,
+        expected_latest_version_id: expectedLatestVersionId,
+      })
+      const refreshedAsset = mapAsset(submission.asset)
+
+      setAssets((currentAssets) =>
+        currentAssets.map((asset) =>
+          asset.id === refreshedAsset.id ? refreshedAsset : asset,
+        ),
+      )
+      setSelectedAssetId(refreshedAsset.id)
+      setStatusFilter('all')
+      storeGenerationJob(submission.job, campaignId)
+      setGenerationJobsError(null)
+      setRefinePrompts((currentPrompts) => {
+        const nextPrompts = { ...currentPrompts }
+        delete nextPrompts[assetId]
+        return nextPrompts
+      })
+    } catch (error) {
+      setErrorMessage(getErrorMessage(error))
+    } finally {
+      setIsRefining(false)
+    }
+  }
+
   async function uploadArtifact(version: AssetVersion, file: File | null) {
     if (!selectedAsset || !file) {
       return
@@ -2893,6 +2999,8 @@ function App() {
     const aspectRatio = readString(job.parameters.aspect_ratio)
     const resolution = readString(job.parameters.resolution)
     const inputMode = readString(job.parameters.input_mode)
+    const operation = readString(job.parameters.operation)
+    const isVideoRefinement = operation === 'video_refinement'
     const isVideoEditJob = inputMode === 'video_to_video'
     const isActionPending = generationJobActionId === job.id
 
@@ -2904,7 +3012,9 @@ function App() {
       >
         <div className="generation-job-heading">
           <div>
-            <span>Video generation</span>
+            <span>
+              {isVideoRefinement ? 'Video refinement' : 'Video generation'}
+            </span>
             <strong>{generationJobStatusLabels[job.status]}</strong>
           </div>
           <span>{job.progress_percent}%</span>
@@ -4595,6 +4705,83 @@ function App() {
                         <dd>{selectedAsset.tags.join(', ')}</dd>
                       </div>
                     </dl>
+
+                    {selectedAsset.format === 'Video concept' && (
+                      <div
+                        className="refine-panel video-refine-panel"
+                        data-testid="video-refinement-panel"
+                      >
+                        <div className="panel-heading">
+                          <div>
+                            <span className="eyebrow">Refine</span>
+                            <h3>Video refinement</h3>
+                          </div>
+                          <span>{`v${getNextVersionNumber(selectedAsset)}`}</span>
+                        </div>
+
+                        <dl className="video-refinement-context">
+                          <div>
+                            <dt>Source</dt>
+                            <dd>
+                              {latestSelectedVersion
+                                ? `${latestSelectedVersion.id.toUpperCase()} / ${
+                                    latestSelectedVersion.artifactFilename ??
+                                    'Stored MP4'
+                                  }`
+                                : 'Unavailable'}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Model</dt>
+                            <dd>{videoEditModel}</dd>
+                          </div>
+                        </dl>
+
+                        <label className="field">
+                          <span>Prompt</span>
+                          <textarea
+                            aria-describedby={
+                              videoRefinementUnavailableReason
+                                ? 'video-refinement-readiness'
+                                : undefined
+                            }
+                            disabled={isRefining}
+                            onChange={(event) =>
+                              setRefinePrompts((currentPrompts) => ({
+                                ...currentPrompts,
+                                [selectedAsset.id]: event.target.value,
+                              }))
+                            }
+                            rows={4}
+                            value={refinePrompt}
+                          />
+                        </label>
+
+                        {videoRefinementUnavailableReason && (
+                          <p
+                            className="video-refinement-state"
+                            id="video-refinement-readiness"
+                            role="status"
+                          >
+                            {videoRefinementUnavailableReason}
+                          </p>
+                        )}
+
+                        <button
+                          className="button button-primary"
+                          data-testid="video-refinement-submit"
+                          disabled={
+                            isRefining ||
+                            !canRefineSelectedVideo ||
+                            !refinePrompt.trim()
+                          }
+                          onClick={() => void refineVideoAsset()}
+                          type="button"
+                        >
+                          {isRefining ? 'Queueing...' : 'Create refinement'}
+                        </button>
+                      </div>
+                    )}
 
                     {selectedAsset.format !== 'Video concept' && (
                       <div className="refine-panel">
