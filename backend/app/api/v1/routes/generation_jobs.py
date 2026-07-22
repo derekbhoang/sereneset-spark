@@ -1,5 +1,7 @@
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import Enum
 from pathlib import PurePosixPath
 from typing import Any
 
@@ -69,6 +71,87 @@ from app.services.video_validation import (
 
 router = APIRouter(tags=["generation-jobs"])
 VIDEO_UPLOAD_CONTENT_TYPES_BY_SUFFIX = {".mp4": "video/mp4"}
+
+
+class VideoSourceOrigin(str, Enum):
+    none = "none"
+    asset_version = "asset_version"
+    brand_asset = "brand_asset"
+    user_upload = "user_upload"
+
+
+@dataclass(frozen=True)
+class ResolvedVideoSource:
+    origin: VideoSourceOrigin
+    input_record: dict[str, object] | None = None
+    source_version_id: uuid.UUID | None = None
+    source_brand_asset_id: uuid.UUID | None = None
+
+    def __post_init__(self) -> None:
+        has_input = self.input_record is not None
+        if (
+            self.origin == VideoSourceOrigin.none
+            and has_input
+        ) or (
+            self.origin != VideoSourceOrigin.none
+            and not has_input
+        ):
+            raise ValueError(
+                "Resolved video source must match its source origin"
+            )
+        if (
+            self.origin == VideoSourceOrigin.asset_version
+            and (
+                self.source_version_id is None
+                or self.source_brand_asset_id is not None
+            )
+        ):
+            raise ValueError("Asset-version source must include its version ID")
+        if (
+            self.origin == VideoSourceOrigin.brand_asset
+            and (
+                self.source_brand_asset_id is None
+                or self.source_version_id is not None
+            )
+        ):
+            raise ValueError("Brand-asset source must include its asset ID")
+        if self.origin in {
+            VideoSourceOrigin.none,
+            VideoSourceOrigin.user_upload,
+        } and (
+            self.source_version_id is not None
+            or self.source_brand_asset_id is not None
+        ):
+            raise ValueError(
+                "Video source origin cannot include a stored-source ID"
+            )
+
+    @property
+    def input_assets(self) -> list[dict[str, object]]:
+        return [self.input_record] if self.input_record is not None else []
+
+    @property
+    def excluded_context_brand_asset_id(self) -> uuid.UUID | None:
+        return (
+            self.source_brand_asset_id
+            if self.origin == VideoSourceOrigin.brand_asset
+            else None
+        )
+
+    def as_metadata(self) -> dict[str, object | None]:
+        return {
+            "origin": self.origin.value,
+            "source_version_id": (
+                str(self.source_version_id)
+                if self.source_version_id is not None
+                else None
+            ),
+            "source_brand_asset_id": (
+                str(self.source_brand_asset_id)
+                if self.source_brand_asset_id is not None
+                else None
+            ),
+        }
 
 
 def metadata_dict(value: object) -> dict[str, object]:
@@ -501,11 +584,66 @@ def uploaded_video_input_record(
     }
 
 
+def resolve_video_source(
+    *,
+    campaign_id: uuid.UUID,
+    video_in: VideoGenerationCreate,
+    db: Session,
+    uploaded_input: dict[str, object] | None = None,
+) -> ResolvedVideoSource:
+    if uploaded_input is not None:
+        if (
+            video_in.source_version_id is not None
+            or video_in.source_brand_asset_id is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    "An uploaded source video cannot be combined with a stored "
+                    "source version or brand asset"
+                ),
+            )
+
+        return ResolvedVideoSource(
+            origin=VideoSourceOrigin.user_upload,
+            input_record=uploaded_input,
+        )
+
+    if video_in.source_version_id is not None:
+        source_version = get_source_version_or_404(
+            campaign_id=campaign_id,
+            source_version_id=video_in.source_version_id,
+            db=db,
+        )
+        return ResolvedVideoSource(
+            origin=VideoSourceOrigin.asset_version,
+            input_record=source_version_input_record(source_version),
+            source_version_id=source_version.id,
+        )
+
+    if video_in.source_brand_asset_id is not None:
+        source_brand_asset_link = get_source_brand_asset_link_or_404(
+            campaign_id=campaign_id,
+            source_brand_asset_id=video_in.source_brand_asset_id,
+            db=db,
+        )
+        return ResolvedVideoSource(
+            origin=VideoSourceOrigin.brand_asset,
+            input_record=campaign_brand_asset_input_record(
+                source_brand_asset_link,
+                role=VIDEO_SOURCE_INPUT_ROLE,
+            ),
+            source_brand_asset_id=video_in.source_brand_asset_id,
+        )
+
+    return ResolvedVideoSource(origin=VideoSourceOrigin.none)
+
+
 def validate_video_submission(
     *,
     video_in: VideoGenerationCreate,
     model: str,
-    source_inputs: list[dict[str, object]],
+    source: ResolvedVideoSource,
     settings: Settings,
 ) -> VideoInputMode:
     try:
@@ -517,7 +655,7 @@ def validate_video_submission(
         )
         return validate_video_input_assets(
             model=model,
-            input_assets=source_inputs,
+            input_assets=source.input_assets,
             require_download_url=False,
             settings=settings,
         )
@@ -534,7 +672,7 @@ def build_queued_video_models(
     video_in: VideoGenerationCreate,
     model: str,
     input_mode: VideoInputMode,
-    source_inputs: list[dict[str, object]],
+    source: ResolvedVideoSource,
     context_assets: list[dict[str, object]],
     asset_id: uuid.UUID | None = None,
     version_id: uuid.UUID | None = None,
@@ -548,20 +686,18 @@ def build_queued_video_models(
         "aspect_ratio": video_in.aspect_ratio.value,
         "resolution": video_in.resolution.value,
     }
+    source_inputs = source.input_assets
+    source_resolution = source.as_metadata()
     provenance_inputs = [*source_inputs, *context_assets]
     job_parameters: dict[str, Any] = {
         **generation_parameters,
         "input_mode": input_mode.value,
-        "source_version_id": (
-            str(video_in.source_version_id)
-            if video_in.source_version_id is not None
-            else None
-        ),
-        "source_brand_asset_id": (
-            str(video_in.source_brand_asset_id)
-            if video_in.source_brand_asset_id is not None
-            else None
-        ),
+        "source_origin": source.origin.value,
+        "source_version_id": source_resolution["source_version_id"],
+        "source_brand_asset_id": source_resolution[
+            "source_brand_asset_id"
+        ],
+        "source_resolution": source_resolution,
         "source_input_assets": source_inputs,
         "context_assets": context_assets,
     }
@@ -577,6 +713,7 @@ def build_queued_video_models(
         "prompt": video_in.prompt,
         "source": "backend_genblaze_video_submission",
         "generation_parameters": generation_parameters,
+        "source_resolution": source_resolution,
         "input_assets": provenance_inputs,
         "job": job_record,
     }
@@ -613,6 +750,7 @@ def build_queued_video_models(
             "prompt": video_in.prompt,
             "source": "backend_genblaze_video_submission",
             "generation_parameters": generation_parameters,
+            "source_resolution": source_resolution,
             "input_assets": provenance_inputs,
             "job": job_record,
             "provenance": provenance,
@@ -816,45 +954,30 @@ def submit_video_generation(
 ) -> VideoGenerationSubmissionRead:
     get_campaign_or_404(campaign_id, db)
     model = video_in.model or settings.genblaze_video_model
-    source_inputs: list[dict[str, object]] = []
-    if video_in.source_version_id is not None:
-        source_version = get_source_version_or_404(
-            campaign_id=campaign_id,
-            source_version_id=video_in.source_version_id,
-            db=db,
-        )
-        source_inputs.append(source_version_input_record(source_version))
-    elif video_in.source_brand_asset_id is not None:
-        source_brand_asset_link = get_source_brand_asset_link_or_404(
-            campaign_id=campaign_id,
-            source_brand_asset_id=video_in.source_brand_asset_id,
-            db=db,
-        )
-        source_inputs.append(
-            campaign_brand_asset_input_record(
-                source_brand_asset_link,
-                role=VIDEO_SOURCE_INPUT_ROLE,
-            )
-        )
+    source = resolve_video_source(
+        campaign_id=campaign_id,
+        video_in=video_in,
+        db=db,
+    )
 
     input_mode = validate_video_submission(
         video_in=video_in,
         model=model,
-        source_inputs=source_inputs,
+        source=source,
         settings=settings,
     )
 
     context_assets = campaign_brand_context_assets(
         campaign_id=campaign_id,
         db=db,
-        exclude_brand_asset_id=video_in.source_brand_asset_id,
+        exclude_brand_asset_id=source.excluded_context_brand_asset_id,
     )
     asset, _version, job = build_queued_video_models(
         campaign_id=campaign_id,
         video_in=video_in,
         model=model,
         input_mode=input_mode,
-        source_inputs=source_inputs,
+        source=source,
         context_assets=context_assets,
     )
     db.add(asset)
@@ -933,11 +1056,17 @@ def submit_video_generation_with_upload(
         inspection=inspection,
         content_validation=content_validation,
     )
+    source = resolve_video_source(
+        campaign_id=campaign_id,
+        video_in=video_in,
+        db=db,
+        uploaded_input=source_input,
+    )
     model = video_in.model or settings.genblaze_video_edit_model
     input_mode = validate_video_submission(
         video_in=video_in,
         model=model,
-        source_inputs=[source_input],
+        source=source,
         settings=settings,
     )
     context_assets = campaign_brand_context_assets(
@@ -949,7 +1078,7 @@ def submit_video_generation_with_upload(
         video_in=video_in,
         model=model,
         input_mode=input_mode,
-        source_inputs=[source_input],
+        source=source,
         context_assets=context_assets,
         asset_id=asset_id,
         version_id=version_id,

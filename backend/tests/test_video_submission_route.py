@@ -20,9 +20,12 @@ from app.models.generation_job import GenerationJobStatus
 from app.schemas.generation_job import VideoGenerationCreate
 from app.services.generation import VideoInputMode
 from app.api.v1.routes.generation_jobs import (
+    ResolvedVideoSource,
+    VideoSourceOrigin,
     build_queued_video_models,
     campaign_brand_asset_input_record,
     get_source_version_or_404,
+    resolve_video_source,
     source_version_input_record,
     submit_video_generation,
     submit_video_generation_with_upload,
@@ -120,7 +123,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             video_in=video_request(tags=["launch", "video"]),
             model="Veo3-Fast",
             input_mode=VideoInputMode.text_to_video,
-            source_inputs=[],
+            source=ResolvedVideoSource(origin=VideoSourceOrigin.none),
             context_assets=[brand_context],
         )
 
@@ -132,6 +135,15 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         self.assertIsNone(version.artifact_storage_key)
         self.assertEqual(job.status, GenerationJobStatus.queued.value)
         self.assertEqual(job.parameters["input_mode"], "text_to_video")
+        self.assertEqual(job.parameters["source_origin"], "none")
+        self.assertEqual(
+            job.parameters["source_resolution"],
+            {
+                "origin": "none",
+                "source_version_id": None,
+                "source_brand_asset_id": None,
+            },
+        )
         self.assertEqual(job.parameters["context_assets"], [brand_context])
         self.assertEqual(len(version.inputs), 1)
         self.assertEqual(version.inputs[0].media_kind, "document")
@@ -207,6 +219,84 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         )
 
         self.assertIs(result, source_version)
+
+    def test_resolves_asset_version_to_normalized_source(self) -> None:
+        campaign_id = uuid.uuid4()
+        source_version = stored_video_source()
+        source_version.asset.campaign_id = campaign_id
+        db = MagicMock()
+
+        with patch(
+            "app.api.v1.routes.generation_jobs.get_source_version_or_404",
+            return_value=source_version,
+        ):
+            resolved = resolve_video_source(
+                campaign_id=campaign_id,
+                video_in=video_request(
+                    source_version_id=source_version.id,
+                ),
+                db=db,
+            )
+
+        self.assertEqual(resolved.origin, VideoSourceOrigin.asset_version)
+        self.assertEqual(resolved.source_version_id, source_version.id)
+        self.assertIsNone(resolved.source_brand_asset_id)
+        self.assertEqual(len(resolved.input_assets), 1)
+        self.assertEqual(
+            resolved.input_assets[0]["source_version_id"],
+            str(source_version.id),
+        )
+        self.assertEqual(
+            resolved.as_metadata()["origin"],
+            "asset_version",
+        )
+
+    def test_resolves_uploaded_record_without_stored_source_id(self) -> None:
+        campaign_id = uuid.uuid4()
+        uploaded_record = {
+            "role": "source_creative",
+            "storage_key": "campaigns/upload/source.mp4",
+            "filename": "source.mp4",
+            "content_type": "video/mp4",
+            "media_kind": "video",
+            "size_bytes": 1024,
+            "sha256": "2" * 64,
+            "source": "user_upload",
+            "storage_ownership": "asset_version",
+        }
+        db = MagicMock()
+
+        resolved = resolve_video_source(
+            campaign_id=campaign_id,
+            video_in=video_request(),
+            db=db,
+            uploaded_input=uploaded_record,
+        )
+
+        self.assertEqual(resolved.origin, VideoSourceOrigin.user_upload)
+        self.assertEqual(resolved.input_assets, [uploaded_record])
+        self.assertIsNone(resolved.excluded_context_brand_asset_id)
+        db.get.assert_not_called()
+        db.scalar.assert_not_called()
+
+    def test_rejects_uploaded_and_stored_source_combination(self) -> None:
+        source_version_id = uuid.uuid4()
+
+        with self.assertRaises(HTTPException) as raised:
+            resolve_video_source(
+                campaign_id=uuid.uuid4(),
+                video_in=video_request(
+                    source_version_id=source_version_id,
+                ),
+                db=MagicMock(),
+                uploaded_input={"role": "source_creative"},
+            )
+
+        self.assertEqual(
+            raised.exception.status_code,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+        )
+        self.assertIn("cannot be combined", raised.exception.detail)
 
     def test_snapshots_brand_asset_as_video_source(self) -> None:
         campaign_id = uuid.uuid4()
@@ -324,6 +414,11 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         queued_version = queued_asset.versions[0]
         queued_job = queued_version.generation_job
         self.assertEqual(queued_job.parameters["input_mode"], "video_to_video")
+        self.assertEqual(queued_job.parameters["source_origin"], "user_upload")
+        self.assertEqual(
+            queued_job.parameters["source_resolution"]["origin"],
+            "user_upload",
+        )
         source_input = queued_job.parameters["source_input_assets"][0]
         self.assertEqual(
             source_input["content_validation"]["container"],
@@ -504,6 +599,15 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         queued_asset = db.add.call_args.args[0]
         queued_job = queued_asset.versions[0].generation_job
         self.assertEqual(queued_job.parameters["input_mode"], "image_to_video")
+        self.assertEqual(queued_job.parameters["source_origin"], "brand_asset")
+        self.assertEqual(
+            queued_job.parameters["source_resolution"],
+            {
+                "origin": "brand_asset",
+                "source_version_id": None,
+                "source_brand_asset_id": str(brand_asset_id),
+            },
+        )
         self.assertEqual(
             queued_job.parameters["source_brand_asset_id"],
             str(brand_asset_id),
