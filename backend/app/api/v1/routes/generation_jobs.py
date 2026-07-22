@@ -1,3 +1,4 @@
+import copy
 import re
 import uuid
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from app.schemas.generation_job import (
     GenerationJobRead,
     VideoGenerationCreate,
     VideoGenerationSubmissionRead,
+    VideoRefinementCreate,
 )
 from app.services.generation import (
     GenerationInputError,
@@ -70,7 +72,13 @@ from app.services.video_validation import (
     VideoContentValidationError,
     validate_mp4_contents,
 )
-from app.services.video_refinement import VIDEO_REFINEMENT_CONTRACT
+from app.services.video_refinement import (
+    VIDEO_REFINEMENT_CONTRACT,
+    VideoGenerationOperation,
+    VideoRefinementLabelState,
+    is_active_video_job_status,
+    video_refinement_version_label,
+)
 
 
 router = APIRouter(tags=["generation-jobs"])
@@ -629,6 +637,54 @@ def validate_latest_video_refinement_version(
     )
 
 
+def build_video_refinement_source(
+    source: ValidatedVideoRefinementSource,
+) -> ResolvedVideoSource:
+    version = source.version
+    if version.version_number < 1:
+        raise ValueError("Video refinement source version number must be positive")
+
+    input_record: dict[str, object] = {
+        "role": VIDEO_REFINEMENT_CONTRACT.source_role,
+        "storage_key": source.storage_key,
+        "filename": source.filename,
+        "content_type": source.content_type,
+        "media_kind": VIDEO_REFINEMENT_CONTRACT.source_media_kind.value,
+        "size_bytes": source.size_bytes,
+        "sha256": source.sha256,
+        "source": "source_version_artifact",
+        "storage_ownership": "source_asset_version",
+        "source_asset_id": str(version.asset_id),
+        "source_version_id": str(version.id),
+        "source_version_number": version.version_number,
+    }
+    return ResolvedVideoSource(
+        origin=VideoSourceOrigin.asset_version,
+        input_record=input_record,
+        source_version_id=version.id,
+    )
+
+
+def ensure_video_refinement_job_slot_available(
+    locked_asset: LockedVideoRefinementAsset,
+) -> None:
+    active_jobs = tuple(
+        job
+        for job in locked_asset.generation_jobs
+        if is_active_video_job_status(job.status)
+    )
+    if (
+        len(active_jobs)
+        < VIDEO_REFINEMENT_CONTRACT.max_active_jobs_per_asset
+    ):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Video asset already has a queued or running generation job",
+    )
+
+
 def source_version_input_record(
     source_version: AssetVersion,
 ) -> dict[str, object]:
@@ -920,31 +976,101 @@ def validate_video_submission(
         ) from exc
 
 
-def build_queued_video_models(
+def validate_video_refinement_submission(
     *,
-    campaign_id: uuid.UUID,
-    video_in: VideoGenerationCreate,
+    model: str,
+    source: ResolvedVideoSource,
+    settings: Settings,
+) -> VideoInputMode:
+    try:
+        validate_resolved_video_source(source)
+        input_mode = validate_video_input_assets(
+            model=model,
+            input_assets=source.input_assets,
+            require_download_url=False,
+            settings=settings,
+        )
+    except GenerationInputError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=str(exc),
+        ) from exc
+
+    if input_mode != VideoInputMode.video_to_video:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Configured video edit model does not support video refinement",
+        )
+
+    return input_mode
+
+
+def build_queued_video_version_models(
+    *,
+    asset: Asset,
+    version_number: int,
+    prompt: str,
     model: str,
     input_mode: VideoInputMode,
     source: ResolvedVideoSource,
     context_assets: list[dict[str, object]],
-    asset_id: uuid.UUID | None = None,
+    generation_parameters: dict[str, object],
+    operation: VideoGenerationOperation,
     version_id: uuid.UUID | None = None,
     job_id: uuid.UUID | None = None,
-) -> tuple[Asset, AssetVersion, GenerationJob]:
-    asset_id = asset_id or uuid.uuid4()
+) -> tuple[AssetVersion, GenerationJob]:
+    if version_number < 1:
+        raise ValueError("Video version number must be positive")
+    if not prompt.strip():
+        raise ValueError("Video prompt must not be empty")
+
+    if operation == VideoGenerationOperation.refinement:
+        if input_mode != VideoInputMode.video_to_video:
+            raise ValueError("Video refinement requires video-to-video input mode")
+        if source.origin != VideoSourceOrigin.asset_version:
+            raise ValueError("Video refinement requires an asset-version source")
+        source_record = source.input_record or {}
+        if optional_string(source_record.get("source_version_id")) != str(
+            source.source_version_id
+        ):
+            raise ValueError(
+                "Video refinement source version provenance is inconsistent"
+            )
+        if optional_string(source_record.get("source_asset_id")) != str(asset.id):
+            raise ValueError(
+                "Video refinement source must belong to the refined asset"
+            )
+        if generation_parameters:
+            raise ValueError("Video refinement does not accept generation controls")
+
     version_id = version_id or uuid.uuid4()
     job_id = job_id or uuid.uuid4()
-    generation_parameters: dict[str, object] = {
-        "duration": video_in.duration_seconds,
-        "aspect_ratio": video_in.aspect_ratio.value,
-        "resolution": video_in.resolution.value,
-    }
-    source_inputs = source.input_assets
+    generation_parameters = copy.deepcopy(generation_parameters)
+    source_inputs = copy.deepcopy(source.input_assets)
+    context_assets = copy.deepcopy(context_assets)
     source_resolution = source.as_metadata()
     provenance_inputs = [*source_inputs, *context_assets]
+    operation_value = operation.value
+    is_refinement = operation == VideoGenerationOperation.refinement
+    submission_source = (
+        "backend_genblaze_video_refinement_submission"
+        if is_refinement
+        else "backend_genblaze_video_submission"
+    )
+    label = (
+        video_refinement_version_label(
+            version_number=version_number,
+            state=VideoRefinementLabelState.queued,
+        )
+        if is_refinement
+        else "Queued Genblaze video"
+    )
+    based_on_version_id = (
+        source_resolution["source_version_id"] if is_refinement else None
+    )
     job_parameters: dict[str, Any] = {
         **generation_parameters,
+        "operation": operation_value,
         "input_mode": input_mode.value,
         "source_origin": source.origin.value,
         "source_version_id": source_resolution["source_version_id"],
@@ -960,14 +1086,17 @@ def build_queued_video_models(
         "kind": GenerationJobKind.video.value,
         "status": GenerationJobStatus.queued.value,
         "progress_percent": 0,
+        "operation": operation_value,
     }
     provenance = {
         "schema": VIDEO_PROVENANCE_SCHEMA,
         "schema_version": VIDEO_PROVENANCE_SCHEMA_VERSION,
         "provider": "gmicloud",
         "model": model,
-        "prompt": video_in.prompt,
-        "source": "backend_genblaze_video_submission",
+        "prompt": prompt,
+        "source": submission_source,
+        "operation": operation_value,
+        "based_on_version_id": based_on_version_id,
         "input_mode": input_mode.value,
         "generation_parameters": generation_parameters,
         "source_resolution": source_resolution,
@@ -976,6 +1105,7 @@ def build_queued_video_models(
         "input_assets": provenance_inputs,
         "job": job_record,
         "request": {
+            "operation": operation_value,
             "input_mode": input_mode.value,
             "generation_parameters": generation_parameters,
             "source_resolution": source_resolution,
@@ -983,40 +1113,28 @@ def build_queued_video_models(
             "context_assets": context_assets,
         },
     }
-    asset = Asset(
-        id=asset_id,
-        campaign_id=campaign_id,
-        title=video_in.title or f"{video_in.channel} video draft",
-        format=AssetFormat.video_concept,
-        channel=video_in.channel,
-        status=video_in.status,
-        reviewer=video_in.reviewer,
-        tags=list(dict.fromkeys(["genblaze", "video", *video_in.tags])),
-        summary=video_in.summary or (
-            "Queued Genblaze video generation with durable B2 storage and "
-            "provenance metadata."
-        ),
-    )
     version = AssetVersion(
         id=version_id,
-        asset_id=asset_id,
-        version_number=1,
-        label="Queued Genblaze video",
-        prompt=video_in.prompt,
+        asset_id=asset.id,
+        version_number=version_number,
+        label=label,
+        prompt=prompt,
         model=model,
         provider="gmicloud",
         storage_key=build_asset_version_storage_key(
-            campaign_id=campaign_id,
-            asset_id=asset_id,
-            version_number=1,
+            campaign_id=asset.campaign_id,
+            asset_id=asset.id,
+            version_number=version_number,
         ),
         generation_metadata={
             "provenance_schema": VIDEO_PROVENANCE_SCHEMA,
             "provenance_schema_version": VIDEO_PROVENANCE_SCHEMA_VERSION,
             "provider": "gmicloud",
             "model": model,
-            "prompt": video_in.prompt,
-            "source": "backend_genblaze_video_submission",
+            "prompt": prompt,
+            "source": submission_source,
+            "operation": operation_value,
+            "based_on_version_id": based_on_version_id,
             "input_mode": input_mode.value,
             "generation_parameters": generation_parameters,
             "source_resolution": source_resolution,
@@ -1039,13 +1157,61 @@ def build_queued_video_models(
         status=GenerationJobStatus.queued.value,
         provider="gmicloud",
         model=model,
-        prompt=video_in.prompt,
+        prompt=prompt,
         parameters=job_parameters,
         progress_percent=0,
         attempt_count=0,
     )
     asset.versions.append(version)
     version.generation_job = job
+    return version, job
+
+
+def build_queued_video_models(
+    *,
+    campaign_id: uuid.UUID,
+    video_in: VideoGenerationCreate,
+    model: str,
+    input_mode: VideoInputMode,
+    source: ResolvedVideoSource,
+    context_assets: list[dict[str, object]],
+    asset_id: uuid.UUID | None = None,
+    version_id: uuid.UUID | None = None,
+    job_id: uuid.UUID | None = None,
+) -> tuple[Asset, AssetVersion, GenerationJob]:
+    asset_id = asset_id or uuid.uuid4()
+    asset = Asset(
+        id=asset_id,
+        campaign_id=campaign_id,
+        title=video_in.title or f"{video_in.channel} video draft",
+        format=AssetFormat.video_concept,
+        channel=video_in.channel,
+        status=video_in.status,
+        reviewer=video_in.reviewer,
+        tags=list(dict.fromkeys(["genblaze", "video", *video_in.tags])),
+        summary=video_in.summary or (
+            "Queued Genblaze video generation with durable B2 storage and "
+            "provenance metadata."
+        ),
+    )
+    generation_parameters: dict[str, object] = {
+        "duration": video_in.duration_seconds,
+        "aspect_ratio": video_in.aspect_ratio.value,
+        "resolution": video_in.resolution.value,
+    }
+    version, job = build_queued_video_version_models(
+        asset=asset,
+        version_number=1,
+        prompt=video_in.prompt,
+        model=model,
+        input_mode=input_mode,
+        source=source,
+        context_assets=context_assets,
+        generation_parameters=generation_parameters,
+        operation=VideoGenerationOperation.generation,
+        version_id=version_id,
+        job_id=job_id,
+    )
     return asset, version, job
 
 
@@ -1208,6 +1374,76 @@ def retry_campaign_generation_job(
     )
     db.commit()
     return job
+
+
+@router.post(
+    "/assets/{asset_id}/refine-video",
+    response_model=VideoGenerationSubmissionRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def submit_video_refinement(
+    asset_id: uuid.UUID,
+    refinement_in: VideoRefinementCreate,
+    db: Session = Depends(get_db),
+    settings: Settings = Depends(get_settings),
+) -> VideoGenerationSubmissionRead:
+    locked_asset = get_video_asset_for_refinement(
+        asset_id=asset_id,
+        db=db,
+    )
+    validated_source = validate_latest_video_refinement_version(
+        locked_asset=locked_asset,
+        expected_latest_version_id=refinement_in.expected_latest_version_id,
+        settings=settings,
+    )
+    ensure_video_refinement_job_slot_available(locked_asset)
+
+    source = build_video_refinement_source(validated_source)
+    model = settings.genblaze_video_edit_model
+    input_mode = validate_video_refinement_submission(
+        model=model,
+        source=source,
+        settings=settings,
+    )
+    context_assets = campaign_brand_context_assets(
+        campaign_id=locked_asset.asset.campaign_id,
+        db=db,
+    )
+    version, job = build_queued_video_version_models(
+        asset=locked_asset.asset,
+        version_number=validated_source.version.version_number + 1,
+        prompt=refinement_in.prompt,
+        model=model,
+        input_mode=input_mode,
+        source=source,
+        context_assets=context_assets,
+        generation_parameters={},
+        operation=VideoGenerationOperation.refinement,
+    )
+    locked_asset.asset.status = VIDEO_REFINEMENT_CONTRACT.review_status_on_queue
+    locked_asset.asset.updated_at = datetime.now(UTC)
+    db.add(version)
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Video refinement job could not be queued",
+        ) from exc
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Video refinement job metadata could not be saved",
+        ) from exc
+
+    return load_video_submission(
+        asset_id=locked_asset.asset.id,
+        job_id=job.id,
+        db=db,
+    )
 
 
 @router.post(

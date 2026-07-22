@@ -135,6 +135,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         self.assertIs(version.generation_job, job)
         self.assertIsNone(version.artifact_storage_key)
         self.assertEqual(job.status, GenerationJobStatus.queued.value)
+        self.assertEqual(job.parameters["operation"], "video_generation")
         self.assertEqual(job.parameters["input_mode"], "text_to_video")
         self.assertEqual(job.parameters["source_origin"], "none")
         self.assertEqual(
@@ -162,6 +163,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
             2,
         )
         provenance = version.generation_metadata["provenance"]
+        self.assertEqual(provenance["operation"], "video_generation")
         self.assertEqual(provenance["schema_version"], 2)
         self.assertEqual(provenance["input_mode"], "text_to_video")
         self.assertEqual(
