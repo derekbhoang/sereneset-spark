@@ -7,7 +7,13 @@ from io import BytesIO
 from zipfile import ZIP_STORED, ZipFile
 
 from app.api.v1.routes.campaigns import make_campaign_export_zip
-from app.models.asset import Asset, AssetFormat, AssetVersion, ReviewStatus
+from app.models.asset import (
+    Asset,
+    AssetFormat,
+    AssetVersion,
+    AssetVersionInput,
+    ReviewStatus,
+)
 from app.models.brand_asset import BrandAsset, BrandAssetType, CampaignBrandAsset
 from app.models.campaign import Campaign
 from app.services.storage import B2StorageService, StorageObjectTooLargeError
@@ -222,12 +228,36 @@ class CampaignBrandAssetExportTests(unittest.TestCase):
 class CampaignVideoExportTests(unittest.TestCase):
     def test_streams_video_into_an_uncompressed_zip_entry(self) -> None:
         video_body = b"video-data" * 220_000
+        source_body = b"source-video"
         campaign = make_campaign()
         version = add_approved_video(campaign=campaign, body=video_body)
+        source_asset_id = uuid.uuid4()
+        source_version_id = uuid.uuid4()
+        source_storage_key = f"campaigns/{campaign.id}/source.mp4"
+        version.inputs = [
+            AssetVersionInput(
+                id=uuid.uuid4(),
+                asset_version_id=version.id,
+                role="source_creative",
+                storage_key=source_storage_key,
+                filename="source.mp4",
+                content_type="video/mp4",
+                media_kind="video",
+                size_bytes=len(source_body),
+                sha256=hashlib.sha256(source_body).hexdigest(),
+                source="source_version_artifact",
+                storage_ownership="source_asset_version",
+                source_asset_id=source_asset_id,
+                source_version_id=source_version_id,
+                source_version_number=2,
+                created_at=datetime.now(UTC),
+            )
+        ]
         storage = StubStorage(
             {
                 version.storage_key: b'{"stored":true}',
                 version.artifact_storage_key: video_body,
+                source_storage_key: source_body,
             }
         )
 
@@ -244,11 +274,18 @@ class CampaignVideoExportTests(unittest.TestCase):
             ]
             artifact_info = export_zip.getinfo(artifact_path)
             exported_video = export_zip.read(artifact_path)
+            input_record = manifest["assets"][0]["versions"][0][
+                "input_assets"
+            ][0]
 
         self.assertEqual(exported_video, video_body)
         self.assertEqual(artifact_info.compress_type, ZIP_STORED)
         self.assertEqual(storage.streams, [version.artifact_storage_key])
         self.assertNotIn(version.artifact_storage_key, storage.downloads)
+        self.assertEqual(input_record["media_kind"], "video")
+        self.assertEqual(input_record["source_asset_id"], str(source_asset_id))
+        self.assertEqual(input_record["source_version_id"], str(source_version_id))
+        self.assertEqual(input_record["source_version_number"], 2)
 
 
 if __name__ == "__main__":

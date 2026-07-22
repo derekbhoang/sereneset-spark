@@ -219,9 +219,13 @@ class VideoGenerationServiceTests(unittest.TestCase):
                         "url": "https://example.com/product.jpg",
                         "filename": "product.jpg",
                         "content_type": "image/jpeg",
+                        "media_kind": "image",
                         "size_bytes": 2048,
                         "sha256": "b" * 64,
                         "role": "source_creative",
+                        "source_asset_id": "64b530bd-f281-4ac1-ad48-1cd687a50269",
+                        "source_version_id": "740f9880-579b-40b2-a133-2fbb81b11922",
+                        "source_version_number": 3,
                     }
                 ],
                 context_assets=[
@@ -251,8 +255,12 @@ class VideoGenerationServiceTests(unittest.TestCase):
                 "role": "source_creative",
                 "filename": "product.jpg",
                 "content_type": "image/jpeg",
+                "media_kind": "image",
                 "size_bytes": 2048,
                 "sha256": "b" * 64,
+                "source_asset_id": "64b530bd-f281-4ac1-ad48-1cd687a50269",
+                "source_version_id": "740f9880-579b-40b2-a133-2fbb81b11922",
+                "source_version_number": 3,
             },
         )
         self.assertNotEqual(

@@ -143,9 +143,13 @@ type VersionInputAsset = {
   storageKey: string | null
   filename: string | null
   contentType: string | null
+  mediaKind: string | null
   sizeBytes: number | null
   sha256: string | null
   source: string | null
+  sourceAssetId: string | null
+  sourceVersionId: string | null
+  sourceVersionNumber: number | null
   brandAssetId: string | null
   brandAssetName: string | null
   usageGuidance: string | null
@@ -566,9 +570,13 @@ function getInputAssetsFromMetadata(
         storageKey: readString(inputAsset.storage_key),
         filename: readString(inputAsset.filename),
         contentType: readString(inputAsset.content_type),
+        mediaKind: readString(inputAsset.media_kind),
         sizeBytes: readNumber(inputAsset.size_bytes),
         sha256: readString(inputAsset.sha256),
         source: readString(inputAsset.source),
+        sourceAssetId: readString(inputAsset.source_asset_id),
+        sourceVersionId: readString(inputAsset.source_version_id),
+        sourceVersionNumber: readNumber(inputAsset.source_version_number),
         brandAssetId: readString(inputAsset.brand_asset_id),
         brandAssetName: readString(inputAsset.brand_asset_name),
         usageGuidance: readString(inputAsset.usage_guidance),
@@ -858,9 +866,13 @@ function mapAssetVersionInput(input: AssetVersionInputDto): VersionInputAsset {
     storageKey: input.storage_key,
     filename: input.filename,
     contentType: input.content_type,
+    mediaKind: input.media_kind,
     sizeBytes: input.size_bytes,
     sha256: input.sha256,
     source: input.source,
+    sourceAssetId: input.source_asset_id,
+    sourceVersionId: input.source_version_id,
+    sourceVersionNumber: input.source_version_number,
     brandAssetId: input.brand_asset_id,
     brandAssetName: input.brand_asset_name,
     usageGuidance: input.usage_guidance,
@@ -2804,6 +2816,7 @@ function App() {
                     <strong>{displayInputRole(inputAsset.role)}</strong>
                     <span>
                       {[
+                        inputAsset.mediaKind,
                         inputAsset.contentType,
                         inputAsset.sizeBytes === null
                           ? null
@@ -2817,6 +2830,14 @@ function App() {
                   {inputAsset.brandAssetName && (
                     <p className="provenance-brand-name">
                       Brand asset: {inputAsset.brandAssetName}
+                    </p>
+                  )}
+                  {inputAsset.sourceVersionId && (
+                    <p className="provenance-brand-name">
+                      Source version:{' '}
+                      {inputAsset.sourceVersionNumber === null
+                        ? inputAsset.sourceVersionId
+                        : `v${inputAsset.sourceVersionNumber} / ${inputAsset.sourceVersionId}`}
                     </p>
                   )}
                   {inputAsset.usageGuidance && (

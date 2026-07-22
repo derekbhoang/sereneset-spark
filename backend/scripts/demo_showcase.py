@@ -29,6 +29,7 @@ from app.models.generation_job import (
     GenerationJobKind,
     GenerationJobStatus,
 )
+from app.services.input_provenance import infer_input_media_kind
 from app.services.storage import (
     StoredObject,
     build_asset_version_artifact_storage_key,
@@ -295,6 +296,7 @@ def brand_asset_input_record(
         "storage_key": brand_asset.storage_key,
         "filename": brand_asset.filename,
         "content_type": brand_asset.content_type,
+        "media_kind": infer_input_media_kind(brand_asset.content_type).value,
         "size_bytes": brand_asset.size_bytes,
         "sha256": brand_asset.sha256,
         "source": "campaign_brand_asset",
@@ -313,11 +315,13 @@ def source_version_input_record(
     source_version: AssetVersion,
     sha256: str,
 ) -> dict[str, object]:
+    content_type = source_version.artifact_content_type or "application/octet-stream"
     return {
         "role": role,
         "storage_key": source_version.artifact_storage_key,
         "filename": source_version.artifact_filename,
-        "content_type": source_version.artifact_content_type,
+        "content_type": content_type,
+        "media_kind": infer_input_media_kind(content_type).value,
         "size_bytes": source_version.artifact_size_bytes,
         "sha256": sha256,
         "source": "source_version_artifact",
@@ -337,10 +341,14 @@ def input_model_values(record: dict[str, object]) -> dict[str, object]:
             "storage_key",
             "filename",
             "content_type",
+            "media_kind",
             "size_bytes",
             "sha256",
             "source",
             "storage_ownership",
+            "source_asset_id",
+            "source_version_id",
+            "source_version_number",
             "brand_asset_id",
             "campaign_brand_asset_id",
             "brand_asset_type",
@@ -369,6 +377,16 @@ def upsert_version_input(
         "campaign_brand_asset_id": (
             uuid.UUID(str(record["campaign_brand_asset_id"]))
             if record.get("campaign_brand_asset_id")
+            else None
+        ),
+        "source_asset_id": (
+            uuid.UUID(str(record["source_asset_id"]))
+            if record.get("source_asset_id")
+            else None
+        ),
+        "source_version_id": (
+            uuid.UUID(str(record["source_version_id"]))
+            if record.get("source_version_id")
             else None
         ),
     }

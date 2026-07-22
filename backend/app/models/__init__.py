@@ -1,6 +1,7 @@
 from app.models.asset import (
     Asset,
     AssetFormat,
+    AssetInputMediaKind,
     AssetVersion,
     AssetVersionInput,
     ReviewStatus,
@@ -20,6 +21,7 @@ from app.models.worker_heartbeat import (
 __all__ = [
     "Asset",
     "AssetFormat",
+    "AssetInputMediaKind",
     "AssetVersion",
     "AssetVersionInput",
     "BrandAsset",

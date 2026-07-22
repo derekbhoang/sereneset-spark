@@ -100,6 +100,9 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         self.assertEqual(job.status, GenerationJobStatus.queued.value)
         self.assertEqual(job.parameters["input_mode"], "text_to_video")
         self.assertEqual(job.parameters["context_assets"], [brand_context])
+        self.assertEqual(len(version.inputs), 1)
+        self.assertEqual(version.inputs[0].media_kind, "document")
+        self.assertEqual(version.inputs[0].storage_key, brand_context["storage_key"])
         self.assertEqual(
             version.generation_metadata["job"]["id"],
             str(job.id),
@@ -140,6 +143,7 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         record = source_version_input_record(source_version)
 
         self.assertEqual(record["content_type"], "image/webp")
+        self.assertEqual(record["media_kind"], "image")
         self.assertEqual(record["sha256"], "b" * 64)
         self.assertEqual(record["role"], "source_creative")
         self.assertEqual(record["storage_ownership"], "source_asset_version")
@@ -151,7 +155,9 @@ class VideoSubmissionRouteTests(unittest.TestCase):
         record = source_version_input_record(source_version)
 
         self.assertEqual(record["content_type"], "video/mp4")
+        self.assertEqual(record["media_kind"], "video")
         self.assertEqual(record["filename"], "source.mp4")
+        self.assertEqual(record["source_asset_id"], str(source_version.asset_id))
         self.assertEqual(record["source_version_id"], str(source_version.id))
 
     def test_source_lookup_accepts_stored_video_version(self) -> None:

@@ -32,6 +32,10 @@ from app.services.generation import (
     validate_video_generation_parameters,
     validate_video_input_assets,
 )
+from app.services.input_provenance import (
+    build_asset_version_input,
+    infer_input_media_kind,
+)
 from app.services.storage import build_asset_version_storage_key
 
 
@@ -244,15 +248,17 @@ def source_version_input_record(
     source_version: AssetVersion,
 ) -> dict[str, object]:
     filename = source_version.artifact_filename or "source-media"
+    content_type = infer_asset_media_type(
+        content_type=source_version.artifact_content_type,
+        filename=filename,
+        url=None,
+    )
     return {
         "role": "source_creative",
         "storage_key": source_version.artifact_storage_key,
         "filename": filename,
-        "content_type": infer_asset_media_type(
-            content_type=source_version.artifact_content_type,
-            filename=filename,
-            url=None,
-        ),
+        "content_type": content_type,
+        "media_kind": infer_input_media_kind(content_type).value,
         "size_bytes": source_version.artifact_size_bytes,
         "sha256": source_version_sha256(source_version),
         "source": "source_version_artifact",
@@ -302,6 +308,7 @@ def campaign_brand_asset_input_record(
         "storage_key": brand_asset.storage_key,
         "filename": brand_asset.filename,
         "content_type": brand_asset.content_type,
+        "media_kind": infer_input_media_kind(brand_asset.content_type).value,
         "size_bytes": brand_asset.size_bytes,
         "sha256": brand_asset.sha256,
         "source": "campaign_brand_asset",
@@ -425,6 +432,13 @@ def build_queued_video_models(
             "job": job_record,
             "provenance": provenance,
         },
+    )
+    version.inputs.extend(
+        build_asset_version_input(
+            asset_version_id=version_id,
+            record=input_record,
+        )
+        for input_record in provenance_inputs
     )
     job = GenerationJob(
         id=job_id,

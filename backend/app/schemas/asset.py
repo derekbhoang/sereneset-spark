@@ -4,7 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.asset import AssetFormat, ReviewStatus
+from app.models.asset import AssetFormat, AssetInputMediaKind, ReviewStatus
 
 
 class AssetVersionBase(BaseModel):
@@ -29,10 +29,14 @@ class AssetVersionInputRead(BaseModel):
     storage_key: str
     filename: str
     content_type: str
+    media_kind: AssetInputMediaKind
     size_bytes: int
-    sha256: str
+    sha256: str | None = None
     source: str
     storage_ownership: str
+    source_asset_id: uuid.UUID | None = None
+    source_version_id: uuid.UUID | None = None
+    source_version_number: int | None = Field(default=None, ge=1)
     brand_asset_id: uuid.UUID | None = None
     campaign_brand_asset_id: uuid.UUID | None = None
     brand_asset_type: str | None = None

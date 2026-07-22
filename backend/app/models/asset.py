@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, TYPE_CHECKING
 
-from sqlalchemy import DateTime
+from sqlalchemy import CheckConstraint, DateTime
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy import ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
@@ -22,6 +22,13 @@ class AssetFormat(str, Enum):
     copy = "copy"
     image = "image"
     video_concept = "video_concept"
+
+
+class AssetInputMediaKind(str, Enum):
+    image = "image"
+    video = "video"
+    document = "document"
+    other = "other"
 
 
 class ReviewStatus(str, Enum):
@@ -138,6 +145,19 @@ class AssetVersion(IdMixin, Base):
 
 class AssetVersionInput(IdMixin, Base):
     __tablename__ = "asset_version_inputs"
+    __table_args__ = (
+        CheckConstraint(
+            "media_kind IN ('image', 'video', 'document', 'other')",
+            name="ck_asset_version_inputs_media_kind",
+        ),
+        CheckConstraint(
+            "(source_asset_id IS NULL AND source_version_id IS NULL AND "
+            "source_version_number IS NULL) OR "
+            "(source_asset_id IS NOT NULL AND source_version_id IS NOT NULL "
+            "AND source_version_number > 0)",
+            name="ck_asset_version_inputs_source_version_snapshot",
+        ),
+    )
 
     asset_version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("asset_versions.id", ondelete="CASCADE"),
@@ -148,8 +168,14 @@ class AssetVersionInput(IdMixin, Base):
     storage_key: Mapped[str] = mapped_column(String(600), nullable=False)
     filename: Mapped[str] = mapped_column(String(240), nullable=False)
     content_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    media_kind: Mapped[str] = mapped_column(
+        String(20),
+        default=AssetInputMediaKind.other.value,
+        nullable=False,
+        index=True,
+    )
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
-    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     source: Mapped[str] = mapped_column(
         String(40),
         default="user_upload",
@@ -162,6 +188,18 @@ class AssetVersionInput(IdMixin, Base):
         nullable=False,
     )
     # These are immutable provenance snapshots, not live foreign keys.
+    source_asset_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        index=True,
+    )
+    source_version_id: Mapped[uuid.UUID | None] = mapped_column(
+        nullable=True,
+        index=True,
+    )
+    source_version_number: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
     brand_asset_id: Mapped[uuid.UUID | None] = mapped_column(
         nullable=True,
         index=True,

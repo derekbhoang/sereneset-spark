@@ -64,12 +64,16 @@ class ExportInputReference:
     url: str | None
     filename: str | None
     content_type: str | None
+    media_kind: str | None
     size_bytes: int | None
     sha256: str | None
     created_at: str | None
     source: str
     input_source: str | None = None
     storage_ownership: str | None = None
+    source_asset_id: str | None = None
+    source_version_id: str | None = None
+    source_version_number: int | None = None
     brand_asset_id: str | None = None
     campaign_brand_asset_id: str | None = None
     brand_asset_type: str | None = None
@@ -275,10 +279,22 @@ def serialize_asset_version_input(
         "storage_key": version_input.storage_key,
         "filename": version_input.filename,
         "content_type": version_input.content_type,
+        "media_kind": version_input.media_kind,
         "size_bytes": version_input.size_bytes,
         "sha256": version_input.sha256,
         "source": version_input.source,
         "storage_ownership": version_input.storage_ownership,
+        "source_asset_id": (
+            str(version_input.source_asset_id)
+            if version_input.source_asset_id is not None
+            else None
+        ),
+        "source_version_id": (
+            str(version_input.source_version_id)
+            if version_input.source_version_id is not None
+            else None
+        ),
+        "source_version_number": version_input.source_version_number,
         "brand_asset_id": (
             str(version_input.brand_asset_id)
             if version_input.brand_asset_id is not None
@@ -309,12 +325,16 @@ def export_input_record(
         "url": reference.url,
         "filename": reference.filename,
         "content_type": reference.content_type,
+        "media_kind": reference.media_kind,
         "size_bytes": reference.size_bytes,
         "sha256": reference.sha256,
         "created_at": reference.created_at,
         "metadata_source": reference.source,
         "source": reference.input_source,
         "storage_ownership": reference.storage_ownership,
+        "source_asset_id": reference.source_asset_id,
+        "source_version_id": reference.source_version_id,
+        "source_version_number": reference.source_version_number,
         "brand_asset_id": reference.brand_asset_id,
         "campaign_brand_asset_id": reference.campaign_brand_asset_id,
         "brand_asset_type": reference.brand_asset_type,
@@ -505,12 +525,24 @@ def asset_version_input_reference(
         url=None,
         filename=version_input.filename,
         content_type=version_input.content_type,
+        media_kind=version_input.media_kind,
         size_bytes=version_input.size_bytes,
         sha256=version_input.sha256,
         created_at=version_input.created_at.isoformat(),
         source="asset_version_input",
         input_source=version_input.source,
         storage_ownership=version_input.storage_ownership,
+        source_asset_id=(
+            str(version_input.source_asset_id)
+            if version_input.source_asset_id is not None
+            else None
+        ),
+        source_version_id=(
+            str(version_input.source_version_id)
+            if version_input.source_version_id is not None
+            else None
+        ),
+        source_version_number=version_input.source_version_number,
         brand_asset_id=(
             str(version_input.brand_asset_id)
             if version_input.brand_asset_id is not None
@@ -559,6 +591,7 @@ def metadata_input_asset_references(
                     filename=optional_string(input_item.get("filename"))
                     or filename_from_url(url),
                     content_type=optional_string(input_item.get("content_type")),
+                    media_kind=optional_string(input_item.get("media_kind")),
                     size_bytes=optional_int(input_item.get("size_bytes")),
                     sha256=optional_string(input_item.get("sha256")),
                     created_at=optional_string(input_item.get("created_at")),
@@ -566,6 +599,15 @@ def metadata_input_asset_references(
                     input_source=optional_string(input_item.get("source")),
                     storage_ownership=optional_string(
                         input_item.get("storage_ownership")
+                    ),
+                    source_asset_id=optional_string(
+                        input_item.get("source_asset_id")
+                    ),
+                    source_version_id=optional_string(
+                        input_item.get("source_version_id")
+                    ),
+                    source_version_number=optional_int(
+                        input_item.get("source_version_number")
                     ),
                     brand_asset_id=optional_string(
                         input_item.get("brand_asset_id")

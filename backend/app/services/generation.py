@@ -11,6 +11,8 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from app.core.config import Settings, get_settings
+from app.models.asset import AssetInputMediaKind
+from app.services.input_provenance import infer_input_media_kind
 
 
 class GenerationConfigurationError(RuntimeError):
@@ -59,10 +61,14 @@ INPUT_ASSET_METADATA_KEYS = (
     "storage_key",
     "filename",
     "content_type",
+    "media_kind",
     "size_bytes",
     "sha256",
     "source",
     "storage_ownership",
+    "source_asset_id",
+    "source_version_id",
+    "source_version_number",
     "brand_asset_id",
     "campaign_brand_asset_id",
     "brand_asset_type",
@@ -502,9 +508,10 @@ def video_model_input_requirement(model: str) -> VideoModelInputRequirement:
 
 
 def video_source_media_kind(content_type: str) -> VideoSourceMediaKind:
-    if content_type.startswith("image/"):
+    media_kind = infer_input_media_kind(content_type)
+    if media_kind == AssetInputMediaKind.image:
         return VideoSourceMediaKind.image
-    if content_type.startswith("video/"):
+    if media_kind == AssetInputMediaKind.video:
         return VideoSourceMediaKind.video
 
     raise GenerationInputError(

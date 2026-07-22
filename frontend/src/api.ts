@@ -144,10 +144,14 @@ export type AssetVersionInputDto = {
   storage_key: string
   filename: string
   content_type: string
+  media_kind: 'image' | 'video' | 'document' | 'other'
   size_bytes: number
-  sha256: string
+  sha256: string | null
   source: string
   storage_ownership: string
+  source_asset_id: string | null
+  source_version_id: string | null
+  source_version_number: number | null
   brand_asset_id: string | null
   campaign_brand_asset_id: string | null
   brand_asset_type: string | null

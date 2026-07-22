@@ -26,6 +26,7 @@ from app.db.session import get_db
 from app.models.asset import (
     Asset,
     AssetFormat,
+    AssetInputMediaKind,
     AssetVersion,
     AssetVersionInput,
     ReviewStatus,
@@ -51,6 +52,10 @@ from app.services.generation import (
     GenblazeGenerationService,
     ImageGenerationRequest,
     get_generation_service,
+)
+from app.services.input_provenance import (
+    build_asset_version_input,
+    infer_input_media_kind,
 )
 from app.services.storage import (
     B2StorageService,
@@ -117,6 +122,7 @@ class StoredGenerationInput:
     content_type: str
     size_bytes: int
     sha256: str
+    media_kind: str = AssetInputMediaKind.image.value
     source: str = "user_upload"
     owns_storage_object: bool = True
     brand_asset_id: uuid.UUID | None = None
@@ -369,27 +375,24 @@ def add_asset_version_inputs(
     version: AssetVersion,
     stored_inputs: list[StoredGenerationInput],
 ) -> None:
-    for stored_input in stored_inputs:
+    add_asset_version_input_records(
+        db=db,
+        version=version,
+        input_records=stored_generation_inputs_to_metadata(stored_inputs),
+    )
+
+
+def add_asset_version_input_records(
+    *,
+    db: Session,
+    version: AssetVersion,
+    input_records: list[dict[str, object]],
+) -> None:
+    for input_record in input_records:
         db.add(
-            AssetVersionInput(
+            build_asset_version_input(
                 asset_version_id=version.id,
-                role=stored_input.role,
-                storage_key=stored_input.storage_key,
-                filename=stored_input.filename,
-                content_type=stored_input.content_type,
-                size_bytes=stored_input.size_bytes,
-                sha256=stored_input.sha256,
-                source=stored_input.source,
-                storage_ownership=(
-                    "asset_version"
-                    if stored_input.owns_storage_object
-                    else "brand_asset"
-                ),
-                brand_asset_id=stored_input.brand_asset_id,
-                campaign_brand_asset_id=stored_input.campaign_brand_asset_id,
-                brand_asset_type=stored_input.brand_asset_type,
-                brand_asset_name=stored_input.brand_asset_name,
-                usage_guidance=stored_input.usage_guidance,
+                record=input_record,
             )
         )
 
@@ -402,6 +405,7 @@ def stored_generation_input_to_metadata(
         "storage_key": stored_input.storage_key,
         "filename": stored_input.filename,
         "content_type": stored_input.content_type,
+        "media_kind": stored_input.media_kind,
         "size_bytes": stored_input.size_bytes,
         "sha256": stored_input.sha256,
         "source": stored_input.source,
@@ -534,6 +538,7 @@ def campaign_brand_asset_generation_inputs(
                 storage_key=brand_asset.storage_key,
                 filename=brand_asset.filename,
                 content_type=content_type,
+                media_kind=infer_input_media_kind(content_type).value,
                 size_bytes=brand_asset.size_bytes,
                 sha256=brand_asset.sha256,
                 source="campaign_brand_asset",
@@ -616,9 +621,12 @@ def latest_version_artifact_input_metadata(
             "storage_key": latest_version.artifact_storage_key,
             "filename": artifact_filename,
             "content_type": artifact_content_type,
+            "media_kind": AssetInputMediaKind.image.value,
             "size_bytes": latest_version.artifact_size_bytes,
             "sha256": optional_string(artifact_flow.get("source_sha256")),
             "source": "latest_version_artifact",
+            "storage_ownership": "source_asset_version",
+            "source_asset_id": str(latest_version.asset_id),
             "source_version_id": str(latest_version.id),
             "source_version_number": latest_version.version_number,
         }
@@ -1302,10 +1310,22 @@ def asset_version_input_to_sidecar(
         "storage_key": version_input.storage_key,
         "filename": version_input.filename,
         "content_type": version_input.content_type,
+        "media_kind": version_input.media_kind,
         "size_bytes": version_input.size_bytes,
         "sha256": version_input.sha256,
         "source": version_input.source,
         "storage_ownership": version_input.storage_ownership,
+        "source_asset_id": (
+            str(version_input.source_asset_id)
+            if version_input.source_asset_id is not None
+            else None
+        ),
+        "source_version_id": (
+            str(version_input.source_version_id)
+            if version_input.source_version_id is not None
+            else None
+        ),
+        "source_version_number": version_input.source_version_number,
         "brand_asset_id": (
             str(version_input.brand_asset_id)
             if version_input.brand_asset_id is not None
@@ -1783,6 +1803,11 @@ def generate_asset_version(
             version=version,
             stored_inputs=brand_inputs,
         )
+        add_asset_version_input_records(
+            db=db,
+            version=version,
+            input_records=latest_metadata_input_assets,
+        )
         uploaded_artifact_key = upload_generated_artifact(
             storage=storage,
             campaign=campaign,
@@ -1924,6 +1949,11 @@ def generate_asset_version_with_inputs(
             db=db,
             version=version,
             stored_inputs=version_inputs,
+        )
+        add_asset_version_input_records(
+            db=db,
+            version=version,
+            input_records=latest_metadata_input_assets,
         )
         uploaded_artifact_key = upload_generated_artifact(
             storage=storage,
