@@ -2779,6 +2779,7 @@ code {
   .detail-panel {
     height: 100%;
     min-height: 0;
+    padding-top: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
     scrollbar-color: #aab9b3 transparent;
@@ -2807,22 +2808,26 @@ code {
     position: sticky;
     top: 0;
     z-index: 4;
-    margin: -22px -22px 18px;
+    margin: 0 -22px 18px;
     padding: 18px 22px 14px;
     border-bottom: 1px solid var(--border);
     box-shadow: 0 8px 14px rgba(21, 28, 32, 0.04);
   }
 
   .creation-panel > .column-toolbar {
-    background: rgba(248, 250, 249, 0.97);
+    background: #f8faf9;
   }
 
   .asset-board > .board-toolbar {
-    background: rgba(255, 255, 255, 0.97);
+    background: #fff;
   }
 
   .detail-panel > .panel-heading {
-    background: rgba(245, 247, 246, 0.97);
+    background: #f5f7f6;
+  }
+
+  .detail-panel > .empty-state:first-child {
+    margin-top: 22px;
   }
 
   .creation-panel:focus-visible,
