@@ -3,7 +3,10 @@ uvicorn[standard]
 sqlalchemy
 alembic
 boto3
-genblaze[gmicloud]
+# Keep this verified Genblaze set in sync when upgrading.
+genblaze-core==0.3.4
+genblaze-gmicloud==0.3.2
+genblaze-s3==0.3.4
 httpx
 python-multipart
 psycopg[binary]
