@@ -577,6 +577,21 @@ export function submitVideoGeneration(
   )
 }
 
+export function submitVideoGenerationWithInput(
+  campaignId: string,
+  video: VideoGenerationCreateDto,
+  file: File,
+): Promise<VideoGenerationSubmissionDto> {
+  const formData = new FormData()
+  formData.append('payload', JSON.stringify(video))
+  formData.append('file', file)
+
+  return uploadRequest<VideoGenerationSubmissionDto>(
+    `/campaigns/${campaignId}/assets/generate-video-with-input`,
+    formData,
+  )
+}
+
 export function fetchCampaignGenerationJobs(
   campaignId: string,
   filters: GenerationJobFilters = {},

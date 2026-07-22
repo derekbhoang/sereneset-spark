@@ -27,6 +27,7 @@ import {
   getCampaignExportUrl,
   retryCampaignGenerationJob,
   submitVideoGeneration,
+  submitVideoGenerationWithInput,
   updateAssetStatus as patchAssetStatus,
   uploadBrandAsset,
   uploadAssetVersionArtifact,
@@ -153,6 +154,7 @@ type VersionInputAsset = {
   brandAssetId: string | null
   brandAssetName: string | null
   usageGuidance: string | null
+  contentValidation: Record<string, unknown> | null
 }
 
 type BrandAssetFormState = {
@@ -164,18 +166,30 @@ type BrandAssetFormState = {
   sourceUrl: string
 }
 
+type VideoSourceMediaKind = 'image' | 'video'
+type VideoSourceMode = 'none' | 'stored' | 'upload'
+
+type VideoSourceUpload = {
+  file: File
+  previewUrl: string
+}
+
 type VideoSourceOption =
   | {
       key: string
       kind: 'brand_asset'
       brandAssetId: string
       label: string
+      mediaKind: VideoSourceMediaKind
+      filename: string
     }
   | {
       key: string
       kind: 'asset_version'
       versionId: string
       label: string
+      mediaKind: VideoSourceMediaKind
+      filename: string
     }
 
 const defaultPrompt =
@@ -270,6 +284,12 @@ const referenceRoleLabels: Record<GenerationInputRole, string> = {
 const videoDurationOptions = [4, 6, 8] as const
 const videoAspectRatios: VideoAspectRatio[] = ['16:9', '9:16']
 const videoResolutions: VideoResolution[] = ['720p', '1080p']
+const videoEditModel = 'wan2.7-videoedit'
+const videoInputModeLabels: Record<string, string> = {
+  text_to_video: 'Text to video',
+  image_to_video: 'Image to video',
+  video_to_video: 'Video to video',
+}
 const generationJobStatusLabels: Record<GenerationJobStatus, string> = {
   queued: 'Queued',
   running: 'Generating',
@@ -280,7 +300,9 @@ const generationJobStatusLabels: Record<GenerationJobStatus, string> = {
 
 const maxReferenceImageCount = 5
 const maxReferenceImageSizeBytes = 25 * 1024 * 1024
+const maxVideoSourceSizeBytes = 100 * 1024 * 1024
 const allowedReferenceImageTypes = ['image/png', 'image/jpeg', 'image/webp']
+const allowedVideoSourceTypes = ['', 'application/octet-stream', 'video/mp4']
 
 function isActiveGenerationJobStatus(status: GenerationJobStatus): boolean {
   return status === 'queued' || status === 'running'
@@ -360,50 +382,86 @@ function getFileExtension(filename: string | null): string {
   return extension.slice(0, 5).toLowerCase()
 }
 
-function isEligibleVideoSourceFile(
+function getVideoSourceMediaKind(
   contentType: string | null,
   filename: string | null,
   sizeBytes: number | null,
-): boolean {
-  if (!filename || !sizeBytes || sizeBytes > maxReferenceImageSizeBytes) {
-    return false
+): VideoSourceMediaKind | null {
+  if (!filename || !sizeBytes || sizeBytes <= 0) {
+    return null
   }
 
-  const normalizedContentType = contentType
-    ?.split(';', 1)[0]
-    .trim()
-    .toLowerCase()
+  const normalizedContentType =
+    contentType?.split(';', 1)[0].trim().toLowerCase() ?? ''
+  const extension = getFileExtension(filename)
 
-  return (
-    (normalizedContentType
-      ? allowedReferenceImageTypes.includes(normalizedContentType)
-      : false) ||
-    ['jpg', 'jpeg', 'png', 'webp'].includes(
-      getFileExtension(filename),
-    )
+  if (
+    sizeBytes <= maxReferenceImageSizeBytes &&
+    ['jpg', 'jpeg', 'png', 'webp'].includes(extension) &&
+    (allowedReferenceImageTypes.includes(normalizedContentType) ||
+      normalizedContentType === '' ||
+      normalizedContentType === 'application/octet-stream')
+  ) {
+    return 'image'
+  }
+
+  if (
+    sizeBytes <= maxVideoSourceSizeBytes &&
+    extension === 'mp4' &&
+    allowedVideoSourceTypes.includes(normalizedContentType)
+  ) {
+    return 'video'
+  }
+
+  return null
+}
+
+function getVideoSourceVersionMediaKind(
+  version: AssetVersion,
+): VideoSourceMediaKind | null {
+  if (!version.artifactStorageKey) {
+    return null
+  }
+
+  return getVideoSourceMediaKind(
+    version.artifactContentType,
+    version.artifactFilename,
+    version.artifactSizeBytes,
   )
 }
 
-function isEligibleVideoSourceVersion(version: AssetVersion): boolean {
-  return Boolean(
-    version.artifactStorageKey &&
-      isEligibleVideoSourceFile(
-        version.artifactContentType,
-        version.artifactFilename,
-        version.artifactSizeBytes,
-      ),
+function getVideoSourceBrandAssetMediaKind(
+  asset: BrandAssetDto,
+): VideoSourceMediaKind | null {
+  if (!asset.is_active) {
+    return null
+  }
+
+  return getVideoSourceMediaKind(
+    asset.content_type,
+    asset.filename,
+    asset.size_bytes,
   )
 }
 
-function isEligibleVideoSourceBrandAsset(asset: BrandAssetDto): boolean {
-  return (
-    asset.is_active &&
-    isEligibleVideoSourceFile(
-      asset.content_type,
-      asset.filename,
-      asset.size_bytes,
-    )
+function validateVideoSourceUpload(file: File): string | null {
+  const mediaKind = getVideoSourceMediaKind(
+    file.type,
+    file.name,
+    file.size,
   )
+
+  if (file.size <= 0) {
+    return 'Source video must not be empty'
+  }
+  if (file.size > maxVideoSourceSizeBytes) {
+    return 'Source video must be 100 MB or smaller'
+  }
+  if (mediaKind !== 'video') {
+    return 'Source video must be an MP4 file'
+  }
+
+  return null
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -480,6 +538,45 @@ function formatVerifiedState(value: boolean | null): string {
   }
 
   return 'Not recorded'
+}
+
+function formatVideoInputMode(value: string | null): string {
+  return value ? (videoInputModeLabels[value] ?? titleCase(value)) : 'Not recorded'
+}
+
+function formatSourceOrigin(value: string | null): string {
+  return value ? titleCase(value) : 'Not recorded'
+}
+
+function formatGenerationParameters(value: unknown): string {
+  if (!isRecord(value)) {
+    return 'None'
+  }
+
+  const parameters = Object.entries(value)
+    .filter(([, item]) =>
+      ['string', 'number', 'boolean'].includes(typeof item),
+    )
+    .map(([key, item]) => `${titleCase(key)}: ${String(item)}`)
+
+  return parameters.join(' / ') || 'None'
+}
+
+function formatInputContentValidation(
+  value: Record<string, unknown> | null,
+): string | null {
+  if (!value || readString(value.container) !== 'mp4') {
+    return null
+  }
+
+  const videoTrackCount = readNumber(value.video_track_count)
+  if (videoTrackCount === null || videoTrackCount < 1) {
+    return null
+  }
+
+  return `MP4 verified / ${videoTrackCount} video ${
+    videoTrackCount === 1 ? 'track' : 'tracks'
+  }`
 }
 
 function isImageDescriptor(
@@ -580,6 +677,9 @@ function getInputAssetsFromMetadata(
         brandAssetId: readString(inputAsset.brand_asset_id),
         brandAssetName: readString(inputAsset.brand_asset_name),
         usageGuidance: readString(inputAsset.usage_guidance),
+        contentValidation: isRecord(inputAsset.content_validation)
+          ? inputAsset.content_validation
+          : null,
       }))
       .filter((inputAsset) => inputAsset.storageKey || inputAsset.filename),
   )
@@ -614,6 +714,9 @@ function mergeVersionInputAssets(
         mergedInputAssets[existingIndex] = {
           ...inputAsset,
           source: mergedInputAssets[existingIndex].source ?? inputAsset.source,
+          contentValidation:
+            mergedInputAssets[existingIndex].contentValidation ??
+            inputAsset.contentValidation,
         }
       }
     }
@@ -876,6 +979,7 @@ function mapAssetVersionInput(input: AssetVersionInputDto): VersionInputAsset {
     brandAssetId: input.brand_asset_id,
     brandAssetName: input.brand_asset_name,
     usageGuidance: input.usage_guidance,
+    contentValidation: null,
   }
 }
 
@@ -944,7 +1048,11 @@ function App() {
     useState<VideoAspectRatio>('16:9')
   const [videoResolution, setVideoResolution] =
     useState<VideoResolution>('720p')
+  const [videoSourceMode, setVideoSourceMode] =
+    useState<VideoSourceMode>('none')
   const [videoSourceKey, setVideoSourceKey] = useState('')
+  const [videoSourceUpload, setVideoSourceUpload] =
+    useState<VideoSourceUpload | null>(null)
   const [isLoadingCampaigns, setIsLoadingCampaigns] = useState(true)
   const [isLoadingAssets, setIsLoadingAssets] = useState(false)
   const [isLoadingGenerationJobs, setIsLoadingGenerationJobs] = useState(false)
@@ -1025,6 +1133,8 @@ function App() {
   const generationJobsRef = useRef<GenerationJobDto[]>([])
   const generationReferenceImagesRef = useRef<ReferenceImage[]>([])
   const refineReferenceImagesRef = useRef<Record<string, ReferenceImage[]>>({})
+  const videoSourceUploadRef = useRef<VideoSourceUpload | null>(null)
+  const videoSourceFileInputRef = useRef<HTMLInputElement>(null)
   const brandAssetFileInputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -1071,11 +1181,18 @@ function App() {
     refineReferenceImagesRef.current = refineReferenceImages
   }, [refineReferenceImages])
 
+  useEffect(() => {
+    videoSourceUploadRef.current = videoSourceUpload
+  }, [videoSourceUpload])
+
   useEffect(
     () => () => {
       revokeReferenceImages(generationReferenceImagesRef.current)
       for (const images of Object.values(refineReferenceImagesRef.current)) {
         revokeReferenceImages(images)
+      }
+      if (videoSourceUploadRef.current) {
+        URL.revokeObjectURL(videoSourceUploadRef.current.previewUrl)
       }
     },
     [],
@@ -1178,7 +1295,16 @@ function App() {
     setGenerationJobs([])
     setGenerationJobsCampaignId(selectedCampaignId)
     setGenerationJobsError(null)
+    setVideoSourceMode('none')
     setVideoSourceKey('')
+    if (videoSourceUploadRef.current) {
+      URL.revokeObjectURL(videoSourceUploadRef.current.previewUrl)
+      videoSourceUploadRef.current = null
+    }
+    setVideoSourceUpload(null)
+    if (videoSourceFileInputRef.current) {
+      videoSourceFileInputRef.current.value = ''
+    }
 
     async function loadGenerationJobs(campaignId: string) {
       setIsLoadingGenerationJobs(true)
@@ -1342,9 +1468,10 @@ function App() {
 
     for (const attachment of campaignBrandAssets) {
       const brandAsset = attachment.brand_asset
+      const mediaKind = getVideoSourceBrandAssetMediaKind(brandAsset)
       if (
         addedBrandAssetIds.has(brandAsset.id) ||
-        !isEligibleVideoSourceBrandAsset(brandAsset)
+        !mediaKind
       ) {
         continue
       }
@@ -1355,32 +1482,61 @@ function App() {
         kind: 'brand_asset',
         brandAssetId: brandAsset.id,
         label: `Brand / ${brandAsset.name} / ${brandAsset.filename}`,
+        mediaKind,
+        filename: brandAsset.filename,
       })
     }
 
     for (const asset of campaignAssets) {
-      if (asset.format !== 'Image') {
+      if (asset.format !== 'Image' && asset.format !== 'Video concept') {
         continue
       }
 
       for (const version of sortVersionsNewestFirst(asset.versions)) {
-        if (!isEligibleVideoSourceVersion(version)) {
+        const mediaKind = getVideoSourceVersionMediaKind(version)
+        if (!mediaKind) {
           continue
         }
 
+        const filename =
+          version.artifactFilename ??
+          (mediaKind === 'video' ? 'video.mp4' : 'image')
         options.push({
           key: `version:${version.versionId}`,
           kind: 'asset_version',
           versionId: version.versionId,
-          label: `Generated / ${asset.title} / v${version.versionNumber} / ${
-            version.artifactFilename ?? 'image'
-          }`,
+          label: `Generated / ${asset.title} / v${version.versionNumber} / ${filename}`,
+          mediaKind,
+          filename,
         })
       }
     }
 
     return options
   }, [campaignAssets, campaignBrandAssets])
+  const selectedVideoSource = useMemo(
+    () =>
+      videoSourceOptions.find((option) => option.key === videoSourceKey) ??
+      null,
+    [videoSourceKey, videoSourceOptions],
+  )
+  const storedImageSourceOptions = videoSourceOptions.filter(
+    (option) => option.mediaKind === 'image',
+  )
+  const storedVideoSourceOptions = videoSourceOptions.filter(
+    (option) => option.mediaKind === 'video',
+  )
+  const selectedVideoSourceMediaKind =
+    videoSourceMode === 'upload'
+      ? 'video'
+      : videoSourceMode === 'stored'
+        ? selectedVideoSource?.mediaKind ?? null
+        : null
+  const isVideoToVideo = selectedVideoSourceMediaKind === 'video'
+  const hasValidVideoSource =
+    videoSourceMode === 'none' ||
+    (videoSourceMode === 'stored' && selectedVideoSource !== null) ||
+    (videoSourceMode === 'upload' && videoSourceUpload !== null)
 
   const channels = useMemo(
     () => ['All', ...(selectedCampaign?.channels ?? [])],
@@ -1906,6 +2062,54 @@ function App() {
     )
   }
 
+  function clearVideoSourceUpload() {
+    if (videoSourceUploadRef.current) {
+      URL.revokeObjectURL(videoSourceUploadRef.current.previewUrl)
+      videoSourceUploadRef.current = null
+    }
+    setVideoSourceUpload(null)
+    if (videoSourceFileInputRef.current) {
+      videoSourceFileInputRef.current.value = ''
+    }
+  }
+
+  function selectVideoSourceMode(mode: VideoSourceMode) {
+    setVideoSourceMode(mode)
+    if (mode !== 'stored') {
+      setVideoSourceKey('')
+    }
+    if (mode !== 'upload') {
+      clearVideoSourceUpload()
+    }
+  }
+
+  function selectVideoSourceUpload(file: File | null) {
+    if (!file) {
+      clearVideoSourceUpload()
+      return
+    }
+
+    const validationError = validateVideoSourceUpload(file)
+    if (validationError) {
+      clearVideoSourceUpload()
+      setErrorMessage(validationError)
+      return
+    }
+
+    if (videoSourceUploadRef.current) {
+      URL.revokeObjectURL(videoSourceUploadRef.current.previewUrl)
+    }
+    const upload = {
+      file,
+      previewUrl: URL.createObjectURL(file),
+    }
+    videoSourceUploadRef.current = upload
+    setVideoSourceUpload(upload)
+    setVideoSourceMode('upload')
+    setVideoSourceKey('')
+    setErrorMessage(null)
+  }
+
   function selectCampaign(campaignId: string) {
     if (campaignId === selectedCampaignId) {
       setOpenCampaignMenuId(null)
@@ -1924,6 +2128,9 @@ function App() {
     setChannelFilter('All')
     setRequestChannel(nextCampaign?.channels[0] ?? '')
     clearGenerationReferenceImages()
+    setVideoSourceMode('none')
+    setVideoSourceKey('')
+    clearVideoSourceUpload()
   }
 
   function resetBrandAssetForm() {
@@ -2230,9 +2437,10 @@ function App() {
       let createdAssetDto: AssetDto
 
       if (requestFormat === 'Video concept') {
-        const selectedVideoSource = videoSourceOptions.find(
-          (option) => option.key === videoSourceKey,
-        )
+        if (!hasValidVideoSource) {
+          return
+        }
+
         const videoPayload: VideoGenerationCreateDto = {
           title: `${requestChannel} video draft`,
           channel: requestChannel,
@@ -2245,19 +2453,29 @@ function App() {
           duration_seconds: videoDurationSeconds,
           aspect_ratio: videoAspectRatio,
           resolution: videoResolution,
+          model: isVideoToVideo ? videoEditModel : null,
           source_version_id:
+            videoSourceMode === 'stored' &&
             selectedVideoSource?.kind === 'asset_version'
               ? selectedVideoSource.versionId
               : null,
           source_brand_asset_id:
+            videoSourceMode === 'stored' &&
             selectedVideoSource?.kind === 'brand_asset'
               ? selectedVideoSource.brandAssetId
               : null,
         }
-        const submission = await submitVideoGeneration(
-          selectedCampaign.id,
-          videoPayload,
-        )
+        const submission =
+          videoSourceMode === 'upload' && videoSourceUpload
+            ? await submitVideoGenerationWithInput(
+                selectedCampaign.id,
+                videoPayload,
+                videoSourceUpload.file,
+              )
+            : await submitVideoGeneration(
+                selectedCampaign.id,
+                videoPayload,
+              )
         const existingJobs =
           generationJobsCampaignId === selectedCampaign.id
             ? generationJobsRef.current
@@ -2311,6 +2529,10 @@ function App() {
 
       if (requestFormat !== 'Video concept') {
         clearGenerationReferenceImages()
+      } else {
+        setVideoSourceMode('none')
+        setVideoSourceKey('')
+        clearVideoSourceUpload()
       }
     } catch (error) {
       setErrorMessage(getErrorMessage(error))
@@ -2671,6 +2893,7 @@ function App() {
     const aspectRatio = readString(job.parameters.aspect_ratio)
     const resolution = readString(job.parameters.resolution)
     const inputMode = readString(job.parameters.input_mode)
+    const isVideoEditJob = inputMode === 'video_to_video'
     const isActionPending = generationJobActionId === job.id
 
     return (
@@ -2692,14 +2915,15 @@ function App() {
         </progress>
 
         <div className="generation-job-facts">
-          {duration !== null && <span>{duration}s</span>}
-          {aspectRatio && <span>{aspectRatio}</span>}
-          {resolution && <span>{resolution}</span>}
+          {!isVideoEditJob && duration !== null && <span>{duration}s</span>}
+          {!isVideoEditJob && aspectRatio && <span>{aspectRatio}</span>}
+          {!isVideoEditJob && resolution && <span>{resolution}</span>}
           {inputMode && (
             <span>
-              {inputMode === 'image_to_video' ? 'Image to video' : 'Text to video'}
+              {videoInputModeLabels[inputMode] ?? inputMode}
             </span>
           )}
+          {isVideoEditJob && <span>{job.model}</span>}
           {job.attempt_count > 0 && <span>Attempt {job.attempt_count}</span>}
         </div>
 
@@ -2740,11 +2964,37 @@ function App() {
   function getVersionProvenance(version: AssetVersion) {
     const metadata = version.generationMetadata
     const provenance = isRecord(metadata.provenance) ? metadata.provenance : {}
+    const request = isRecord(provenance.request)
+      ? provenance.request
+      : isRecord(metadata.request)
+        ? metadata.request
+        : {}
+    const execution = isRecord(provenance.execution)
+      ? provenance.execution
+      : isRecord(metadata.execution)
+        ? metadata.execution
+        : {}
+    const inputRouting = isRecord(execution.input_routing)
+      ? execution.input_routing
+      : {}
+    const sourceResolution = isRecord(provenance.source_resolution)
+      ? provenance.source_resolution
+      : isRecord(metadata.source_resolution)
+        ? metadata.source_resolution
+        : isRecord(request.source_resolution)
+          ? request.source_resolution
+          : {}
     const artifactFlow = isRecord(metadata.artifact_flow)
       ? metadata.artifact_flow
       : isRecord(provenance.artifact_flow)
         ? provenance.artifact_flow
         : {}
+    const genblazeInputParameter = readString(
+      inputRouting.genblaze_input_parameter,
+    )
+    const providerSourceParameter = readString(
+      inputRouting.provider_source_parameter,
+    )
 
     return {
       provider: firstString(metadata.provider, provenance.provider, version.provider),
@@ -2756,6 +3006,30 @@ function App() {
       manifestVerified:
         readBoolean(metadata.manifest_verified) ??
         readBoolean(provenance.manifest_verified),
+      schemaVersion:
+        readNumber(metadata.provenance_schema_version) ??
+        readNumber(provenance.schema_version),
+      inputMode: firstString(
+        metadata.input_mode,
+        provenance.input_mode,
+        request.input_mode,
+      ),
+      sourceOrigin: readString(sourceResolution.origin),
+      providerJobId: firstString(
+        metadata.provider_job_id,
+        provenance.provider_job_id,
+      ),
+      requestedParameters: formatGenerationParameters(
+        request.generation_parameters,
+      ),
+      effectiveParameters: formatGenerationParameters(execution.parameters),
+      inputRoute:
+        [genblazeInputParameter, providerSourceParameter]
+          .filter((value): value is string => Boolean(value))
+          .join(' to ') || null,
+      contextAssetsRouted: readBoolean(
+        inputRouting.context_assets_routed_to_provider,
+      ),
       generatedStorageKey: firstString(
         artifactFlow.source_storage_key,
         version.generatedPreview?.storageKey,
@@ -2789,6 +3063,18 @@ function App() {
             <strong>{displayValue(provenance.model)}</strong>
           </div>
           <div>
+            <span>Mode</span>
+            <strong>{formatVideoInputMode(provenance.inputMode)}</strong>
+          </div>
+          <div>
+            <span>Source</span>
+            <strong>{formatSourceOrigin(provenance.sourceOrigin)}</strong>
+          </div>
+          <div>
+            <span>Input route</span>
+            <strong>{displayValue(provenance.inputRoute)}</strong>
+          </div>
+          <div>
             <span>Manifest</span>
             <strong>{manifestLabel}</strong>
           </div>
@@ -2798,6 +3084,32 @@ function App() {
           <span>Prompt</span>
           <p>{displayValue(provenance.prompt)}</p>
         </div>
+
+        {(provenance.schemaVersion !== null || provenance.inputMode) && (
+          <div className="provenance-item">
+            <span>Generation contract</span>
+            <div className="provenance-parameter-grid">
+              <div>
+                <span>Requested</span>
+                <strong>{provenance.requestedParameters}</strong>
+              </div>
+              <div>
+                <span>Sent</span>
+                <strong>{provenance.effectiveParameters}</strong>
+              </div>
+              <div>
+                <span>Context assets</span>
+                <strong>
+                  {provenance.contextAssetsRouted === true
+                    ? 'Provider input'
+                    : provenance.contextAssetsRouted === false
+                      ? 'Provenance only'
+                      : 'Not recorded'}
+                </strong>
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="provenance-item">
           <span>Input assets</span>
@@ -2845,6 +3157,15 @@ function App() {
                       {inputAsset.usageGuidance}
                     </small>
                   )}
+                  {formatInputContentValidation(
+                    inputAsset.contentValidation,
+                  ) && (
+                    <small className="provenance-validation">
+                      {formatInputContentValidation(
+                        inputAsset.contentValidation,
+                      )}
+                    </small>
+                  )}
                   <code>{displayValue(inputAsset.storageKey)}</code>
                   <div className="provenance-input-foot">
                     <span>{displayValue(inputAsset.source)}</span>
@@ -2854,7 +3175,7 @@ function App() {
               ))}
             </div>
           ) : (
-            <p>No reference images recorded.</p>
+            <p>No source or context assets recorded.</p>
           )}
         </div>
 
@@ -2886,6 +3207,10 @@ function App() {
 
         <div className="provenance-foot">
           <span>{displayValue(provenance.source)}</span>
+          {provenance.schemaVersion !== null && (
+            <span>Provenance v{provenance.schemaVersion}</span>
+          )}
+          {provenance.providerJobId && <span>Provider job recorded</span>}
           <span>{version.artifactStorageKey ? 'Export ready' : 'Needs artifact'}</span>
         </div>
       </div>
@@ -3732,7 +4057,14 @@ function App() {
                         aria-pressed={requestFormat === format}
                         className={requestFormat === format ? 'is-selected' : ''}
                         key={format}
-                        onClick={() => setRequestFormat(format)}
+                        onClick={() => {
+                          setRequestFormat(format)
+                          if (format !== 'Video concept') {
+                            setVideoSourceMode('none')
+                            setVideoSourceKey('')
+                            clearVideoSourceUpload()
+                          }
+                        }}
                         type="button"
                       >
                         {format}
@@ -3763,93 +4095,216 @@ function App() {
 
                   {requestFormat === 'Video concept' ? (
                     <div className="video-generation-controls">
-                      <label className="field">
-                        <span>Duration (seconds)</span>
-                        <select
-                          disabled={isGenerating}
-                          onChange={(event) =>
-                            setVideoDurationSeconds(
-                              Number(event.currentTarget.value),
-                            )
-                          }
-                          value={videoDurationSeconds}
-                        >
-                          {videoDurationOptions.map((duration) => (
-                            <option key={duration} value={duration}>
-                              {duration}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-
                       <div className="video-control">
-                        <span>Aspect ratio</span>
-                        <div className="segmented" aria-label="Aspect ratio">
-                          {videoAspectRatios.map((aspectRatio) => (
-                            <button
-                              aria-pressed={
-                                videoAspectRatio === aspectRatio
-                              }
-                              className={
-                                videoAspectRatio === aspectRatio
-                                  ? 'is-selected'
-                                  : ''
-                              }
-                              disabled={isGenerating}
-                              key={aspectRatio}
-                              onClick={() =>
-                                setVideoAspectRatio(aspectRatio)
-                              }
-                              type="button"
-                            >
-                              {aspectRatio}
-                            </button>
-                          ))}
-                        </div>
-                      </div>
-
-                      <div className="video-control">
-                        <span>Resolution</span>
+                        <span>Source</span>
                         <div
-                          className="segmented video-resolution-control"
-                          aria-label="Resolution"
+                          className="segmented video-source-mode-control"
+                          aria-label="Video source"
                         >
-                          {videoResolutions.map((resolution) => (
+                          {(
+                            [
+                              ['none', 'Text'],
+                              ['stored', 'Stored'],
+                              ['upload', 'Upload MP4'],
+                            ] as const
+                          ).map(([mode, label]) => (
                             <button
-                              aria-pressed={videoResolution === resolution}
+                              aria-pressed={videoSourceMode === mode}
                               className={
-                                videoResolution === resolution
-                                  ? 'is-selected'
-                                  : ''
+                                videoSourceMode === mode ? 'is-selected' : ''
                               }
                               disabled={isGenerating}
-                              key={resolution}
-                              onClick={() => setVideoResolution(resolution)}
+                              key={mode}
+                              onClick={() => selectVideoSourceMode(mode)}
                               type="button"
                             >
-                              {resolution}
+                              {label}
                             </button>
                           ))}
                         </div>
                       </div>
 
-                      <label className="field video-source-field">
-                        <span>Source image</span>
-                        <select
-                          disabled={isGenerating}
-                          onChange={(event) =>
-                            setVideoSourceKey(event.target.value)
-                          }
-                          value={videoSourceKey}
-                        >
-                          <option value="">Text to video (no source image)</option>
-                          {videoSourceOptions.map((option) => (
-                            <option key={option.key} value={option.key}>
-                              {option.label}
+                      {videoSourceMode === 'stored' && (
+                        <label className="field video-source-field">
+                          <span>Stored source</span>
+                          <select
+                            disabled={
+                              isGenerating || videoSourceOptions.length === 0
+                            }
+                            onChange={(event) =>
+                              setVideoSourceKey(event.target.value)
+                            }
+                            value={videoSourceKey}
+                          >
+                            <option value="">
+                              {videoSourceOptions.length
+                                ? 'Select stored media'
+                                : 'No eligible stored media'}
                             </option>
-                          ))}
-                        </select>
-                      </label>
+                            {storedImageSourceOptions.length > 0 && (
+                              <optgroup label="Images">
+                                {storedImageSourceOptions.map((option) => (
+                                  <option key={option.key} value={option.key}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </optgroup>
+                            )}
+                            {storedVideoSourceOptions.length > 0 && (
+                              <optgroup label="Videos">
+                                {storedVideoSourceOptions.map((option) => (
+                                  <option key={option.key} value={option.key}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </optgroup>
+                            )}
+                          </select>
+                        </label>
+                      )}
+
+                      {videoSourceMode === 'upload' && (
+                        <div className="video-source-upload">
+                          <label
+                            className={`metadata-button artifact-upload video-source-upload-button ${
+                              isGenerating ? 'is-disabled' : ''
+                            }`}
+                            htmlFor="video-source-upload"
+                          >
+                            Choose MP4
+                            <input
+                              accept=".mp4,video/mp4"
+                              disabled={isGenerating}
+                              id="video-source-upload"
+                              onChange={(event) =>
+                                selectVideoSourceUpload(
+                                  event.currentTarget.files?.[0] ?? null,
+                                )
+                              }
+                              ref={videoSourceFileInputRef}
+                              type="file"
+                            />
+                          </label>
+
+                          {videoSourceUpload && (
+                            <div className="video-source-upload-card">
+                              <video
+                                controls
+                                key={videoSourceUpload.previewUrl}
+                                muted
+                                preload="metadata"
+                                src={videoSourceUpload.previewUrl}
+                              />
+                              <div>
+                                <strong>{videoSourceUpload.file.name}</strong>
+                                <span>
+                                  {formatFileSize(videoSourceUpload.file.size)}
+                                </span>
+                              </div>
+                              <button
+                                className="reference-remove-button"
+                                disabled={isGenerating}
+                                onClick={clearVideoSourceUpload}
+                                type="button"
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {isVideoToVideo ? (
+                        <div className="video-edit-contract">
+                          <div>
+                            <span>Mode</span>
+                            <strong>Video to video</strong>
+                          </div>
+                          <div>
+                            <span>Model</span>
+                            <strong>{videoEditModel}</strong>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <label className="field">
+                            <span>Duration (seconds)</span>
+                            <select
+                              disabled={isGenerating}
+                              onChange={(event) =>
+                                setVideoDurationSeconds(
+                                  Number(event.currentTarget.value),
+                                )
+                              }
+                              value={videoDurationSeconds}
+                            >
+                              {videoDurationOptions.map((duration) => (
+                                <option key={duration} value={duration}>
+                                  {duration}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+
+                          <div className="video-control">
+                            <span>Aspect ratio</span>
+                            <div
+                              className="segmented"
+                              aria-label="Aspect ratio"
+                            >
+                              {videoAspectRatios.map((aspectRatio) => (
+                                <button
+                                  aria-pressed={
+                                    videoAspectRatio === aspectRatio
+                                  }
+                                  className={
+                                    videoAspectRatio === aspectRatio
+                                      ? 'is-selected'
+                                      : ''
+                                  }
+                                  disabled={isGenerating}
+                                  key={aspectRatio}
+                                  onClick={() =>
+                                    setVideoAspectRatio(aspectRatio)
+                                  }
+                                  type="button"
+                                >
+                                  {aspectRatio}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          <div className="video-control">
+                            <span>Resolution</span>
+                            <div
+                              className="segmented video-resolution-control"
+                              aria-label="Resolution"
+                            >
+                              {videoResolutions.map((resolution) => (
+                                <button
+                                  aria-pressed={
+                                    videoResolution === resolution
+                                  }
+                                  className={
+                                    videoResolution === resolution
+                                      ? 'is-selected'
+                                      : ''
+                                  }
+                                  disabled={isGenerating}
+                                  key={resolution}
+                                  onClick={() =>
+                                    setVideoResolution(resolution)
+                                  }
+                                  type="button"
+                                >
+                                  {resolution}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </>
+                      )}
                     </div>
                   ) : (
                     renderReferenceImagePicker({
@@ -3878,17 +4333,25 @@ function App() {
                   <button
                     className="button button-primary"
                     disabled={
-                      isGenerating || !requestChannel || !requestPrompt.trim()
+                      isGenerating ||
+                      !requestChannel ||
+                      !requestPrompt.trim() ||
+                      (requestFormat === 'Video concept' &&
+                        !hasValidVideoSource)
                     }
                     onClick={generateAsset}
                     type="button"
                   >
                     {isGenerating
                       ? requestFormat === 'Video concept'
-                        ? 'Queueing...'
+                        ? videoSourceMode === 'upload'
+                          ? 'Uploading...'
+                          : 'Queueing...'
                         : 'Generating...'
                       : requestFormat === 'Video concept'
-                        ? 'Queue video'
+                        ? isVideoToVideo
+                          ? 'Queue video edit'
+                          : 'Queue video'
                         : 'Generate asset'}
                   </button>
                 </div>
