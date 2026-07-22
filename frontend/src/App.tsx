@@ -305,6 +305,57 @@ const maxVideoSourceSizeBytes = 100 * 1024 * 1024
 const allowedReferenceImageTypes = ['image/png', 'image/jpeg', 'image/webp']
 const allowedVideoSourceTypes = ['', 'application/octet-stream', 'video/mp4']
 
+type CampaignLocation =
+  | { kind: 'root' }
+  | { kind: 'campaign'; campaignId: string }
+  | { kind: 'unknown' }
+
+function campaignPath(campaignId: string): string {
+  return `/campaigns/${encodeURIComponent(campaignId)}`
+}
+
+function parseCampaignLocation(pathname: string): CampaignLocation {
+  const normalizedPath = pathname.replace(/\/+$/, '') || '/'
+  if (normalizedPath === '/') {
+    return { kind: 'root' }
+  }
+
+  const match = normalizedPath.match(/^\/campaigns\/([^/]+)$/)
+  if (!match) {
+    return { kind: 'unknown' }
+  }
+
+  try {
+    const campaignId = decodeURIComponent(match[1])
+    return campaignId
+      ? { kind: 'campaign', campaignId }
+      : { kind: 'unknown' }
+  } catch {
+    return { kind: 'unknown' }
+  }
+}
+
+function updateCampaignLocation(
+  campaignId: string | null,
+  mode: 'push' | 'replace',
+): void {
+  const path = campaignId ? campaignPath(campaignId) : '/'
+  if (
+    window.location.pathname === path &&
+    !window.location.search &&
+    !window.location.hash
+  ) {
+    return
+  }
+
+  const state = campaignId ? { campaignId } : null
+  if (mode === 'push') {
+    window.history.pushState(state, '', path)
+  } else {
+    window.history.replaceState(state, '', path)
+  }
+}
+
 function isActiveGenerationJobStatus(status: GenerationJobStatus): boolean {
   return status === 'queued' || status === 'running'
 }
@@ -1173,9 +1224,26 @@ function App() {
           return
         }
 
+        const location = parseCampaignLocation(window.location.pathname)
+        const requestedCampaign =
+          location.kind === 'campaign'
+            ? (nextCampaigns.find(
+                (campaign) => campaign.id === location.campaignId,
+              ) ?? null)
+            : null
+
         setCampaigns(nextCampaigns)
-        setSelectedCampaignId(nextCampaigns[0]?.id ?? '')
-        setRequestChannel(nextCampaigns[0]?.channels[0] ?? '')
+        if (location.kind === 'campaign' && !requestedCampaign) {
+          setSelectedCampaignId('')
+          setRequestChannel('')
+          setErrorMessage('Campaign in this URL was not found.')
+          return
+        }
+
+        const nextCampaign = requestedCampaign ?? nextCampaigns[0] ?? null
+        setSelectedCampaignId(nextCampaign?.id ?? '')
+        setRequestChannel(nextCampaign?.channels[0] ?? '')
+        updateCampaignLocation(nextCampaign?.id ?? null, 'replace')
       } catch (error) {
         if (!isCancelled) {
           setErrorMessage(getErrorMessage(error))
@@ -1224,6 +1292,63 @@ function App() {
       campaigns.find((campaign) => campaign.id === selectedCampaignId) ?? null,
     [campaigns, selectedCampaignId],
   )
+
+  useEffect(() => {
+    function handlePopState() {
+      const location = parseCampaignLocation(window.location.pathname)
+      const nextCampaign =
+        location.kind === 'campaign'
+          ? (campaigns.find(
+              (campaign) => campaign.id === location.campaignId,
+            ) ?? null)
+          : (campaigns[0] ?? null)
+
+      setOpenCampaignMenuId(null)
+      setIsCreateCampaignOpen(false)
+      setIsBrandAssetModalOpen(false)
+      setSelectedAssetId('')
+      setAssets([])
+      setStatusFilter('all')
+      setChannelFilter('All')
+      setGenerationReferenceImages((currentImages) => {
+        revokeReferenceImages(currentImages)
+        return []
+      })
+      setVideoSourceMode('none')
+      setVideoSourceKey('')
+      if (videoSourceUploadRef.current) {
+        URL.revokeObjectURL(videoSourceUploadRef.current.previewUrl)
+        videoSourceUploadRef.current = null
+      }
+      setVideoSourceUpload(null)
+      if (videoSourceFileInputRef.current) {
+        videoSourceFileInputRef.current.value = ''
+      }
+
+      if (location.kind === 'campaign' && !nextCampaign) {
+        setSelectedCampaignId('')
+        setRequestChannel('')
+        setErrorMessage('Campaign in this URL was not found.')
+        return
+      }
+
+      setSelectedCampaignId(nextCampaign?.id ?? '')
+      setRequestChannel(nextCampaign?.channels[0] ?? '')
+      setErrorMessage(null)
+      if (location.kind !== 'campaign') {
+        updateCampaignLocation(nextCampaign?.id ?? null, 'replace')
+      }
+    }
+
+    window.addEventListener('popstate', handlePopState)
+    return () => window.removeEventListener('popstate', handlePopState)
+  }, [campaigns])
+
+  useEffect(() => {
+    document.title = selectedCampaign
+      ? `${selectedCampaign.name} | SereneSet Spark`
+      : 'SereneSet Spark'
+  }, [selectedCampaign])
 
   useEffect(() => {
     if (!isCreateCampaignOpen) {
@@ -2164,11 +2289,16 @@ function App() {
   function selectCampaign(campaignId: string) {
     if (campaignId === selectedCampaignId) {
       setOpenCampaignMenuId(null)
+      updateCampaignLocation(campaignId, 'replace')
       return
     }
 
     const nextCampaign = campaigns.find((campaign) => campaign.id === campaignId)
+    if (!nextCampaign) {
+      return
+    }
 
+    updateCampaignLocation(campaignId, 'push')
     setOpenCampaignMenuId(null)
     setIsCreateCampaignOpen(false)
     setIsBrandAssetModalOpen(false)
@@ -2178,6 +2308,7 @@ function App() {
     setStatusFilter('all')
     setChannelFilter('All')
     setRequestChannel(nextCampaign?.channels[0] ?? '')
+    setErrorMessage(null)
     clearGenerationReferenceImages()
     setVideoSourceMode('none')
     setVideoSourceKey('')
@@ -2361,6 +2492,7 @@ function App() {
           (campaign) => campaign.id !== createdCampaign.id,
         ),
       ])
+      updateCampaignLocation(createdCampaign.id, 'push')
       setSelectedCampaignId(createdCampaign.id)
       setSelectedAssetId('')
       setAssets([])
@@ -2404,6 +2536,7 @@ function App() {
       setOpenCampaignMenuId(null)
 
       if (selectedCampaignId === campaign.id) {
+        updateCampaignLocation(nextSelectedCampaign?.id ?? null, 'replace')
         setSelectedCampaignId(nextSelectedCampaign?.id ?? '')
         setSelectedAssetId('')
         setAssets([])
@@ -3936,10 +4069,26 @@ function App() {
                 }`}
                 key={campaign.id}
               >
-                <button
+                <a
+                  aria-current={
+                    campaign.id === selectedCampaignId ? 'page' : undefined
+                  }
                   className="campaign-select"
-                  onClick={() => selectCampaign(campaign.id)}
-                  type="button"
+                  href={campaignPath(campaign.id)}
+                  onClick={(event) => {
+                    if (
+                      event.button !== 0 ||
+                      event.metaKey ||
+                      event.ctrlKey ||
+                      event.shiftKey ||
+                      event.altKey
+                    ) {
+                      return
+                    }
+
+                    event.preventDefault()
+                    selectCampaign(campaign.id)
+                  }}
                 >
                   <span className="campaign-card-top">
                     <strong>{campaign.name}</strong>
@@ -3953,7 +4102,7 @@ function App() {
                   <span className="health-track" aria-hidden="true">
                     <span style={{ width: `${campaign.health}%` }} />
                   </span>
-                </button>
+                </a>
 
                 <div className="campaign-menu">
                   <button
