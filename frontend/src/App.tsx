@@ -56,6 +56,7 @@ import './App.css'
 type AssetFormat = 'Copy' | 'Image' | 'Video concept'
 type PreviewName = 'evergreen' | 'coral' | 'ink' | 'sun'
 type PreviewMediaKind = 'image' | 'video'
+type AssetPreviewTab = 'overview' | 'provenance'
 
 type Campaign = {
   id: string
@@ -1180,6 +1181,8 @@ function App() {
   const [selectedCampaignId, setSelectedCampaignId] = useState('')
   const [selectedAssetId, setSelectedAssetId] = useState('')
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null)
+  const [assetPreviewTab, setAssetPreviewTab] =
+    useState<AssetPreviewTab>('overview')
   const [statusFilter, setStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const [channelFilter, setChannelFilter] = useState('All')
   const [requestFormat, setRequestFormat] = useState<AssetFormat>('Image')
@@ -1817,6 +1820,12 @@ function App() {
             !previewAssetError),
       )
     : false
+  const previewAssetProvenance = previewAssetVersion
+    ? getVersionProvenance(previewAssetVersion)
+    : null
+  const previewAssetGenerationJob = previewAssetVersion
+    ? (generationJobsByVersionId.get(previewAssetVersion.versionId) ?? null)
+    : null
 
   const selectedVersions = useMemo(
     () => (selectedAsset ? sortVersionsNewestFirst(selectedAsset.versions) : []),
@@ -3593,8 +3602,10 @@ function App() {
     )
   }
 
-  async function openStoredMetadata(version: AssetVersion) {
-    if (!selectedAsset) {
+  async function openStoredMetadata(version: AssetVersion, assetId?: string) {
+    const resolvedAssetId = assetId ?? selectedAsset?.id
+
+    if (!resolvedAssetId) {
       return
     }
 
@@ -3608,7 +3619,7 @@ function App() {
 
     try {
       const download = await fetchAssetVersionDownloadUrl(
-        selectedAsset.id,
+        resolvedAssetId,
         version.versionId,
       )
       openedWindow.location.assign(download.download_url)
@@ -4156,148 +4167,444 @@ function App() {
             role="dialog"
           >
             <header className="asset-preview-modal-header">
-              <div>
-                <span className="eyebrow">
-                  {previewAsset.channel} / {previewAsset.format}
-                </span>
+              <div className="asset-preview-title-group">
+                <div className="asset-preview-kickers">
+                  <span>{previewAsset.format}</span>
+                  <span>{previewAsset.channel}</span>
+                </div>
                 <h2 id="asset-preview-title">{previewAsset.title}</h2>
+                <p>{previewAsset.copy}</p>
               </div>
-              <button
-                aria-label="Close asset preview"
-                autoFocus
-                className="modal-close-button"
-                onClick={() => setPreviewAssetId(null)}
-                type="button"
-              >
-                x
-              </button>
+              <div className="asset-preview-header-actions">
+                <span className={`status-pill ${previewAsset.status}`}>
+                  {statusLabels[previewAsset.status]}
+                </span>
+                <button
+                  aria-label="Close asset preview"
+                  autoFocus
+                  className="modal-close-button"
+                  onClick={() => setPreviewAssetId(null)}
+                  type="button"
+                >
+                  x
+                </button>
+              </div>
             </header>
 
             <div className="asset-preview-modal-body">
-              <div
-                className={`asset-preview-stage ${
-                  previewAssetUrl && !previewAssetError
-                    ? 'has-media'
-                    : 'is-empty'
-                }`}
-              >
-                {previewAssetUrl &&
-                previewAssetMediaKind === 'image' &&
-                !previewAssetError ? (
-                  <img
-                    alt={`${previewAsset.title} generated asset`}
-                    onError={() =>
-                      previewAssetVersion &&
-                      setArtifactPreviewErrors((currentPreviewErrors) => ({
-                        ...currentPreviewErrors,
-                        [previewAssetVersion.versionId]:
-                          'Image preview could not be loaded',
-                      }))
-                    }
-                    src={previewAssetUrl}
-                  />
-                ) : previewAssetUrl &&
-                  previewAssetMediaKind === 'video' &&
+              <div className="asset-preview-viewer">
+                <div
+                  className={`asset-preview-stage ${
+                    previewAssetUrl && !previewAssetError
+                      ? 'has-media'
+                      : 'is-empty'
+                  }`}
+                >
+                  {previewAssetUrl &&
+                  previewAssetMediaKind === 'image' &&
                   !previewAssetError ? (
-                  <video
-                    controls
-                    controlsList="nodownload"
-                    key={previewAssetUrl}
-                    onError={() =>
-                      previewAssetVersion &&
-                      setArtifactPreviewErrors((currentPreviewErrors) => ({
-                        ...currentPreviewErrors,
-                        [previewAssetVersion.versionId]:
-                          'Video preview could not be played',
-                      }))
-                    }
-                    playsInline
-                    preload="metadata"
-                    src={previewAssetUrl}
-                  />
-                ) : (
-                  <span className="asset-preview-modal-state">
-                    <strong>
-                      {isPreviewAssetLoading
-                        ? 'Loading generated output'
-                        : previewAssetError
-                          ? 'Preview unavailable'
-                          : 'No generated output'}
-                    </strong>
-                    <span>
-                      {previewAssetError ?? previewAsset.format}
+                    <img
+                      alt={`${previewAsset.title} generated asset`}
+                      onError={() =>
+                        previewAssetVersion &&
+                        setArtifactPreviewErrors((currentPreviewErrors) => ({
+                          ...currentPreviewErrors,
+                          [previewAssetVersion.versionId]:
+                            'Image preview could not be loaded',
+                        }))
+                      }
+                      src={previewAssetUrl}
+                    />
+                  ) : previewAssetUrl &&
+                    previewAssetMediaKind === 'video' &&
+                    !previewAssetError ? (
+                    <video
+                      controls
+                      controlsList="nodownload"
+                      key={previewAssetUrl}
+                      onError={() =>
+                        previewAssetVersion &&
+                        setArtifactPreviewErrors((currentPreviewErrors) => ({
+                          ...currentPreviewErrors,
+                          [previewAssetVersion.versionId]:
+                            'Video preview could not be played',
+                        }))
+                      }
+                      playsInline
+                      preload="metadata"
+                      src={previewAssetUrl}
+                    />
+                  ) : (
+                    <span className="asset-preview-modal-state">
+                      <strong>
+                        {isPreviewAssetLoading
+                          ? 'Loading generated output'
+                          : previewAssetError
+                            ? 'Preview unavailable'
+                            : 'No generated output'}
+                      </strong>
+                      <span>{previewAssetError ?? previewAsset.format}</span>
                     </span>
-                  </span>
-                )}
-              </div>
-
-              <div className="asset-preview-summary">
-                <div className="asset-preview-version-heading">
-                  <div>
-                    <span>Generated version</span>
-                    <strong>
-                      {previewAssetVersion
-                        ? previewAssetVersion.id.toUpperCase()
-                        : 'Unavailable'}
-                    </strong>
-                  </div>
-                  <span className={`status-pill ${previewAsset.status}`}>
-                    {statusLabels[previewAsset.status]}
-                  </span>
+                  )}
                 </div>
 
-                {previewAssetVersion && (
-                  <>
-                    <dl className="asset-preview-facts">
-                      <div>
-                        <dt>Model</dt>
-                        <dd>{previewAssetVersion.model}</dd>
-                      </div>
-                      <div>
-                        <dt>Provider</dt>
-                        <dd>{previewAssetVersion.provider}</dd>
-                      </div>
-                      <div>
-                        <dt>Artifact</dt>
-                        <dd>{formatArtifactDetails(previewAssetVersion)}</dd>
-                      </div>
-                    </dl>
-                    <div className="asset-preview-prompt">
-                      <span>Prompt</span>
-                      <p>{previewAssetVersion.prompt}</p>
-                    </div>
-                  </>
-                )}
+                <div className="asset-preview-media-footer">
+                  <div>
+                    <strong>
+                      {previewAssetVersion
+                        ? getVersionFilename(previewAssetVersion) ??
+                          'Generated output'
+                        : 'No generated output'}
+                    </strong>
+                    <span>
+                      {previewAssetVersion
+                        ? formatArtifactDetails(previewAssetVersion)
+                        : previewAsset.format}
+                    </span>
+                  </div>
+                  {previewAssetVersion && (
+                    <span>{previewAssetVersion.id.toUpperCase()}</span>
+                  )}
+                </div>
               </div>
+
+              <aside className="asset-preview-inspector">
+                <div
+                  aria-label="Preview information"
+                  className="asset-preview-tabs"
+                  role="tablist"
+                >
+                  <button
+                    aria-controls="asset-preview-overview"
+                    aria-selected={assetPreviewTab === 'overview'}
+                    className={
+                      assetPreviewTab === 'overview' ? 'is-selected' : ''
+                    }
+                    id="asset-preview-overview-tab"
+                    onClick={() => setAssetPreviewTab('overview')}
+                    role="tab"
+                    type="button"
+                  >
+                    Overview
+                  </button>
+                  <button
+                    aria-controls="asset-preview-provenance"
+                    aria-selected={assetPreviewTab === 'provenance'}
+                    className={
+                      assetPreviewTab === 'provenance' ? 'is-selected' : ''
+                    }
+                    id="asset-preview-provenance-tab"
+                    onClick={() => setAssetPreviewTab('provenance')}
+                    role="tab"
+                    type="button"
+                  >
+                    Provenance
+                  </button>
+                </div>
+
+                {assetPreviewTab === 'overview' ? (
+                  <div
+                    aria-labelledby="asset-preview-overview-tab"
+                    className="asset-preview-tab-panel"
+                    id="asset-preview-overview"
+                    role="tabpanel"
+                  >
+                    <div className="asset-preview-section-heading">
+                      <div>
+                        <span>Latest generated version</span>
+                        <strong>
+                          {previewAssetVersion?.label ?? 'Unavailable'}
+                        </strong>
+                      </div>
+                      {previewAssetGenerationJob && (
+                        <span
+                          className={`asset-preview-job-state ${previewAssetGenerationJob.status}`}
+                        >
+                          {
+                            generationJobStatusLabels[
+                              previewAssetGenerationJob.status
+                            ]
+                          }
+                        </span>
+                      )}
+                    </div>
+
+                    {previewAssetVersion && (
+                      <>
+                        <dl className="asset-preview-fact-grid">
+                          <div>
+                            <dt>Model</dt>
+                            <dd>{previewAssetVersion.model}</dd>
+                          </div>
+                          <div>
+                            <dt>Provider</dt>
+                            <dd>{previewAssetVersion.provider}</dd>
+                          </div>
+                          <div>
+                            <dt>Version</dt>
+                            <dd>{previewAssetVersion.id.toUpperCase()}</dd>
+                          </div>
+                          <div>
+                            <dt>Updated</dt>
+                            <dd>{previewAsset.updated}</dd>
+                          </div>
+                          <div>
+                            <dt>Reviewer</dt>
+                            <dd>{previewAsset.reviewer}</dd>
+                          </div>
+                          <div>
+                            <dt>Tags</dt>
+                            <dd>
+                              {previewAsset.tags.length > 0
+                                ? previewAsset.tags.join(', ')
+                                : 'None'}
+                            </dd>
+                          </div>
+                        </dl>
+
+                        <section className="asset-preview-prompt">
+                          <span>Generation prompt</span>
+                          <p>{previewAssetVersion.prompt}</p>
+                        </section>
+
+                        <section className="asset-preview-inputs">
+                          <div className="asset-preview-subheading">
+                            <span>Source inputs</span>
+                            <strong>
+                              {previewAssetVersion.inputAssets.length}
+                            </strong>
+                          </div>
+                          {previewAssetVersion.inputAssets.length > 0 ? (
+                            <div className="asset-preview-input-list">
+                              {previewAssetVersion.inputAssets.map(
+                                (inputAsset, index) => (
+                                  <div
+                                    className="asset-preview-input-row"
+                                    key={
+                                      inputAsset.id ??
+                                      inputAsset.storageKey ??
+                                      `${inputAsset.role}-${inputAsset.filename}-${index}`
+                                    }
+                                  >
+                                    <span>
+                                      {displayInputRole(inputAsset.role)}
+                                    </span>
+                                    <div>
+                                      <strong>
+                                        {inputAsset.brandAssetName ??
+                                          inputAsset.filename ??
+                                          'Stored input'}
+                                      </strong>
+                                      <small>
+                                        {[
+                                          inputAsset.mediaKind,
+                                          inputAsset.sizeBytes === null
+                                            ? null
+                                            : formatFileSize(
+                                                inputAsset.sizeBytes,
+                                              ),
+                                        ]
+                                          .filter(Boolean)
+                                          .join(' / ') || 'Context asset'}
+                                      </small>
+                                    </div>
+                                  </div>
+                                ),
+                              )}
+                            </div>
+                          ) : (
+                            <p className="asset-preview-empty-copy">
+                              No source inputs recorded for this version.
+                            </p>
+                          )}
+                        </section>
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div
+                    aria-labelledby="asset-preview-provenance-tab"
+                    className="asset-preview-tab-panel"
+                    id="asset-preview-provenance"
+                    role="tabpanel"
+                  >
+                    {previewAssetVersion && previewAssetProvenance ? (
+                      <>
+                        <div
+                          className={`asset-preview-verification ${
+                            previewAssetProvenance.manifestVerified === true
+                              ? 'is-verified'
+                              : ''
+                          }`}
+                        >
+                          <span aria-hidden="true" />
+                          <div>
+                            <strong>
+                              {previewAssetProvenance.manifestUri
+                                ? formatVerifiedState(
+                                    previewAssetProvenance.manifestVerified,
+                                  )
+                                : 'Manifest not recorded'}
+                            </strong>
+                            <small>Generation manifest</small>
+                          </div>
+                        </div>
+
+                        <dl className="asset-preview-fact-grid">
+                          <div>
+                            <dt>Mode</dt>
+                            <dd>
+                              {formatVideoInputMode(
+                                previewAssetProvenance.inputMode,
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Source</dt>
+                            <dd>
+                              {formatSourceOrigin(
+                                previewAssetProvenance.sourceOrigin,
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Schema</dt>
+                            <dd>
+                              {previewAssetProvenance.schemaVersion === null
+                                ? 'Not recorded'
+                                : `v${previewAssetProvenance.schemaVersion}`}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Input route</dt>
+                            <dd>
+                              {displayValue(
+                                previewAssetProvenance.inputRoute,
+                              )}
+                            </dd>
+                          </div>
+                        </dl>
+
+                        <section className="asset-preview-contract">
+                          <span>Generation contract</span>
+                          <div>
+                            <small>Requested</small>
+                            <strong>
+                              {previewAssetProvenance.requestedParameters}
+                            </strong>
+                          </div>
+                          <div>
+                            <small>Sent to provider</small>
+                            <strong>
+                              {previewAssetProvenance.effectiveParameters}
+                            </strong>
+                          </div>
+                        </section>
+
+                        <section className="asset-preview-storage">
+                          <span>Storage lineage</span>
+                          <ol>
+                            <li>
+                              <strong>Generated</strong>
+                              <code>
+                                {displayValue(
+                                  previewAssetProvenance.generatedStorageKey,
+                                )}
+                              </code>
+                            </li>
+                            <li>
+                              <strong>B2 artifact</strong>
+                              <code>
+                                {displayValue(
+                                  previewAssetProvenance.artifactStorageKey,
+                                )}
+                              </code>
+                            </li>
+                            <li>
+                              <strong>Sidecar</strong>
+                              <code>
+                                {displayValue(
+                                  previewAssetProvenance.sidecarStorageKey,
+                                )}
+                              </code>
+                            </li>
+                          </ol>
+                        </section>
+
+                        <section className="asset-preview-manifest">
+                          <span>Manifest</span>
+                          <code>
+                            {displayValue(previewAssetProvenance.manifestUri)}
+                          </code>
+                          <code>
+                            {displayValue(previewAssetProvenance.manifestHash)}
+                          </code>
+                        </section>
+                      </>
+                    ) : (
+                      <p className="asset-preview-empty-copy">
+                        No provenance recorded for this asset.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </aside>
             </div>
 
             <footer className="asset-preview-modal-actions">
-              <button
-                className="button button-tertiary"
-                onClick={() => setPreviewAssetId(null)}
-                type="button"
-              >
-                Close
-              </button>
-              <button
-                className="button button-secondary"
-                disabled={
-                  !previewAssetVersion ||
-                  (!previewAssetVersion.artifactStorageKey &&
-                    !previewAssetVersion.generatedPreview?.url) ||
+              <span className="asset-preview-storage-state">
+                {previewAssetVersion?.artifactStorageKey
+                  ? 'Stored in B2 / Export ready'
+                  : 'Generated preview only'}
+              </span>
+              <div>
+                <button
+                  className="button button-tertiary"
+                  onClick={() => setPreviewAssetId(null)}
+                  type="button"
+                >
+                  Close
+                </button>
+                <button
+                  className="button button-tertiary"
+                  disabled={
+                    !previewAssetVersion ||
+                    openingVersionId === previewAssetVersion.versionId
+                  }
+                  onClick={() =>
+                    previewAssetVersion &&
+                    void openStoredMetadata(
+                      previewAssetVersion,
+                      previewAsset.id,
+                    )
+                  }
+                  type="button"
+                >
+                  {previewAssetVersion &&
+                  openingVersionId === previewAssetVersion.versionId
+                    ? 'Opening...'
+                    : 'Open metadata'}
+                </button>
+                <button
+                  className="button button-secondary"
+                  disabled={
+                    !previewAssetVersion ||
+                    (!previewAssetVersion.artifactStorageKey &&
+                      !previewAssetVersion.generatedPreview?.url) ||
+                    openingArtifactVersionId === previewAssetVersion.versionId
+                  }
+                  onClick={() =>
+                    previewAssetVersion &&
+                    openPreview(previewAssetVersion, previewAsset.id)
+                  }
+                  type="button"
+                >
+                  {previewAssetVersion &&
                   openingArtifactVersionId === previewAssetVersion.versionId
-                }
-                onClick={() =>
-                  previewAssetVersion &&
-                  openPreview(previewAssetVersion, previewAsset.id)
-                }
-                type="button"
-              >
-                {previewAssetVersion &&
-                openingArtifactVersionId === previewAssetVersion.versionId
-                  ? 'Opening...'
-                  : 'Open original'}
-              </button>
+                    ? 'Opening...'
+                    : 'Open original'}
+                </button>
+              </div>
             </footer>
           </section>
         </div>
@@ -4969,6 +5276,7 @@ function App() {
                             key={asset.id}
                             onClick={() => {
                               setSelectedAssetId(asset.id)
+                              setAssetPreviewTab('overview')
                               setPreviewAssetId(asset.id)
                             }}
                             type="button"
