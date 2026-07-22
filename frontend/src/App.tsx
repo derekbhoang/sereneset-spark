@@ -55,6 +55,7 @@ import './App.css'
 
 type AssetFormat = 'Copy' | 'Image' | 'Video concept'
 type PreviewName = 'evergreen' | 'coral' | 'ink' | 'sun'
+type PreviewMediaKind = 'image' | 'video'
 
 type Campaign = {
   id: string
@@ -879,6 +880,16 @@ function getAssetCardPreviewVersion(asset: Asset): AssetVersion | null {
   }, null)
 }
 
+function getVersionPreviewMediaKind(
+  version: AssetVersion,
+): PreviewMediaKind | null {
+  if (hasVideoArtifact(version)) {
+    return 'video'
+  }
+
+  return hasImageArtifact(version) ? 'image' : null
+}
+
 function sortVersionsNewestFirst(versions: AssetVersion[]): AssetVersion[] {
   return [...versions].sort(
     (firstVersion, secondVersion) =>
@@ -1168,6 +1179,7 @@ function App() {
   const [assets, setAssets] = useState<Asset[]>([])
   const [selectedCampaignId, setSelectedCampaignId] = useState('')
   const [selectedAssetId, setSelectedAssetId] = useState('')
+  const [previewAssetId, setPreviewAssetId] = useState<string | null>(null)
   const [statusFilter, setStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const [channelFilter, setChannelFilter] = useState('All')
   const [requestFormat, setRequestFormat] = useState<AssetFormat>('Image')
@@ -1365,6 +1377,7 @@ function App() {
       setIsCreateCampaignOpen(false)
       setIsBrandAssetModalOpen(false)
       setSelectedAssetId('')
+      setPreviewAssetId(null)
       setAssets([])
       setStatusFilter('all')
       setChannelFilter('All')
@@ -1440,6 +1453,22 @@ function App() {
 
     return () => window.removeEventListener('keydown', closeOnEscape)
   }, [isBrandAssetModalOpen])
+
+  useEffect(() => {
+    if (!previewAssetId) {
+      return
+    }
+
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        setPreviewAssetId(null)
+      }
+    }
+
+    window.addEventListener('keydown', closeOnEscape)
+
+    return () => window.removeEventListener('keydown', closeOnEscape)
+  }, [previewAssetId])
 
   useEffect(() => {
     let isCancelled = false
@@ -1764,6 +1793,30 @@ function App() {
     filteredAssets.find((asset) => asset.id === selectedAssetId) ??
     filteredAssets[0] ??
     null
+
+  const previewAsset = previewAssetId
+    ? (campaignAssets.find((asset) => asset.id === previewAssetId) ?? null)
+    : null
+  const previewAssetVersion = previewAsset
+    ? getAssetCardPreviewVersion(previewAsset)
+    : null
+  const previewAssetUrl = previewAssetVersion
+    ? getArtifactPreviewUrl(previewAssetVersion, artifactPreviewUrls)
+    : null
+  const previewAssetMediaKind = previewAssetVersion
+    ? getVersionPreviewMediaKind(previewAssetVersion)
+    : null
+  const previewAssetError = previewAssetVersion
+    ? artifactPreviewErrors[previewAssetVersion.versionId]
+    : null
+  const isPreviewAssetLoading = previewAssetVersion
+    ? Boolean(
+        artifactPreviewLoadingIds[previewAssetVersion.versionId] ||
+          (previewAssetVersion.artifactStorageKey &&
+            !previewAssetUrl &&
+            !previewAssetError),
+      )
+    : false
 
   const selectedVersions = useMemo(
     () => (selectedAsset ? sortVersionsNewestFirst(selectedAsset.versions) : []),
@@ -2362,6 +2415,7 @@ function App() {
     setIsBrandAssetModalOpen(false)
     setSelectedCampaignId(campaignId)
     setSelectedAssetId('')
+    setPreviewAssetId(null)
     setAssets([])
     setStatusFilter('all')
     setChannelFilter('All')
@@ -2553,6 +2607,7 @@ function App() {
       updateCampaignLocation(createdCampaign.id, 'push')
       setSelectedCampaignId(createdCampaign.id)
       setSelectedAssetId('')
+      setPreviewAssetId(null)
       setAssets([])
       setStatusFilter('all')
       setChannelFilter('All')
@@ -2597,6 +2652,7 @@ function App() {
         updateCampaignLocation(nextSelectedCampaign?.id ?? null, 'replace')
         setSelectedCampaignId(nextSelectedCampaign?.id ?? '')
         setSelectedAssetId('')
+        setPreviewAssetId(null)
         setAssets([])
         setStatusFilter('all')
         setChannelFilter('All')
@@ -3002,8 +3058,10 @@ function App() {
     return openedWindow
   }
 
-  async function openArtifact(version: AssetVersion) {
-    if (!selectedAsset || !version.artifactStorageKey) {
+  async function openArtifact(version: AssetVersion, assetId?: string) {
+    const resolvedAssetId = assetId ?? selectedAsset?.id
+
+    if (!resolvedAssetId || !version.artifactStorageKey) {
       return
     }
 
@@ -3017,7 +3075,7 @@ function App() {
 
     try {
       const download = await fetchAssetVersionArtifactDownloadUrl(
-        selectedAsset.id,
+        resolvedAssetId,
         version.versionId,
       )
       openedWindow.location.assign(download.download_url)
@@ -3043,9 +3101,9 @@ function App() {
     }
   }
 
-  function openPreview(version: AssetVersion) {
+  function openPreview(version: AssetVersion, assetId?: string) {
     if (version.artifactStorageKey) {
-      void openArtifact(version)
+      void openArtifact(version, assetId)
       return
     }
 
@@ -4085,6 +4143,166 @@ function App() {
         </div>
       )}
 
+      {previewAsset && (
+        <div
+          className="modal-backdrop asset-preview-backdrop"
+          onMouseDown={() => setPreviewAssetId(null)}
+        >
+          <section
+            aria-labelledby="asset-preview-title"
+            aria-modal="true"
+            className="asset-preview-modal"
+            onMouseDown={(event) => event.stopPropagation()}
+            role="dialog"
+          >
+            <header className="asset-preview-modal-header">
+              <div>
+                <span className="eyebrow">
+                  {previewAsset.channel} / {previewAsset.format}
+                </span>
+                <h2 id="asset-preview-title">{previewAsset.title}</h2>
+              </div>
+              <button
+                aria-label="Close asset preview"
+                autoFocus
+                className="modal-close-button"
+                onClick={() => setPreviewAssetId(null)}
+                type="button"
+              >
+                x
+              </button>
+            </header>
+
+            <div className="asset-preview-modal-body">
+              <div
+                className={`asset-preview-stage ${
+                  previewAssetUrl && !previewAssetError
+                    ? 'has-media'
+                    : 'is-empty'
+                }`}
+              >
+                {previewAssetUrl &&
+                previewAssetMediaKind === 'image' &&
+                !previewAssetError ? (
+                  <img
+                    alt={`${previewAsset.title} generated asset`}
+                    onError={() =>
+                      previewAssetVersion &&
+                      setArtifactPreviewErrors((currentPreviewErrors) => ({
+                        ...currentPreviewErrors,
+                        [previewAssetVersion.versionId]:
+                          'Image preview could not be loaded',
+                      }))
+                    }
+                    src={previewAssetUrl}
+                  />
+                ) : previewAssetUrl &&
+                  previewAssetMediaKind === 'video' &&
+                  !previewAssetError ? (
+                  <video
+                    controls
+                    controlsList="nodownload"
+                    key={previewAssetUrl}
+                    onError={() =>
+                      previewAssetVersion &&
+                      setArtifactPreviewErrors((currentPreviewErrors) => ({
+                        ...currentPreviewErrors,
+                        [previewAssetVersion.versionId]:
+                          'Video preview could not be played',
+                      }))
+                    }
+                    playsInline
+                    preload="metadata"
+                    src={previewAssetUrl}
+                  />
+                ) : (
+                  <span className="asset-preview-modal-state">
+                    <strong>
+                      {isPreviewAssetLoading
+                        ? 'Loading generated output'
+                        : previewAssetError
+                          ? 'Preview unavailable'
+                          : 'No generated output'}
+                    </strong>
+                    <span>
+                      {previewAssetError ?? previewAsset.format}
+                    </span>
+                  </span>
+                )}
+              </div>
+
+              <div className="asset-preview-summary">
+                <div className="asset-preview-version-heading">
+                  <div>
+                    <span>Generated version</span>
+                    <strong>
+                      {previewAssetVersion
+                        ? previewAssetVersion.id.toUpperCase()
+                        : 'Unavailable'}
+                    </strong>
+                  </div>
+                  <span className={`status-pill ${previewAsset.status}`}>
+                    {statusLabels[previewAsset.status]}
+                  </span>
+                </div>
+
+                {previewAssetVersion && (
+                  <>
+                    <dl className="asset-preview-facts">
+                      <div>
+                        <dt>Model</dt>
+                        <dd>{previewAssetVersion.model}</dd>
+                      </div>
+                      <div>
+                        <dt>Provider</dt>
+                        <dd>{previewAssetVersion.provider}</dd>
+                      </div>
+                      <div>
+                        <dt>Artifact</dt>
+                        <dd>{formatArtifactDetails(previewAssetVersion)}</dd>
+                      </div>
+                    </dl>
+                    <div className="asset-preview-prompt">
+                      <span>Prompt</span>
+                      <p>{previewAssetVersion.prompt}</p>
+                    </div>
+                  </>
+                )}
+              </div>
+            </div>
+
+            <footer className="asset-preview-modal-actions">
+              <button
+                className="button button-tertiary"
+                onClick={() => setPreviewAssetId(null)}
+                type="button"
+              >
+                Close
+              </button>
+              <button
+                className="button button-secondary"
+                disabled={
+                  !previewAssetVersion ||
+                  (!previewAssetVersion.artifactStorageKey &&
+                    !previewAssetVersion.generatedPreview?.url) ||
+                  openingArtifactVersionId === previewAssetVersion.versionId
+                }
+                onClick={() =>
+                  previewAssetVersion &&
+                  openPreview(previewAssetVersion, previewAsset.id)
+                }
+                type="button"
+              >
+                {previewAssetVersion &&
+                openingArtifactVersionId === previewAssetVersion.versionId
+                  ? 'Opening...'
+                  : 'Open original'}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
+
       <div className="workspace">
         <aside className="campaign-rail" aria-label="Campaigns">
           <div className="rail-heading">
@@ -4722,11 +4940,7 @@ function App() {
                             )
                           : null
                         const cardPreviewKind = cardPreviewVersion
-                          ? hasVideoArtifact(cardPreviewVersion)
-                            ? 'video'
-                            : hasImageArtifact(cardPreviewVersion)
-                              ? 'image'
-                              : null
+                          ? getVersionPreviewMediaKind(cardPreviewVersion)
                           : null
                         const cardPreviewError = cardPreviewVersion
                           ? artifactPreviewErrors[cardPreviewVersion.versionId]
@@ -4748,11 +4962,15 @@ function App() {
 
                         return (
                           <button
+                            aria-haspopup="dialog"
                             className={`asset-card ${
                               selectedAsset?.id === asset.id ? 'is-active' : ''
                             }`}
                             key={asset.id}
-                            onClick={() => setSelectedAssetId(asset.id)}
+                            onClick={() => {
+                              setSelectedAssetId(asset.id)
+                              setPreviewAssetId(asset.id)
+                            }}
                             type="button"
                           >
                             <span
