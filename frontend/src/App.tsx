@@ -54,7 +54,8 @@ import {
 import logoUrl from './assets/logo.png'
 import './App.css'
 
-type AssetFormat = 'Copy' | 'Image' | 'Video concept'
+type AssetFormat = 'Copy' | 'Image' | 'Video'
+type GeneratableAssetFormat = 'Image' | 'Video'
 type PreviewName = 'evergreen' | 'coral' | 'ink' | 'sun'
 type PreviewMediaKind = 'image' | 'video'
 type AssetPreviewTab = 'overview' | 'provenance'
@@ -255,18 +256,17 @@ const statusLabels: Record<ReviewStatus, string> = {
   rejected: 'Rejected',
 }
 
-const formatOptions: AssetFormat[] = ['Copy', 'Image', 'Video concept']
+const formatOptions: GeneratableAssetFormat[] = ['Image', 'Video']
 
 const formatLabels: Record<AssetFormatValue, AssetFormat> = {
   copy: 'Copy',
   image: 'Image',
-  video_concept: 'Video concept',
+  video_concept: 'Video',
 }
 
-const formatValues: Record<AssetFormat, AssetFormatValue> = {
-  Copy: 'copy',
+const formatValues: Record<GeneratableAssetFormat, AssetFormatValue> = {
   Image: 'image',
-  'Video concept': 'video_concept',
+  Video: 'video_concept',
 }
 
 const referenceRoleOptions: GenerationInputRole[] = [
@@ -1067,7 +1067,7 @@ function referenceImagesToGenerationInputs(
 }
 
 function buildRefinePrompt(asset: Asset): string {
-  if (asset.format === 'Video concept') {
+  if (asset.format === 'Video') {
     return `Preserve the subject, composition, branding, and timing of "${asset.title}". Improve the background motion without changing the product.`
   }
 
@@ -1186,7 +1186,8 @@ function App() {
     useState<AssetPreviewTab>('overview')
   const [statusFilter, setStatusFilter] = useState<ReviewStatus | 'all'>('all')
   const [channelFilter, setChannelFilter] = useState('All')
-  const [requestFormat, setRequestFormat] = useState<AssetFormat>('Image')
+  const [requestFormat, setRequestFormat] =
+    useState<GeneratableAssetFormat>('Image')
   const [requestChannel, setRequestChannel] = useState('')
   const [requestPrompt, setRequestPrompt] = useState(defaultPrompt)
   const [videoDurationSeconds, setVideoDurationSeconds] = useState(4)
@@ -1780,7 +1781,7 @@ function App() {
     }
 
     for (const asset of campaignAssets) {
-      if (asset.format !== 'Image' && asset.format !== 'Video concept') {
+      if (asset.format !== 'Image' && asset.format !== 'Video') {
         continue
       }
 
@@ -1911,7 +1912,7 @@ function App() {
       !isLoadingGenerationJobs,
   )
   const videoRefinementUnavailableReason =
-    selectedAsset?.format !== 'Video concept'
+    selectedAsset?.format !== 'Video'
       ? null
       : !latestSelectedVersion
         ? 'No source version is available.'
@@ -1925,7 +1926,7 @@ function App() {
                 ? 'The latest version does not have a refinable MP4 artifact.'
                 : null
   const canRefineSelectedVideo = Boolean(
-    selectedAsset?.format === 'Video concept' &&
+    selectedAsset?.format === 'Video' &&
       latestSelectedVersion &&
       videoRefinementUnavailableReason === null,
   )
@@ -2813,7 +2814,7 @@ function App() {
     try {
       let createdAssetDto: AssetDto
 
-      if (requestFormat === 'Video concept') {
+      if (requestFormat === 'Video') {
         if (!hasValidVideoSource) {
           return
         }
@@ -2893,7 +2894,7 @@ function App() {
       setStatusFilter('all')
       setChannelFilter('All')
 
-      if (requestFormat !== 'Video concept') {
+      if (requestFormat !== 'Video') {
         clearGenerationReferenceImages()
       } else {
         setVideoSourceMode('none')
@@ -2992,7 +2993,7 @@ function App() {
   }
 
   async function refineAsset() {
-    if (!selectedAsset) {
+    if (!selectedAsset || selectedAsset.format !== 'Image') {
       return
     }
 
@@ -4991,7 +4992,7 @@ function App() {
                         key={format}
                         onClick={() => {
                           setRequestFormat(format)
-                          if (format !== 'Video concept') {
+                          if (format !== 'Video') {
                             setVideoSourceMode('none')
                             setVideoSourceKey('')
                             clearVideoSourceUpload()
@@ -5025,7 +5026,7 @@ function App() {
                     />
                   </label>
 
-                  {requestFormat === 'Video concept' ? (
+                  {requestFormat === 'Video' ? (
                     <div className="video-generation-controls">
                       <div className="video-control">
                         <span>Source</span>
@@ -5255,7 +5256,7 @@ function App() {
                     </div>
                   )}
 
-                  {requestFormat === 'Video concept' &&
+                  {requestFormat === 'Video' &&
                     isLoadingGenerationJobs && (
                       <span className="generation-jobs-loading">
                         Loading video jobs...
@@ -5268,19 +5269,19 @@ function App() {
                       isGenerating ||
                       !requestChannel ||
                       !requestPrompt.trim() ||
-                      (requestFormat === 'Video concept' &&
+                      (requestFormat === 'Video' &&
                         !hasValidVideoSource)
                     }
                     onClick={generateAsset}
                     type="button"
                   >
                     {isGenerating
-                      ? requestFormat === 'Video concept'
+                      ? requestFormat === 'Video'
                         ? videoSourceMode === 'upload'
                           ? 'Uploading...'
                           : 'Queueing...'
                         : 'Generating...'
-                      : requestFormat === 'Video concept'
+                      : requestFormat === 'Video'
                         ? isVideoToVideo
                           ? 'Queue video edit'
                           : 'Queue video'
@@ -5598,7 +5599,7 @@ function App() {
                       </div>
                     </dl>
 
-                    {selectedAsset.format === 'Video concept' && (
+                    {selectedAsset.format === 'Video' && (
                       <div
                         className="refine-panel video-refine-panel"
                         data-testid="video-refinement-panel"
@@ -5675,7 +5676,7 @@ function App() {
                       </div>
                     )}
 
-                    {selectedAsset.format !== 'Video concept' && (
+                    {selectedAsset.format === 'Image' && (
                       <div className="refine-panel">
                         <div className="panel-heading">
                           <div>
