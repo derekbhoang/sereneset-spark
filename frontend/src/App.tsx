@@ -1314,13 +1314,22 @@ function App() {
           setSelectedCampaignId('')
           setRequestChannel('')
           setErrorMessage('Campaign in this URL was not found.')
+          updateCampaignLocation(null, 'replace')
           return
         }
 
-        const nextCampaign = requestedCampaign ?? nextCampaigns[0] ?? null
-        setSelectedCampaignId(nextCampaign?.id ?? '')
-        setRequestChannel(nextCampaign?.channels[0] ?? '')
-        updateCampaignLocation(nextCampaign?.id ?? null, 'replace')
+        if (location.kind === 'campaign') {
+          setSelectedCampaignId(requestedCampaign?.id ?? '')
+          setRequestChannel(requestedCampaign?.channels[0] ?? '')
+          return
+        }
+
+        setSelectedCampaignId('')
+        setRequestChannel('')
+        if (location.kind === 'unknown') {
+          setErrorMessage('Page not found. Showing the workspace overview.')
+          updateCampaignLocation(null, 'replace')
+        }
       } catch (error) {
         if (!isCancelled) {
           setErrorMessage(getErrorMessage(error))
@@ -1369,6 +1378,22 @@ function App() {
       campaigns.find((campaign) => campaign.id === selectedCampaignId) ?? null,
     [campaigns, selectedCampaignId],
   )
+  const overviewStats = useMemo(
+    () => ({
+      channelCount: new Set(
+        campaigns.flatMap((campaign) => campaign.channels),
+      ).size,
+      ownerCount: new Set(
+        campaigns
+          .map((campaign) => campaign.owner.trim())
+          .filter((owner) => owner.length > 0),
+      ).size,
+      scheduledCount: campaigns.filter(
+        (campaign) => campaign.due !== 'No due date',
+      ).length,
+    }),
+    [campaigns],
+  )
 
   useEffect(() => {
     function handlePopState() {
@@ -1378,7 +1403,7 @@ function App() {
           ? (campaigns.find(
               (campaign) => campaign.id === location.campaignId,
             ) ?? null)
-          : (campaigns[0] ?? null)
+          : null
 
       setOpenCampaignMenuId(null)
       setIsCreateCampaignOpen(false)
@@ -1407,14 +1432,17 @@ function App() {
         setSelectedCampaignId('')
         setRequestChannel('')
         setErrorMessage('Campaign in this URL was not found.')
+        updateCampaignLocation(null, 'replace')
         return
       }
 
       setSelectedCampaignId(nextCampaign?.id ?? '')
       setRequestChannel(nextCampaign?.channels[0] ?? '')
-      setErrorMessage(null)
-      if (location.kind !== 'campaign') {
-        updateCampaignLocation(nextCampaign?.id ?? null, 'replace')
+      if (location.kind === 'unknown') {
+        setErrorMessage('Page not found. Showing the workspace overview.')
+        updateCampaignLocation(null, 'replace')
+      } else {
+        setErrorMessage(null)
       }
     }
 
@@ -2464,6 +2492,25 @@ function App() {
     clearVideoSourceUpload()
   }
 
+  function selectWorkspaceOverview() {
+    updateCampaignLocation(null, 'push')
+    setOpenCampaignMenuId(null)
+    setIsCreateCampaignOpen(false)
+    setIsBrandAssetModalOpen(false)
+    setSelectedCampaignId('')
+    setSelectedAssetId('')
+    setPreviewAssetId(null)
+    setAssets([])
+    setStatusFilter('all')
+    setChannelFilter('All')
+    setRequestChannel('')
+    setErrorMessage(null)
+    clearGenerationReferenceImages()
+    setVideoSourceMode('none')
+    setVideoSourceKey('')
+    clearVideoSourceUpload()
+  }
+
   function resetBrandAssetForm() {
     setBrandAssetForm(defaultBrandAssetForm)
     setBrandAssetFile(null)
@@ -2677,23 +2724,18 @@ function App() {
       const nextCampaigns = campaigns.filter(
         (currentCampaign) => currentCampaign.id !== campaign.id,
       )
-      const nextSelectedCampaign =
-        selectedCampaignId === campaign.id
-          ? (nextCampaigns[0] ?? null)
-          : selectedCampaign
-
       setCampaigns(nextCampaigns)
       setOpenCampaignMenuId(null)
 
       if (selectedCampaignId === campaign.id) {
-        updateCampaignLocation(nextSelectedCampaign?.id ?? null, 'replace')
-        setSelectedCampaignId(nextSelectedCampaign?.id ?? '')
+        updateCampaignLocation(null, 'replace')
+        setSelectedCampaignId('')
         setSelectedAssetId('')
         setPreviewAssetId(null)
         setAssets([])
         setStatusFilter('all')
         setChannelFilter('All')
-        setRequestChannel(nextSelectedCampaign?.channels[0] ?? '')
+        setRequestChannel('')
         clearGenerationReferenceImages()
       }
     } catch (error) {
@@ -3662,7 +3704,26 @@ function App() {
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div className="brand-lockup" aria-label="SereneSet Spark">
+        <a
+          aria-current={!selectedCampaign ? 'page' : undefined}
+          aria-label="SereneSet Spark workspace overview"
+          className="brand-lockup"
+          href="/"
+          onClick={(event) => {
+            if (
+              event.button !== 0 ||
+              event.metaKey ||
+              event.ctrlKey ||
+              event.shiftKey ||
+              event.altKey
+            ) {
+              return
+            }
+
+            event.preventDefault()
+            selectWorkspaceOverview()
+          }}
+        >
           <img
             alt=""
             className="brand-mark"
@@ -3674,11 +3735,11 @@ function App() {
             <strong>SereneSet Spark</strong>
             <span>Campaign asset workspace</span>
           </div>
-        </div>
+        </a>
 
-        <div className="topbar-context" aria-label="Current campaign">
-          <span>Campaign</span>
-          <strong>{selectedCampaign?.name ?? 'No campaign selected'}</strong>
+        <div className="topbar-context" aria-label="Current view">
+          <span>{selectedCampaign ? 'Campaign' : 'Workspace'}</span>
+          <strong>{selectedCampaign?.name ?? 'Overview'}</strong>
         </div>
       </header>
 
@@ -4741,7 +4802,7 @@ function App() {
           </div>
 
           {!isLoadingCampaigns && campaigns.length === 0 && (
-            <div className="empty-state">No campaigns found.</div>
+            <div className="rail-empty">No campaigns yet.</div>
           )}
         </aside>
 
@@ -5759,26 +5820,182 @@ function App() {
             </div>
           </main>
         ) : (
-          <main className="campaign-stage">
-            <div className="empty-state workspace-empty">
-              {isLoadingCampaigns ? (
-                'Loading workspace...'
-              ) : campaigns.length === 0 ? (
-                <>
-                  <strong>No campaigns yet</strong>
-                  <span>Create a campaign to start building assets.</span>
-                  <button
-                    className="button button-primary"
-                    onClick={() => setIsCreateCampaignOpen(true)}
-                    type="button"
-                  >
-                    Create campaign
-                  </button>
-                </>
-              ) : (
-                'Choose a campaign to open its workspace.'
-              )}
-            </div>
+          <main className="campaign-stage overview-stage">
+            {isLoadingCampaigns ? (
+              <div className="empty-state workspace-empty">
+                Loading workspace...
+              </div>
+            ) : (
+              <section
+                aria-labelledby="workspace-overview-title"
+                className="workspace-overview"
+              >
+                <header className="overview-header">
+                  <div>
+                    <span className="eyebrow">Workspace overview</span>
+                    <h1 id="workspace-overview-title">Campaign portfolio</h1>
+                    <p>
+                      Review campaign briefs and open a workspace to continue
+                      production.
+                    </p>
+                  </div>
+                  {campaigns.length > 0 && (
+                    <button
+                      className="button button-primary"
+                      onClick={() => setIsCreateCampaignOpen(true)}
+                      type="button"
+                    >
+                      New campaign
+                    </button>
+                  )}
+                </header>
+
+                {campaigns.length === 0 ? (
+                  <div className="empty-state workspace-empty overview-empty">
+                    <strong>No campaigns yet</strong>
+                    <span>Create a campaign to start building assets.</span>
+                    <button
+                      className="button button-primary"
+                      onClick={() => setIsCreateCampaignOpen(true)}
+                      type="button"
+                    >
+                      Create campaign
+                    </button>
+                  </div>
+                ) : (
+                  <>
+                    <dl
+                      aria-label="Workspace totals"
+                      className="overview-summary"
+                    >
+                      <div>
+                        <dt>Campaigns</dt>
+                        <dd>{campaigns.length}</dd>
+                        <span>Briefs in the workspace</span>
+                      </div>
+                      <div>
+                        <dt>Channels</dt>
+                        <dd>{overviewStats.channelCount}</dd>
+                        <span>Distinct delivery channels</span>
+                      </div>
+                      <div>
+                        <dt>Scheduled</dt>
+                        <dd>{overviewStats.scheduledCount}</dd>
+                        <span>Campaigns with due dates</span>
+                      </div>
+                      <div>
+                        <dt>Owners</dt>
+                        <dd>{overviewStats.ownerCount}</dd>
+                        <span>People leading campaigns</span>
+                      </div>
+                    </dl>
+
+                    <section
+                      aria-labelledby="campaign-portfolio-title"
+                      className="overview-campaigns"
+                    >
+                      <div className="overview-section-heading">
+                        <div>
+                          <span className="eyebrow">Campaigns</span>
+                          <h2 id="campaign-portfolio-title">
+                            Production workspaces
+                          </h2>
+                        </div>
+                        <span>
+                          {campaigns.length}{' '}
+                          {campaigns.length === 1 ? 'campaign' : 'campaigns'}
+                        </span>
+                      </div>
+
+                      <div className="overview-campaign-grid">
+                        {campaigns.map((campaign) => (
+                          <article
+                            className="overview-campaign-card"
+                            key={campaign.id}
+                          >
+                            <div className="overview-campaign-top">
+                              <span className="overview-product">
+                                {campaign.product}
+                              </span>
+                              <span className="campaign-state-pill">
+                                {campaign.status}
+                              </span>
+                            </div>
+
+                            <div className="overview-campaign-copy">
+                              <h3>{campaign.name}</h3>
+                              <p>
+                                {campaign.goal ||
+                                  `Campaign for ${campaign.audience}.`}
+                              </p>
+                            </div>
+
+                            <dl className="overview-campaign-meta">
+                              <div>
+                                <dt>Audience</dt>
+                                <dd>{campaign.audience || 'Not specified'}</dd>
+                              </div>
+                              <div>
+                                <dt>Owner</dt>
+                                <dd>{campaign.owner || 'Unassigned'}</dd>
+                              </div>
+                              <div>
+                                <dt>Due</dt>
+                                <dd>{campaign.due}</dd>
+                              </div>
+                            </dl>
+
+                            <footer className="overview-campaign-footer">
+                              <div
+                                aria-label="Campaign channels"
+                                className="overview-channel-list"
+                              >
+                                {campaign.channels.length === 0 ? (
+                                  <span>No channels</span>
+                                ) : (
+                                  <>
+                                    {campaign.channels
+                                      .slice(0, 3)
+                                      .map((channel) => (
+                                        <span key={channel}>{channel}</span>
+                                      ))}
+                                    {campaign.channels.length > 3 && (
+                                      <span>
+                                        +{campaign.channels.length - 3}
+                                      </span>
+                                    )}
+                                  </>
+                                )}
+                              </div>
+                              <a
+                                className="overview-open-link"
+                                href={campaignPath(campaign.id)}
+                                onClick={(event) => {
+                                  if (
+                                    event.button !== 0 ||
+                                    event.metaKey ||
+                                    event.ctrlKey ||
+                                    event.shiftKey ||
+                                    event.altKey
+                                  ) {
+                                    return
+                                  }
+
+                                  event.preventDefault()
+                                  selectCampaign(campaign.id)
+                                }}
+                              >
+                                Open campaign
+                              </a>
+                            </footer>
+                          </article>
+                        ))}
+                      </div>
+                    </section>
+                  </>
+                )}
+              </section>
+            )}
           </main>
         )}
       </div>
