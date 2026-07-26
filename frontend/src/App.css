@@ -27,16 +27,14 @@
 }
 
 .brand-mark {
-  display: grid;
+  display: block;
   width: 40px;
   height: 40px;
   flex: 0 0 auto;
-  place-items: center;
-  border-radius: 8px;
-  color: #fff;
-  background: #176b5d;
-  font-size: 13px;
-  font-weight: 800;
+  border: 1px solid rgba(23, 107, 93, 0.16);
+  border-radius: 50%;
+  object-fit: contain;
+  box-shadow: 0 2px 8px rgba(17, 41, 37, 0.12);
 }
 
 .brand-lockup div {

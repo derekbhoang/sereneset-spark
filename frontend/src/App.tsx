@@ -51,6 +51,7 @@ import {
   type VideoGenerationCreateDto,
   type VideoResolution,
 } from './api'
+import logoUrl from './assets/logo.png'
 import './App.css'
 
 type AssetFormat = 'Copy' | 'Image' | 'Video concept'
@@ -3662,7 +3663,13 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand-lockup" aria-label="SereneSet Spark">
-          <span className="brand-mark">SS</span>
+          <img
+            alt=""
+            className="brand-mark"
+            height="40"
+            src={logoUrl}
+            width="40"
+          />
           <div>
             <strong>SereneSet Spark</strong>
             <span>Campaign asset workspace</span>
